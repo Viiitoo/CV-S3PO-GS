@@ -14,7 +14,7 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
-from utils.init_pose import get_pose, get_depth
+from utils.init_pose import get_pose, get_depth, save_confidence_map
 from utils.depth_utils import process_depth
 
 class FrontEnd(mp.Process):
@@ -142,7 +142,16 @@ class FrontEnd(mp.Process):
 
         # get mono_depth from MASt3R
         img = viewpoint.original_image
-        viewpoint.mono_depth = get_depth(img, img, self.model)
+        # ========= 修改开始 =========
+        # 1. 调用函数，要求返回置信度
+        depth, conf = get_depth(img, img, self.model, return_conf=True)
+        viewpoint.mono_depth = depth
+        
+        # 2. 保存置信度图到 save_dir (结果文件夹)
+        # 注意：self.save_dir 需要确保已创建，通常 SLAM 启动时会创建
+        print(f"debug: saving confidence map for frame {cur_frame_idx}...")
+        save_confidence_map(conf, cur_frame_idx, self.save_dir)
+        # ========= 修改结束 =========
         
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
@@ -167,7 +176,19 @@ class FrontEnd(mp.Process):
                             viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background)
         
         # get mono_depth from MASt3R
-        viewpoint.mono_depth = get_depth(img2, img2, self.model)
+        # ========= 修改这里 (找到 get_depth 这一行) =========
+        # 原代码: viewpoint.mono_depth = get_depth(img2, img2, self.model)
+        
+        # 新代码:
+        depth, conf = get_depth(img2, img2, self.model, return_conf=True)
+        viewpoint.mono_depth = depth
+        
+        # 保存置信度图 (注意: self.save_dir 要确保不是 None)
+        # 建议加个判定，或者直接用你刚才设置的那个 debug 路径
+        if cur_frame_idx % 10 == 0: # 建议每隔几帧存一张，否则会跑得很慢！
+            print(f"Saving confidence map for frame {cur_frame_idx}")
+            save_confidence_map(conf, cur_frame_idx, self.save_dir)
+        # =================================================
         
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)

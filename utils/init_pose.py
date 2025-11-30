@@ -185,27 +185,32 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
         pose_w2c = np.eye(4)
         return pose_w2c, render_depth.detach().cpu().numpy()  
 
-# Extract depth from MASt3R
-def get_depth(img1, img2, model):
+# Extract depth and confidence from MASt3R
+def get_depth(img1, img2, model, return_conf=False): # <--- 改动：增加参数
     device = 'cuda'
-    schedule = 'cosine'
-    lr = 0.01
-    niter = 300
-
+    # ... (原有参数设置不变) ...
     H1 = img1.shape[1]
     W1 = img1.shape[2]
     
     images = torch_images_to_dust3r_format([img1, img2], size=512)
     output = inference([tuple(images)], model, device, batch_size=1, verbose=False)
     view1, pred1 = output['view1'], output['pred1']
-    view2, pred2 = output['view2'], output['pred2']
     
+    # --- 原有提取深度逻辑 ---
     pts1 = pred1['pts3d'].squeeze(0)
     z1 = pts1[...,2]
     z1 = z1.detach().cpu().numpy()
     z1_resized = cv2.resize(z1, (W1,H1), interpolation=cv2.INTER_NEAREST)
    
-    return z1_resized
+    # --- 改动：处理置信度 ---
+    if return_conf:
+        # 提取置信度 (Confidence)
+        conf = pred1['conf'].squeeze(0).detach().cpu().numpy()
+        # 缩放至原图大小 (使用线性插值)
+        conf_resized = cv2.resize(conf, (W1, H1), interpolation=cv2.INTER_LINEAR)
+        return z1_resized, conf_resized # 返回两个值
+    else:
+        return z1_resized # 保持旧行为，只返回深度
     
 # Visualize comparison of rendered depth
 def save_depth_comparison(render_depth, mono_depth, rgb, cur_frame_idx, save_dir):
@@ -271,3 +276,27 @@ def save_depth_comparison(render_depth, mono_depth, rgb, cur_frame_idx, save_dir
     plt.close(fig)
     
     return save_path
+
+
+def save_confidence_map(conf_map, cur_frame_idx, save_dir):
+    """
+    保存置信度热力图
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    # 使用 'plasma' 或 'inferno' 这种高对比度的色图
+    # vmax 可以根据你的数据情况调整，通常大于 2.0 就是非常可信了，这里设为自动或固定值
+    im = ax.imshow(conf_map, cmap='plasma') 
+    
+    ax.set_title(f"Confidence Map - Frame {cur_frame_idx}\n(Brighter/Yellow = Higher Confidence)", fontsize=15)
+    ax.axis('off')
+    
+    # 添加色条
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Confidence Value", fontsize=12)
+    
+    save_path = os.path.join(save_dir, f"confidence_{cur_frame_idx}.png")
+    plt.savefig(save_path)
+    plt.close(fig)
+    print(f"Confidence map saved to: {save_path}")
