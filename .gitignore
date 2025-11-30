@@ -1,0 +1,10 @@
+# 忽略具体的那一个大文件
+checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
+
+# 或者，忽略 checkpoints 文件夹下的所有内容（推荐）
+checkpoints/
+
+# 或者，忽略项目中所有的 .pth 模型权重文件（通常都不需要提交）
+*.pth
+
+datasets/

@@ -1,0 +1,106 @@
+Dataset:
+  Calibration:
+    cx: 302.29
+    cy: 241.49
+    depth_scale: 1000.0
+    distorted: false
+    fx: 516.95
+    fy: 516.86
+    height: 480
+    k1: -0.00020782629144378
+    k2: 0.000180254035512917
+    k3: 9.6945594123099e-05
+    p1: 0.0
+    p2: 0.0
+    width: 640
+  adaptive_pointsize: true
+  begin: 0
+  dataset_path: datasets/StereoMIS/stereo_seq_easy/stereo_seq_easy/train
+  depth_loss: false
+  end: 300
+  pcd_downsample: 256
+  pcd_downsample_init: 128
+  point_size: 0.01
+  sensor_type: monocular
+  type: tum
+Results:
+  color_refinement: true
+  eval_rendering: true
+  global_BA: false
+  save_dir: results/stereo_seq_easy_stereo_seq_easy/2025-11-27-17-41-19
+  save_results: true
+  save_trj: true
+  save_trj_kf_intv: 10
+  use_gui: false
+  use_wandb: false
+Training:
+  a_invalid: 0.5
+  a_valid: 0.2
+  alpha: 0.98
+  edge_threshold: 1.1
+  gaussian_extent: 1.0
+  gaussian_reset: 2001
+  gaussian_th: 0.7
+  gaussian_update_every: 150
+  gaussian_update_offset: 50
+  global_BA_itr_num: 500
+  init_gaussian_extent: 30
+  init_gaussian_reset: 500
+  init_gaussian_th: 0.005
+  init_gaussian_update: 100
+  init_itr_num: 1050
+  kf_cutoff: 0.3
+  kf_interval: 5
+  kf_min_translation: 0.05
+  kf_overlap: 0.9
+  kf_translation: 0.08
+  lr:
+    cam_rot_delta: 0.003
+    cam_trans_delta: 0.001
+  mapping_itr_nosingle: 30
+  mapping_itr_num: 150
+  pose_window: 3
+  prune_mode: slam
+  prune_num: 1
+  rgb_boundary_threshold: 0.01
+  single_thread: false
+  size_threshold: 20
+  spherical_harmonics: false
+  tracking_itr_num: 100
+  window_size: 8
+depth:
+  error_threshold: 0.1
+  final_error_threshold: 0.15
+  mean_threshold: 0.3
+  min_accurate_pixels_ratio: 0.01
+  patch_size: 10
+  std_threshold: 0.3
+inherit_from: configs/mono/Stereo/Stereo_seq_easy/base_config.yaml
+model_params:
+  data_device: cuda
+  model_path: ''
+  resolution: -1
+  sh_degree: 0
+  source_path: ''
+  white_background: false
+opt_params:
+  densification_interval: 100
+  densify_from_iter: 500
+  densify_grad_threshold: 0.0002
+  densify_until_iter: 15000
+  feature_lr: 0.0025
+  init_lr: 6
+  iterations: 30000
+  lambda_dssim: 0.2
+  opacity_lr: 0.05
+  opacity_reset_interval: 3000
+  percent_dense: 0.01
+  position_lr_delay_mult: 0.01
+  position_lr_final: 0.00016
+  position_lr_init: 0.0016
+  position_lr_max_steps: 30000
+  rotation_lr: 0.001
+  scaling_lr: 0.001
+pipeline_params:
+  compute_cov3D_python: false
+  convert_SHs_python: false

@@ -1,0 +1,29 @@
+inherit_from: "configs/mono/Stereo/base_config.yaml"
+
+Dataset:
+  begin: 0
+  end: 300
+  dataset_path: "datasets/StereoMIS/Stereo/stereo"
+  Calibration:
+    fx: 1033.894287109375
+    fy: 1033.7147216796875
+    cx: 604.578857421875
+    cy: 514.9761962890625
+    k1: -0.00020782629144378006
+    k2: 0.00018025403551291674
+    p1: 0.0
+    p2: 0.0
+    k3: 9.6945594123099e-05
+    width: 1280
+    height: 1024
+    depth_scale: 1000.0
+    distorted: True
+
+opt_params:
+    position_lr_init: 0.0016
+    position_lr_final: 0.00016
+    init_lr: 6
+
+Training:
+    alpha: 0.98
+    mapping_itr_nosingle: 30

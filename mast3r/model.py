@@ -51,18 +51,55 @@ class AsymmetricMASt3R(AsymmetricCroCo3DStereo):
         else:
             return super(AsymmetricMASt3R, cls).from_pretrained(pretrained_model_name_or_path, **kw)
 
-    def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size, **kw):
-        assert img_size[0] % patch_size == 0 and img_size[
-            1] % patch_size == 0, f'{img_size=} must be multiple of {patch_size=}'
+    def set_downstream_head(
+        self,
+        output_mode,
+        head_type,
+        landscape_only,
+        depth_mode,
+        conf_mode,
+        **croco_kwargs,
+    ):
+        # 从 croco_kwargs 里拿 patch_size 和 img_size（dust3r 这边就是这么传的）
+        patch_size = croco_kwargs.get("patch_size", 16)
+        img_size = croco_kwargs.get("img_size", 512)
+
+        if isinstance(img_size, int):
+            img_size = (img_size, img_size)
+
+        assert img_size[0] % patch_size == 0 and img_size[1] % patch_size == 0, \
+            f'{img_size=} must be multiple of {patch_size=}'
+
+        # ---- 1. Dust3R 风格：linear + pts3d，直接走父类（原版 dust3r 的 head）----
+        if head_type == "linear" and output_mode == "pts3d":
+            # 调父类实现，避免再次走到这个 override
+            return AsymmetricCroCo3DStereo.set_downstream_head(
+                self,
+                output_mode,
+                head_type,
+                landscape_only,
+                depth_mode,
+                conf_mode,
+                **croco_kwargs,
+            )
+
+        # ---- 2. MASt3R 风格：catmlp+dpt、pts3d+desc24 等，使用 MASt3R 的双 head ----
         self.output_mode = output_mode
         self.head_type = head_type
         self.depth_mode = depth_mode
         self.conf_mode = conf_mode
         if self.desc_conf_mode is None:
             self.desc_conf_mode = conf_mode
-        # allocate heads
-        self.downstream_head1 = mast3r_head_factory(head_type, output_mode, self, has_conf=bool(conf_mode))
-        self.downstream_head2 = mast3r_head_factory(head_type, output_mode, self, has_conf=bool(conf_mode))
-        # magic wrapper
+
+        # 分别建两个 head（对应两张图）
+        self.downstream_head1 = mast3r_head_factory(
+            head_type, output_mode, self, has_conf=bool(conf_mode)
+        )
+        self.downstream_head2 = mast3r_head_factory(
+            head_type, output_mode, self, has_conf=bool(conf_mode)
+        )
+
+        # landscape_only 时自动转置到横图
         self.head1 = transpose_to_landscape(self.downstream_head1, activate=landscape_only)
         self.head2 = transpose_to_landscape(self.downstream_head2, activate=landscape_only)
+

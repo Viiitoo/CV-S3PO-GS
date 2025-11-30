@@ -12,9 +12,9 @@ Results:
 Dataset:
   type: 'waymo'
   sensor_type: 'monocular'
-  depth_loss: True
-  pcd_downsample: 64
-  pcd_downsample_init: 32
+  depth_loss: False
+  pcd_downsample: 256
+  pcd_downsample_init: 128
   adaptive_pointsize: True
   point_size: 0.01
 

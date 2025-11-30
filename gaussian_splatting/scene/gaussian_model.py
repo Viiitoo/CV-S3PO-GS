@@ -169,30 +169,53 @@ class GaussianModel:
         )
         self.ply_input = pcd
 
-        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()     
-        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())   
+                # --- 把点云/颜色搬到 GPU ---
+        points_np = np.asarray(pcd.points)
+        colors_np = np.asarray(pcd.colors)
+
+        print("PCD points:", points_np.shape,
+              " approx mem (xyz float32):",
+              points_np.shape[0] * points_np.shape[1] * 4 / (1024**2), "MB")
+
+        fused_point_cloud = torch.from_numpy(points_np).float().cuda()
+        fused_color = RGB2SH(torch.from_numpy(colors_np).float().cuda())
+
         features = (
-            torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
-            .float()
-            .cuda()
+            torch.zeros(
+                (fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2),
+                dtype=torch.float32,
+                device="cuda",
+            )
         )
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
-        dist2 = (
-            torch.clamp_min(
-                distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
-                0.0000001,
-            )
-            * point_size
+        # === 关键修改：不再使用 distCUDA2，直接用场景尺度估计初始 Gaussian 半径 ===
+        # 1. 用点到原点的范数估计一个场景尺度（取 90% 分位数，避免少量远点影响）
+        with torch.no_grad():
+            radii = torch.linalg.norm(fused_point_cloud, dim=1)  # (N,)
+            scene_extent = torch.quantile(radii, 0.9).item()
+
+        # 2. 根据场景尺度 + point_size 给一个经验半径
+        #    比如：初始半径 ≈ scene_extent * 0.01 * point_size
+        base_scale = max(scene_extent * 0.01 * point_size, 1e-3)
+        # （你可以之后根据效果再调这个系数，比如 0.005、0.02 之类）
+
+        # 3. 写入 log-尺度（和原始代码接口一致）
+        scales = torch.full(
+            (fused_point_cloud.shape[0], 1),
+            np.log(base_scale),
+            dtype=torch.float32,
+            device="cuda",
         )
-        scales = torch.log(torch.sqrt(dist2))[..., None]
         if not self.isotropic:
             scales = scales.repeat(1, 3)
 
+        # --- 旋转 & 不透明度和原来一样 ---
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
-        opacities = inverse_sigmoid(         
+
+        opacities = inverse_sigmoid(
             0.5
             * torch.ones(
                 (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
@@ -200,6 +223,7 @@ class GaussianModel:
         )
 
         return fused_point_cloud, features, scales, rots, opacities
+
     
     def init_lr(self, spatial_lr_scale):
         self.spatial_lr_scale = spatial_lr_scale

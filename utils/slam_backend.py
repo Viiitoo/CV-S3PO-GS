@@ -93,6 +93,12 @@ class BackEnd(mp.Process):
     def initialize_map(self, cur_frame_idx, viewpoint):
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
+            # print(">>> Before first render:")
+            # print("xyz:", self.gaussians._xyz.shape)
+            # print("scaling:", self.gaussians._scaling.shape)
+            # print("rotation:", self.gaussians._rotation.shape)
+            # print("opacity:", self.gaussians._opacity.shape)
+
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )

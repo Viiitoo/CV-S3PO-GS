@@ -226,6 +226,10 @@ if __name__ == "__main__":
     parser.add_argument("--windowsize", type=int, default=None, help="window size of local BA")
     parser.add_argument("--patch_size", type=int, default=None, help="patch size")
     
+    parser.add_argument("--ns", type=int, default=None, help="mapping_itr_nosingle (number of scales)")
+    parser.add_argument("--sh", type=int, default=None, help="spherical harmonics degree")
+
+
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -290,7 +294,7 @@ if __name__ == "__main__":
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
         
-    model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
+    model_name = "checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
     mast3r_model = AsymmetricMASt3R.from_pretrained(model_name).to("cuda")
     
     slam = SLAM(config, save_dir=save_dir,mast3r_model=mast3r_model)

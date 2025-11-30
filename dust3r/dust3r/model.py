@@ -109,8 +109,15 @@ class AsymmetricCroCo3DStereo (
         """ No prediction head """
         return
 
-    def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size,
-                            **kw):
+    def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode,
+                            patch_size, img_size, **kw):
+        # 兼容：有些 checkpoint/config 里 img_size 是一个 int（例如 512），
+        # 但下面代码是按 (H, W) tuple 在用的，这里统一转换一下。
+        if isinstance(img_size, int):
+            img_size = (img_size, img_size)
+        elif isinstance(img_size, (list, tuple)) and len(img_size) == 1:
+            img_size = (img_size[0], img_size[0])
+
         assert img_size[0] % patch_size == 0 and img_size[1] % patch_size == 0, \
             f'{img_size=} must be multiple of {patch_size=}'
         self.output_mode = output_mode
