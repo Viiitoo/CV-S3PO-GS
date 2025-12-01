@@ -1,5 +1,4 @@
 import time
-
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -18,7 +17,7 @@ from utils.init_pose import get_pose, get_depth, save_confidence_map
 from utils.depth_utils import process_depth
 
 class FrontEnd(mp.Process):
-    def __init__(self, config,model, save_dir=None):
+    def __init__(self, config, model, save_dir=None):
         super().__init__()
         self.config = config
         self.background = None
@@ -31,6 +30,13 @@ class FrontEnd(mp.Process):
 
         self.initialized = False            
         self.kf_indices = []
+        
+        # [Modified] 1. 定义存储完整轨迹的列表
+        self.full_trajectory_data = {
+            "trj_id": [],
+            "trj_est": []
+        }
+        
         self.monocular = config["Training"]["monocular"]
         self.iteration_count = 0
         self.occ_aware_visibility = {}
@@ -59,6 +65,7 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]       
+    
     # Add a new keyframe. Create valid pixel mask using RGB boundary threshold from config, then generate initial depth map
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
@@ -92,7 +99,7 @@ class FrontEnd(mp.Process):
                     f"Std: {torch.std(initial_depth).item()}")
                 initial_depth[~valid_rgb.cpu()] = 0
                 return initial_depth[0].numpy()
-            else:                               # For non-initial keyframes, use rendered depth
+            else:                                               # For non-initial keyframes, use rendered depth
                 depth = depth.detach().clone()
                 opacity = opacity.detach()
                 
@@ -142,16 +149,14 @@ class FrontEnd(mp.Process):
 
         # get mono_depth from MASt3R
         img = viewpoint.original_image
-        # ========= 修改开始 =========
+        
         # 1. 调用函数，要求返回置信度
         depth, conf = get_depth(img, img, self.model, return_conf=True)
         viewpoint.mono_depth = depth
         
-        # 2. 保存置信度图到 save_dir (结果文件夹)
-        # 注意：self.save_dir 需要确保已创建，通常 SLAM 启动时会创建
+        # 2. 保存置信度图到 save_dir
         print(f"debug: saving confidence map for frame {cur_frame_idx}...")
         save_confidence_map(conf, cur_frame_idx, self.save_dir)
-        # ========= 修改结束 =========
         
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
@@ -175,20 +180,14 @@ class FrontEnd(mp.Process):
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
                             viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background)
         
-        # get mono_depth from MASt3R
-        # ========= 修改这里 (找到 get_depth 这一行) =========
-        # 原代码: viewpoint.mono_depth = get_depth(img2, img2, self.model)
-        
-        # 新代码:
+        # get mono_depth from MASt3R (Modified with confidence return)
         depth, conf = get_depth(img2, img2, self.model, return_conf=True)
         viewpoint.mono_depth = depth
         
-        # 保存置信度图 (注意: self.save_dir 要确保不是 None)
-        # 建议加个判定，或者直接用你刚才设置的那个 debug 路径
-        if cur_frame_idx % 10 == 0: # 建议每隔几帧存一张，否则会跑得很慢！
+        # 保存置信度图
+        if cur_frame_idx % 10 == 0: 
             print(f"Saving confidence map for frame {cur_frame_idx}")
             save_confidence_map(conf, cur_frame_idx, self.save_dir)
-        # =================================================
         
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)
@@ -398,9 +397,9 @@ class FrontEnd(mp.Process):
     # Synchronize data from backend, including Gaussian scene, occlusion-aware visibility, and keyframe info; update keyframe
     def sync_backend(self, data):
         self.gaussians = data[1]
-        occ_aware_visibility = data[2]
+        self.occ_aware_visibility = data[2]
         keyframes = data[3]
-        self.occ_aware_visibility = occ_aware_visibility
+        # self.occ_aware_visibility = occ_aware_visibility
 
         for kf_id, kf_R, kf_T in keyframes:
             self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
@@ -413,26 +412,24 @@ class FrontEnd(mp.Process):
     # Main execution loop: process messages in frontend and backend queues, perform tracking, keyframe management, 
     # synchronize data, clean up resources, and save results
     def run(self):
+        # ... (前面的初始化代码保持不变) ...
         cur_frame_idx = 0
         projection_matrix = getProjectionMatrix2(    
-            znear=0.01,
-            zfar=100.0,
-            fx=self.dataset.fx,
-            fy=self.dataset.fy,
-            cx=self.dataset.cx,
-            cy=self.dataset.cy,
-            W=self.dataset.width,
-            H=self.dataset.height,
+            znear=0.01, zfar=100.0, fx=self.dataset.fx, fy=self.dataset.fy,
+            cx=self.dataset.cx, cy=self.dataset.cy, W=self.dataset.width, H=self.dataset.height,
         ).transpose(0, 1)
         projection_matrix = projection_matrix.to(device=self.device)
         tic = torch.cuda.Event(enable_timing=True)      
         toc = torch.cuda.Event(enable_timing=True)
 
+        import json # 引入 json 库
+
         while True:
+            # ... (队列处理代码保持不变) ...
             if self.q_vis2main.empty():      
-                if self.pause:
-                    continue
+                if self.pause: continue
             else:
+                # ... (暂停逻辑保持不变) ...
                 data_vis2main = self.q_vis2main.get()
                 self.pause = data_vis2main.flag_pause
                 if self.pause:
@@ -443,38 +440,41 @@ class FrontEnd(mp.Process):
 
             if self.frontend_queue.empty():    
                 tic.record()
-                if cur_frame_idx >= len(self.dataset):  # If current frame index exceeds dataset length, evaluate results, save, and exit the loop
+                
+                # =========================================================
+                # [Modified] 4. 程序结束时，保存我们自己收集的完整轨迹
+                # =========================================================
+                if cur_frame_idx >= len(self.dataset):  
                     if self.save_results:
+                        # 1. 仍然调用原来的 eval_ate 保存关键帧评估结果 (可选)
                         eval_ate(
-                            self.cameras,
-                            self.kf_indices,
-                            self.save_dir,
-                            0,
-                            final=True,
-                            monocular=self.monocular,
+                            self.cameras, self.kf_indices, self.save_dir, 0,
+                            final=True, monocular=self.monocular,
                         )
-                        save_gaussians(
-                            self.gaussians, self.save_dir, "final", final=True
-                        )
+                        save_gaussians(self.gaussians, self.save_dir, "final", final=True)
+                        
+                        # 2. 保存所有帧的轨迹到 full_trajectory.json
+                        full_trj_path = os.path.join(self.save_dir, "full_trajectory.json")
+                        print(f"Saving FULL trajectory ({len(self.full_trajectory_data['trj_id'])} frames) to {full_trj_path}...")
+                        with open(full_trj_path, "w") as f:
+                            json.dump(self.full_trajectory_data, f, indent=4)
+                            
                     break
+                # =========================================================
 
+                # ... (中间的 sleep 和 init 逻辑保持不变) ...
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
-
                 if self.single_thread and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
-
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
-               
-                viewpoint = Camera.init_from_dataset(
-                    self.dataset, cur_frame_idx, projection_matrix
-                )
+                
+                viewpoint = Camera.init_from_dataset(self.dataset, cur_frame_idx, projection_matrix)
                 viewpoint.compute_grad_mask(self.config)
-
                 self.cameras[cur_frame_idx] = viewpoint
 
                 if self.reset:
@@ -483,12 +483,26 @@ class FrontEnd(mp.Process):
                     cur_frame_idx += 1
                     continue
 
-                self.initialized = self.initialized or (
-                    len(self.current_window) == self.window_size
-                )
+                self.initialized = self.initialized or (len(self.current_window) == self.window_size)
 
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
+                
+                # =========================================================
+                # [Modified] 3. 强制记录每一帧的位姿 (在 Tracking 之后)
+                # =========================================================
+                # 获取 World-to-Camera 矩阵
+                w2c = getWorld2View2(viewpoint.R, viewpoint.T)
+                # 计算 Camera-to-World (C2W) 矩阵，这通常是画轨迹需要的
+                c2w = torch.linalg.inv(w2c)
+                
+                # 转为 list 存入字典
+                self.full_trajectory_data["trj_id"].append(cur_frame_idx)
+                self.full_trajectory_data["trj_est"].append(c2w.cpu().numpy().tolist())
+                # =========================================================
+                
+                # ... (后续代码保持不变: cleanup, keyframe logic 等) ...
+                
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
                 keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
@@ -502,87 +516,56 @@ class FrontEnd(mp.Process):
                     )
                 )
                 
+                # ... (后面所有的 keyframe 判断逻辑和 eval_ate 调用保持原样即可) ...
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
                     continue
 
                 last_keyframe_idx = self.current_window[0]
-                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval    # Frame interval is used as a criterion for keyframe selection
+                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
-                create_kf = self.is_keyframe(
-                    cur_frame_idx,
-                    last_keyframe_idx,
-                    curr_visibility,
-                    self.occ_aware_visibility,         
-                )
+                create_kf = self.is_keyframe(cur_frame_idx, last_keyframe_idx, curr_visibility, self.occ_aware_visibility)
+                
                 if len(self.current_window) < self.window_size:    
-                    union = torch.logical_or(
-                        curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                    ).count_nonzero()
-                    intersection = torch.logical_and(
-                        curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                    ).count_nonzero()
+                    union = torch.logical_or(curr_visibility, self.occ_aware_visibility[last_keyframe_idx]).count_nonzero()
+                    intersection = torch.logical_and(curr_visibility, self.occ_aware_visibility[last_keyframe_idx]).count_nonzero()
                     point_ratio = intersection / union
-                    create_kf = (
-                        check_time
-                        and point_ratio < self.config["Training"]["kf_overlap"]
-                    )
+                    create_kf = (check_time and point_ratio < self.config["Training"]["kf_overlap"])
+                
                 if self.single_thread:      
                     create_kf = check_time and create_kf
+                
                 if create_kf:     
-                    self.current_window, removed = self.add_to_window(
-                        cur_frame_idx,
-                        curr_visibility,
-                        self.occ_aware_visibility,
-                        self.current_window,
-                    )       
-                    depth_map = self.add_new_keyframe(     
-                        cur_frame_idx,
-                        depth=render_pkg["depth"],
-                        opacity=render_pkg["opacity"],
-                        init=False,
-                    )
-                    self.request_keyframe(    
-                        cur_frame_idx, viewpoint, self.current_window, depth_map
-                    )
+                    self.current_window, removed = self.add_to_window(cur_frame_idx, curr_visibility, self.occ_aware_visibility, self.current_window)       
+                    depth_map = self.add_new_keyframe(cur_frame_idx, depth=render_pkg["depth"], opacity=render_pkg["opacity"], init=False)
+                    self.request_keyframe(cur_frame_idx, viewpoint, self.current_window, depth_map)
                 else:
                     self.cleanup(cur_frame_idx)
+                
                 cur_frame_idx += 1          
 
-                if (        # Evaluate camera pose if the conditions are satisfied
-                    self.save_results
-                    and self.save_trj
-                    and create_kf
-                    and len(self.kf_indices) % self.save_trj_kf_intv == 0
-                ):
+                # 这里原有的 eval_ate 不用动，它只负责中间的 Debug
+                if (self.save_results and self.save_trj and create_kf and len(self.kf_indices) % self.save_trj_kf_intv == 0):
                     Log("Evaluating ATE at frame: ", cur_frame_idx)
-                    eval_ate(
-                        self.cameras,
-                        self.kf_indices,
-                        self.save_dir,
-                        cur_frame_idx,
-                        monocular=self.monocular,
-                    )
+                    eval_ate(self.cameras, self.kf_indices, self.save_dir, cur_frame_idx, monocular=self.monocular)
+                
                 toc.record()
                 torch.cuda.synchronize()       
                 if create_kf:
-                    # throttle at 3fps when keyframe is added   
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
             else:      
+                # ... (backend sync 逻辑保持不变) ...
                 data = self.frontend_queue.get()
                 if data[0] == "sync_backend":
                     self.sync_backend(data)
-
                 elif data[0] == "keyframe":
                     self.sync_backend(data)
                     self.requested_keyframe -= 1
-
                 elif data[0] == "init":
                     self.sync_backend(data)
                     self.requested_init = False
-
                 elif data[0] == "stop":
                     Log("Frontend Stopped.")
                     break
