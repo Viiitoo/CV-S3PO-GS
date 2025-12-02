@@ -15,6 +15,7 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 from utils.init_pose import get_pose, get_depth, save_confidence_map
 from utils.depth_utils import process_depth
+import json 
 
 class FrontEnd(mp.Process):
     def __init__(self, config, model, save_dir=None):
@@ -31,7 +32,6 @@ class FrontEnd(mp.Process):
         self.initialized = False            
         self.kf_indices = []
         
-        # [Modified] 1. 定义存储完整轨迹的列表
         self.full_trajectory_data = {
             "trj_id": [],
             "trj_est": []
@@ -91,9 +91,9 @@ class FrontEnd(mp.Process):
             theta_rad = torch.acos((trace_R_diff - 1) / 2)
             theta_deg = torch.rad2deg(theta_rad)
             self.theta = theta_deg
-        #print("angular difference is:",self.theta)
+        
         gt_img = viewpoint.original_image.cuda()
-        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]      # Check if sum of RGB channels exceeds threshold; add a new dimension to match expected shape
+        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]      
         if self.monocular:
             if depth is None:
                 initial_depth = torch.from_numpy(viewpoint.mono_depth).unsqueeze(0)     # For the first frame, use MASt3R to estimate depth during map initialization
@@ -105,7 +105,7 @@ class FrontEnd(mp.Process):
                     f"Std: {torch.std(initial_depth).item()}")
                 initial_depth[~valid_rgb.cpu()] = 0
                 return initial_depth[0].numpy()
-            else:                                               # For non-initial keyframes, use rendered depth
+            else:                                                               # For non-initial keyframes, use rendered depth
                 depth = depth.detach().clone()
                 opacity = opacity.detach()
                 
@@ -114,21 +114,17 @@ class FrontEnd(mp.Process):
                 # Compute scale factor and adjust rendered depth (Pointmap Replacement)
                 render_depth = initial_depth.cpu().numpy()[0]
                 initial_depth, scale_factor, error_mask, num_accurate_pixels = process_depth(render_depth, viewpoint.mono_depth, last_depth = viewpoint_last.mono_depth, 
-                                                                                             im1 = viewpoint_last.original_image, im2 = viewpoint.original_image, model = self.model,
-                                                                                             patch_size = self.config["depth"]["patch_size"], 
-                                                                                             mean_threshold = self.config["depth"]["mean_threshold"], std_threshold = self.config["depth"]["std_threshold"],
-                                                                                             error_threshold = self.config["depth"]["error_threshold"], final_error_threshold = self.config["depth"]["final_error_threshold"],
-                                                                                             min_accurate_pixels_ratio = self.config["depth"]["min_accurate_pixels_ratio"])
+                                                                                         im1 = viewpoint_last.original_image, im2 = viewpoint.original_image, model = self.model,
+                                                                                         patch_size = self.config["depth"]["patch_size"], 
+                                                                                         mean_threshold = self.config["depth"]["mean_threshold"], std_threshold = self.config["depth"]["std_threshold"],
+                                                                                         error_threshold = self.config["depth"]["error_threshold"], final_error_threshold = self.config["depth"]["final_error_threshold"],
+                                                                                         min_accurate_pixels_ratio = self.config["depth"]["min_accurate_pixels_ratio"])
 
                 # Correct MASt3R scale
                 viewpoint.mono_depth = viewpoint.mono_depth * scale_factor
 
                 pixel_num = viewpoint.image_height * viewpoint.image_width
-                #print("Initialization info for frame", cur_frame_idx, ":", 
-                #    f"Max: {np.max(initial_depth)}", f"Min: {np.min(initial_depth)}", f"Mean: {np.mean(initial_depth)}",
-                #    f"Median: {np.median(initial_depth)}", f"Std: {np.std(initial_depth)}", f"Scale Factor: {scale_factor}", 
-                #    f"Accurate Pixel Ratio: {num_accurate_pixels / pixel_num}", f"Accurate Pixel Ratio: {np.sum(error_mask) / pixel_num}")
-                
+               
                 valid_rgb_np = valid_rgb.cpu().numpy() if isinstance(valid_rgb, torch.Tensor) else valid_rgb
                 if initial_depth.shape == valid_rgb_np.shape[1:]:
                     initial_depth[~valid_rgb_np[0]] = 0 
@@ -138,8 +134,7 @@ class FrontEnd(mp.Process):
         initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
         return initial_depth[0].numpy()      # initial_depth is a 4D tensor (1, C, H, W); extract the first channel as (C, H, W)
     
-    # Initialize the SLAM system: clear backend queue, reset state, set current frame to ground-truth pose, 
-    # add a new keyframe, and push related info into the backend queue
+    # Initialize the SLAM system
     def initialize(self, cur_frame_idx, viewpoint):
         self.initialized = not self.monocular
         self.kf_indices = []
@@ -156,9 +151,15 @@ class FrontEnd(mp.Process):
         # get mono_depth from MASt3R
         img = viewpoint.original_image
         
-        # 1. 调用函数，要求返回置信度
+        # [Modified] Get depth and confidence
         depth, conf = get_depth(img, img, self.model, return_conf=True)
         viewpoint.mono_depth = depth
+        
+        # [Modified] Store confidence map in viewpoint (Transfer to GPU)
+        if isinstance(conf, np.ndarray):
+            viewpoint.confidence_map = torch.from_numpy(conf).float().to(self.device)
+        else:
+            viewpoint.confidence_map = conf.to(self.device)
         
         # 2. 保存置信度图到 save_dir
         print(f"debug: saving confidence map for frame {cur_frame_idx}...")
@@ -168,7 +169,7 @@ class FrontEnd(mp.Process):
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
         self.request_init(cur_frame_idx, viewpoint, depth_map)      # Request initialization and push related info into the backend queue
         self.reset = False
-   
+    
     def tracking(self, cur_frame_idx, viewpoint):    
         ##=====================Pointmap Anchored Pose Estimation(PAPE)=====================
         # The previous frame
@@ -186,10 +187,16 @@ class FrontEnd(mp.Process):
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
                             viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background)
         
-        # get mono_depth from MASt3R (Modified with confidence return)
+        # [Modified] get mono_depth and confidence
         depth, conf = get_depth(img2, img2, self.model, return_conf=True)
         viewpoint.mono_depth = depth
         
+        # [Modified] Store confidence map
+        if isinstance(conf, np.ndarray):
+            viewpoint.confidence_map = torch.from_numpy(conf).float().to(self.device)
+        else:
+            viewpoint.confidence_map = conf.to(self.device)
+
         # 保存置信度图
         if cur_frame_idx % 10 == 0: 
             print(f"Saving confidence map for frame {cur_frame_idx}")
@@ -206,9 +213,6 @@ class FrontEnd(mp.Process):
             pose_init = rel_pose @ pose_last_kf
             viewpoint.update_RT(pose_init[:3, :3], pose_init[:3, 3])
 
-        # Use previous frame pose (for ablation)
-        #viewpoint.update_RT(prev.R, prev.T)
-        
         ## ===================================Pose Optimization=================================
         opt_params = []     # Exposure parameters a and b, used to adjust image brightness
         opt_params.append(
@@ -251,8 +255,11 @@ class FrontEnd(mp.Process):
                 render_pkg["opacity"],
             )
             pose_optimizer.zero_grad()
+            
+            # [Modified] Pass confidence to loss function
             loss_tracking = get_loss_tracking(
-                self.config, image, depth, opacity, viewpoint
+                self.config, image, depth, opacity, viewpoint, 
+                confidence=viewpoint.confidence_map 
             )
             loss_tracking.backward()
 
@@ -315,16 +322,11 @@ class FrontEnd(mp.Process):
 
         rot_equiv = angle * self.median_depth
         alpha = 0.05
-        # dist_total = torch.sqrt(dist_trans**2 + (alpha * rot_equiv)**2)
         
-        # rotation_check = dist_total > kf_translation * self.median_depth
-        # rotation_check2 = dist_total > kf_min_translation * self.median_depth
         return True
-        return (rot_equiv > alpha * self.median_depth) or dist_check or (point_ratio_2 < kf_overlap and dist_check2)
-
-        return (point_ratio_2 < kf_overlap and dist_check2) or dist_check     # Small co-visibility or large camera motion
+        # return (rot_equiv > alpha * self.median_depth) or dist_check or (point_ratio_2 < kf_overlap and dist_check2)
+        # return (point_ratio_2 < kf_overlap and dist_check2) or dist_check     # Small co-visibility or large camera motion
     
-    # Add current frame to the window and remove the least important keyframe based on overlap ratio to keep window size within limit
     def add_to_window(
         self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
     ):
@@ -386,7 +388,6 @@ class FrontEnd(mp.Process):
             window.remove(removed_frame)
         return window, removed_frame
     
-    # Request to add a new keyframe and push related info into the backend queue
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap):
         msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap, self.theta]
         self.backend_queue.put(msg)
@@ -400,7 +401,7 @@ class FrontEnd(mp.Process):
         msg = ["init", cur_frame_idx, viewpoint, depth_map]
         self.backend_queue.put(msg)
         self.requested_init = True
-    # Synchronize data from backend, including Gaussian scene, occlusion-aware visibility, and keyframe info; update keyframe
+
     def sync_backend(self, data):
         self.gaussians = data[1]
         self.occ_aware_visibility = data[2]
@@ -409,16 +410,13 @@ class FrontEnd(mp.Process):
 
         for kf_id, kf_R, kf_T in keyframes:
             self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
-    # Clear current frame's camera data; clear CUDA cache every 10 frames
+
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()
             
-    # Main execution loop: process messages in frontend and backend queues, perform tracking, keyframe management, 
-    # synchronize data, clean up resources, and save results
     def run(self):
-        # ... (前面的初始化代码保持不变) ...
         cur_frame_idx = 0
         projection_matrix = getProjectionMatrix2(    
             znear=0.01, zfar=100.0, fx=self.dataset.fx, fy=self.dataset.fy,
@@ -428,14 +426,11 @@ class FrontEnd(mp.Process):
         tic = torch.cuda.Event(enable_timing=True)      
         toc = torch.cuda.Event(enable_timing=True)
 
-        import json # 引入 json 库
-
         while True:
-            # ... (队列处理代码保持不变) ...
+            # ... (队列处理) ...
             if self.q_vis2main.empty():      
                 if self.pause: continue
             else:
-                # ... (暂停逻辑保持不变) ...
                 data_vis2main = self.q_vis2main.get()
                 self.pause = data_vis2main.flag_pause
                 if self.pause:
@@ -447,28 +442,22 @@ class FrontEnd(mp.Process):
             if self.frontend_queue.empty():    
                 tic.record()
                 
-                # =========================================================
-                # [Modified] 4. 程序结束时，保存我们自己收集的完整轨迹
-                # =========================================================
+                # 保存轨迹逻辑
                 if cur_frame_idx >= len(self.dataset):  
                     if self.save_results:
-                        # 1. 仍然调用原来的 eval_ate 保存关键帧评估结果 (可选)
                         eval_ate(
                             self.cameras, self.kf_indices, self.save_dir, 0,
                             final=True, monocular=self.monocular,
                         )
                         save_gaussians(self.gaussians, self.save_dir, "final", final=True)
                         
-                        # 2. 保存所有帧的轨迹到 full_trajectory.json
                         full_trj_path = os.path.join(self.plot_dir, "full_trajectory.json")
                         print(f"Saving FULL trajectory ({len(self.full_trajectory_data['trj_id'])} frames) to {full_trj_path}...")
                         with open(full_trj_path, "w") as f:
                             json.dump(self.full_trajectory_data, f, indent=4)
                             
                     break
-                # =========================================================
 
-                # ... (中间的 sleep 和 init 逻辑保持不变) ...
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
@@ -494,20 +483,11 @@ class FrontEnd(mp.Process):
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
                 
-                # =========================================================
-                # [Modified] 3. 强制记录每一帧的位姿 (在 Tracking 之后)
-                # =========================================================
-                # 获取 World-to-Camera 矩阵
+                # 记录位姿
                 w2c = getWorld2View2(viewpoint.R, viewpoint.T)
-                # 计算 Camera-to-World (C2W) 矩阵，这通常是画轨迹需要的
                 c2w = torch.linalg.inv(w2c)
-                
-                # 转为 list 存入字典
                 self.full_trajectory_data["trj_id"].append(cur_frame_idx)
                 self.full_trajectory_data["trj_est"].append(c2w.cpu().numpy().tolist())
-                # =========================================================
-                
-                # ... (后续代码保持不变: cleanup, keyframe logic 等) ...
                 
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
@@ -522,7 +502,6 @@ class FrontEnd(mp.Process):
                     )
                 )
                 
-                # ... (后面所有的 keyframe 判断逻辑和 eval_ate 调用保持原样即可) ...
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
@@ -551,7 +530,6 @@ class FrontEnd(mp.Process):
                 
                 cur_frame_idx += 1          
 
-                # 这里原有的 eval_ate 不用动，它只负责中间的 Debug
                 if (self.save_results and self.save_trj and create_kf and len(self.kf_indices) % self.save_trj_kf_intv == 0):
                     Log("Evaluating ATE at frame: ", cur_frame_idx)
                     eval_ate(self.cameras, self.kf_indices, self.save_dir, cur_frame_idx, monocular=self.monocular)
@@ -562,7 +540,6 @@ class FrontEnd(mp.Process):
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
             else:      
-                # ... (backend sync 逻辑保持不变) ...
                 data = self.frontend_queue.get()
                 if data[0] == "sync_backend":
                     self.sync_backend(data)

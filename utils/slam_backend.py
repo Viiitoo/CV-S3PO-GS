@@ -93,12 +93,6 @@ class BackEnd(mp.Process):
     def initialize_map(self, cur_frame_idx, viewpoint):
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
-            # print(">>> Before first render:")
-            # print("xyz:", self.gaussians._xyz.shape)
-            # print("scaling:", self.gaussians._scaling.shape)
-            # print("rotation:", self.gaussians._rotation.shape)
-            # print("opacity:", self.gaussians._opacity.shape)
-
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )
@@ -119,8 +113,11 @@ class BackEnd(mp.Process):
                 render_pkg["opacity"],
                 render_pkg["n_touched"],
             )
+            
+            # [Modified] Pass confidence map
+            conf_map = getattr(viewpoint, 'confidence_map', None)
             loss_init = get_loss_mapping(
-                self.config, image, viewpoint, depth=depth,initialization=True
+                self.config, image, viewpoint, depth=depth, initialization=True, confidence=conf_map
             )
             loss_init.backward()
 
@@ -174,7 +171,7 @@ class BackEnd(mp.Process):
             viewspace_point_tensor_acm = []                 
             visibility_filter_acm = []                      
             radii_acm = []                                  
-            n_touched_acm = []                            
+            n_touched_acm = []                              
 
             keyframes_opt = []          
 
@@ -184,7 +181,7 @@ class BackEnd(mp.Process):
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background
                 )
-                (                                          
+                (                                       
                     image,
                     viewspace_point_tensor,                 
                     visibility_filter,                     
@@ -201,7 +198,11 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-                loss_mapping += get_loss_mapping(self.config, image, viewpoint, depth=depth, monodepth=True)
+                
+                # [Modified] Pass confidence map
+                conf_map = getattr(viewpoint, 'confidence_map', None)
+                loss_mapping += get_loss_mapping(self.config, image, viewpoint, depth=depth, monodepth=True, confidence=conf_map)
+                
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -230,7 +231,11 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-                loss_mapping += get_loss_mapping(self.config, image, viewpoint, depth=depth, monodepth=True)
+                
+                # [Modified] Pass confidence map
+                conf_map = getattr(viewpoint, 'confidence_map', None)
+                loss_mapping += get_loss_mapping(self.config, image, viewpoint, depth=depth, monodepth=True, confidence=conf_map)
+                
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -372,9 +377,7 @@ class BackEnd(mp.Process):
             
         msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
         self.frontend_queue.put(msg)
-    # Main execution loop: 
-    # process backend messages, perform initialization, optimize keyframe map, color refinement,
-    # synchronize data, and push updates to the frontend
+    
     def run(self):
         while True:
             if self.backend_queue.empty():
@@ -474,20 +477,20 @@ class BackEnd(mp.Process):
                                     "name": "trans_{}".format(viewpoint.uid),
                                 }
                             )
-                        opt_params.append(
-                            {
-                                "params": [viewpoint.exposure_a],
-                                "lr": 0.01,
-                                "name": "exposure_a_{}".format(viewpoint.uid),
-                            }
-                        )
-                        opt_params.append(
-                            {
-                                "params": [viewpoint.exposure_b],
-                                "lr": 0.01,
-                                "name": "exposure_b_{}".format(viewpoint.uid),
-                            }
-                        )
+                            opt_params.append(
+                                {
+                                    "params": [viewpoint.exposure_a],
+                                    "lr": 0.01,
+                                    "name": "exposure_a_{}".format(viewpoint.uid),
+                                }
+                            )
+                            opt_params.append(
+                                {
+                                    "params": [viewpoint.exposure_b],
+                                    "lr": 0.01,
+                                    "name": "exposure_b_{}".format(viewpoint.uid),
+                                }
+                            )
                     self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
                     self.map(self.current_window, iters=iter_per_kf, up_pose=True)

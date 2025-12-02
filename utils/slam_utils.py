@@ -37,15 +37,18 @@ def image_gradient_mask(image, eps=0.01):
     return img_grad_v[0] == torch.sum(conv_x), img_grad_h[0] == torch.sum(conv_y)
 
 
-def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=False):
+# [Modified] Added confidence argument
+def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=False, confidence=None):
     image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
     
+    # 如果是单目且开启了 depth_loss，现在我们允许使用 confidence 加权的深度损失
     if config["Training"]["monocular"] and config["Dataset"]["depth_loss"]:
-        #return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
-        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
+        return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint, confidence=confidence)
+        
     if config["Training"]["monocular"]:
         return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
-    return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
+        
+    return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint, confidence=confidence)
 
 def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
     gt_image = viewpoint.original_image.cuda()
@@ -58,8 +61,9 @@ def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
     
     return l1.mean()
 
+# [Modified] Added confidence argument and weighting logic
 def get_loss_tracking_rgbd(
-    config, image, depth, opacity, viewpoint, initialization=False
+    config, image, depth, opacity, viewpoint, initialization=False, confidence=None
 ):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
 
@@ -71,20 +75,29 @@ def get_loss_tracking_rgbd(
 
     l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
     depth_mask = depth_pixel_mask * opacity_mask
-    l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
-    return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
+    
+    l1_depth_error = torch.abs(depth * depth_mask - gt_depth * depth_mask)
+    
+    # [Logic Update] Apply confidence weighting
+    if confidence is not None:
+        if confidence.ndim == 2:
+            confidence = confidence.unsqueeze(0) # Ensure (1, H, W)
+        l1_depth_error = l1_depth_error * confidence
 
-def get_loss_mapping(config, image,  viewpoint, depth=None, initialization=False, monodepth = True):
+    return alpha * l1_rgb + (1 - alpha) * l1_depth_error.mean()
+
+# [Modified] Added confidence argument
+def get_loss_mapping(config, image, viewpoint, depth=None, initialization=False, monodepth=True, confidence=None):
     if initialization:
         image_ab = image
     else:
         image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
         
     if config["Training"]["monocular"] and monodepth:
-        return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
+        return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint, confidence=confidence)
     if config["Training"]["monocular"]:
         return get_loss_mapping_rgb(config, image_ab, viewpoint)
-    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
+    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint, confidence=confidence)
 
 def get_loss_mapping_rgb(config, image, viewpoint):
     gt_image = viewpoint.original_image.cuda()
@@ -97,7 +110,8 @@ def get_loss_mapping_rgb(config, image, viewpoint):
 
     return l1_rgb.mean()
 
-def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
+# [Modified] Added confidence argument and weighting logic
+def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False, confidence=None):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
 
@@ -111,6 +125,13 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False)
 
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
+    
+    # [Logic Update] Apply confidence weighting
+    if confidence is not None:
+        if confidence.ndim == 2:
+            confidence = confidence.unsqueeze(0)
+        l1_depth = l1_depth * confidence
+
     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):
