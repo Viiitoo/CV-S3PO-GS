@@ -64,7 +64,13 @@ class FrontEnd(mp.Process):
         self.tracking_itr_num = self.config["Training"]["tracking_itr_num"]
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
-        self.single_thread = self.config["Training"]["single_thread"]       
+        self.single_thread = self.config["Training"]["single_thread"]
+        self.confidence_dir = os.path.join(self.save_dir, "confidence")
+        self.plot_dir = os.path.join(self.save_dir, "plot")
+        
+        if self.save_results:
+            os.makedirs(self.confidence_dir, exist_ok=True)
+            os.makedirs(self.plot_dir, exist_ok=True)       
     
     # Add a new keyframe. Create valid pixel mask using RGB boundary threshold from config, then generate initial depth map
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
@@ -156,7 +162,7 @@ class FrontEnd(mp.Process):
         
         # 2. 保存置信度图到 save_dir
         print(f"debug: saving confidence map for frame {cur_frame_idx}...")
-        save_confidence_map(conf, cur_frame_idx, self.save_dir)
+        save_confidence_map(conf, cur_frame_idx, self.confidence_dir)
         
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
@@ -187,7 +193,7 @@ class FrontEnd(mp.Process):
         # 保存置信度图
         if cur_frame_idx % 10 == 0: 
             print(f"Saving confidence map for frame {cur_frame_idx}")
-            save_confidence_map(conf, cur_frame_idx, self.save_dir)
+            save_confidence_map(conf, cur_frame_idx, self.confidence_dir)
         
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)
@@ -454,7 +460,7 @@ class FrontEnd(mp.Process):
                         save_gaussians(self.gaussians, self.save_dir, "final", final=True)
                         
                         # 2. 保存所有帧的轨迹到 full_trajectory.json
-                        full_trj_path = os.path.join(self.save_dir, "full_trajectory.json")
+                        full_trj_path = os.path.join(self.plot_dir, "full_trajectory.json")
                         print(f"Saving FULL trajectory ({len(self.full_trajectory_data['trj_id'])} frames) to {full_trj_path}...")
                         with open(full_trj_path, "w") as f:
                             json.dump(self.full_trajectory_data, f, indent=4)
