@@ -12,6 +12,7 @@
    * **After (Confidence-Weighted):**
        $$L_{depth} = \mathbf{C} \cdot | D_{render} - D_{gt} |_1$$
 2. Core Implementation
+
 FrontEnd: 获取 MASt3R 的 confidence 并存储至 viewpoint.confidence_map (GPU Tensor)。
 
 BackEnd / Tracking: 在 get_loss_mapping 和 get_loss_tracking 中提取该 Map。
