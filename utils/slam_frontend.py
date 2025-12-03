@@ -113,12 +113,28 @@ class FrontEnd(mp.Process):
                 
                 # Compute scale factor and adjust rendered depth (Pointmap Replacement)
                 render_depth = initial_depth.cpu().numpy()[0]
-                initial_depth, scale_factor, error_mask, num_accurate_pixels = process_depth(render_depth, viewpoint.mono_depth, last_depth = viewpoint_last.mono_depth, 
-                                                                                         im1 = viewpoint_last.original_image, im2 = viewpoint.original_image, model = self.model,
-                                                                                         patch_size = self.config["depth"]["patch_size"], 
-                                                                                         mean_threshold = self.config["depth"]["mean_threshold"], std_threshold = self.config["depth"]["std_threshold"],
-                                                                                         error_threshold = self.config["depth"]["error_threshold"], final_error_threshold = self.config["depth"]["final_error_threshold"],
-                                                                                         min_accurate_pixels_ratio = self.config["depth"]["min_accurate_pixels_ratio"])
+                conf_map_np = None
+                if hasattr(viewpoint, 'confidence_map') and viewpoint.confidence_map is not None:
+                    # 确保转到 CPU 并转为 numpy，因为 process_depth 内部可能使用 cv2
+                    if isinstance(viewpoint.confidence_map, torch.Tensor):
+                        conf_map_np = viewpoint.confidence_map.detach().cpu().numpy()
+                    else:
+                        conf_map_np = viewpoint.confidence_map
+                initial_depth, scale_factor, error_mask, num_accurate_pixels = process_depth(
+                    render_depth, 
+                    viewpoint.mono_depth, 
+                    last_depth = viewpoint_last.mono_depth, 
+                    im1 = viewpoint_last.original_image, 
+                    im2 = viewpoint.original_image, 
+                    model = self.model,
+                    patch_size = self.config["depth"]["patch_size"], 
+                    mean_threshold = self.config["depth"]["mean_threshold"], 
+                    std_threshold = self.config["depth"]["std_threshold"],
+                    error_threshold = self.config["depth"]["error_threshold"], 
+                    final_error_threshold = self.config["depth"]["final_error_threshold"],
+                    min_accurate_pixels_ratio = self.config["depth"]["min_accurate_pixels_ratio"],
+                    confidence_map = conf_map_np  # <--- 新增这一行
+                )
 
                 # Correct MASt3R scale
                 viewpoint.mono_depth = viewpoint.mono_depth * scale_factor

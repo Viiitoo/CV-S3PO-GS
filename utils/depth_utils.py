@@ -57,7 +57,11 @@ def find_scale(im1, im2, depth1, depth2, model):
     return scale_factor
 
 # Patch-based Pointmap Scale Alignment (Algorithm 1 in Paper)
-def process_depth(render_depth, mono_depth, last_depth, im1, im2, model, patch_size=10, mean_threshold=0.25, std_threshold=0.3, error_threshold=0.1, final_error_threshold=0.15, max_iter=4, epsilon=0.01, min_accurate_pixels_ratio=0.01):
+def process_depth(render_depth, mono_depth, last_depth, im1, im2, model, 
+                  patch_size=10, mean_threshold=0.25, std_threshold=0.3, 
+                  error_threshold=0.1, final_error_threshold=0.15, 
+                  max_iter=4, epsilon=0.01, min_accurate_pixels_ratio=0.01,
+                  confidence_map=None): # [新增] 传入置信度图
     # Step 1: Ensure render_depth is in (H, W) format
     if render_depth.ndim == 3:
         render_depth = render_depth[0] 
@@ -124,16 +128,48 @@ def process_depth(render_depth, mono_depth, last_depth, im1, im2, model, patch_s
             final_mask = accurate_pixels.copy()  
             num_accurate_pixels = np.sum(final_mask)
 
-    # Step 7: Fill invalid (error) pixels
-    mono_depth_scaled = mono_depth * scale_factor
-    relative_error = np.abs(render_depth - mono_depth_scaled) / (mono_depth_scaled + 1e-8)  
-    error_mask = relative_error > final_error_threshold
+    # Step 7: Soft Weighted Fusion (软加权融合)
+    # -------------------------------------------------------
+    # 1. 准备对齐后的先验深度 X^p 和 测量深度 X^r
+    mono_depth_scaled = mono_depth * scale_factor  # X^p
+    X_r = render_depth                             # X^r
 
-    # Also fill pixels where rendered depth is zero
-    error_mask[render_depth == 0] = True
+    # 2. 准备置信度 c
+    # 如果没传置信度，默认全为 1.0 (仅依赖几何误差进行融合)
+    if confidence_map is None:
+        c = np.ones_like(X_r)
+    else:
+        # 确保置信度尺寸匹配 (以防传入的尺寸不一致)
+        if confidence_map.shape != (H, W):
+            c = cv2.resize(confidence_map, (W, H), interpolation=cv2.INTER_NEAREST)
+        else:
+            c = confidence_map
 
-    final_depth = np.where(error_mask, mono_depth_scaled, render_depth)
+    # 3. 计算相对残差 r = (Xr - Xp) / Xp
+    # 加 1e-8 防止除零
+    r = (X_r - mono_depth_scaled) / (mono_depth_scaled + 1e-8)
+
+    # 4. 计算鲁棒权重 w(r) (Cauchy Kernel)
+    # delta 对应 final_error_threshold (例如 0.15 即 15% 容差)
+    delta = final_error_threshold
+    w_r = 1.0 / (1.0 + (r / delta)**2)
+
+    # 5. 计算最终融合系数 alpha = c * w(r)
+    alpha = c * w_r
+    alpha = np.clip(alpha, 0.0, 1.0) # 限制在 [0, 1]
+
+    # 6. 执行融合 X_fused = alpha * Xr + (1-alpha) * Xp
+    final_depth = alpha * X_r + (1.0 - alpha) * mono_depth_scaled
+
+    # 7. 特殊情况处理
+    # 如果渲染深度本身是 0 (无效区域)，则强制完全信任先验
+    mask_zero = (X_r == 0)
+    final_depth[mask_zero] = mono_depth_scaled[mask_zero]
+
+    # 为了兼容接口返回 error_mask
+    # 定义：融合权重 alpha 过小 (例如小于 0.5) 的区域，可视作“渲染值不可信”的区域
+    error_mask = alpha < 0.5 
+
+    print(f"Soft Fusion Applied. Mean Alpha: {np.mean(alpha):.4f}")
     
-    print("Number of patches passed the first-stage filtering: ", patch_num)
-
     return final_depth, scale_factor, error_mask, num_accurate_pixels 
