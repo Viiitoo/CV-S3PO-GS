@@ -18,3 +18,26 @@ FrontEnd: 获取 MASt3R 的 confidence 并存储至 viewpoint.confidence_map (GP
 BackEnd / Tracking: 在 get_loss_mapping 和 get_loss_tracking 中提取该 Map。
 
 Loss Calculation: 修改 slam_utils.py，将置信度作为 Soft Mask 乘入深度误差项。
+
+2025/12/3
+引入鲁棒核函数
+
+**Description:**
+Replaced the previous hard thresholding logic (`np.where`) with a **Soft Weighted Fusion** strategy. This method leverages the MASt3R confidence map and a Cauchy robust kernel to smoothly fuse the rendered depth ($X^r$) and the geometric prior ($X^p$), ensuring gradient continuity and better robustness against noise.
+
+**Core Formulation:**
+Instead of a binary selection, the final depth is computed as:
+
+$$
+X_{fused} = \alpha X^r + (1 - \alpha) X^p
+$$
+
+Where the fusion weight $\alpha$ is determined by the confidence $c$ and the relative residual $r$:
+
+$$
+\alpha = \text{clip}(c \cdot w(r), 0, 1), \quad w(r) = \frac{1}{1 + (r / \delta)^2}
+$$
+
+* $r = (X^r - X^p) / X^p$: Relative geometric error.
+* $\delta$: Error tolerance threshold (e.g., 0.15).
+* $w(r)$: **Cauchy Robust Kernel** that automatically down-weights large errors.
