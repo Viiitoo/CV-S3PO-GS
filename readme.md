@@ -6,6 +6,7 @@
 Replaced standard $L_1$ loss with **Huber Loss** to handle depth outliers (flying pixels) and improve geometric consistency during tracking and mapping.
 
 **Core Formula:**
+
 $$
 L_{depth} = \begin{cases} 
 \frac{1}{2}(D_{render} - D_{gt})^2 & \text{if } |D_{render} - D_{gt}| \le \delta \\
