@@ -12,7 +12,7 @@ Results:
 Dataset:
   type: 'tum'
   sensor_type: 'monocular'
-  depth_loss: False
+  depth_loss: True
   pcd_downsample: 256
   pcd_downsample_init: 128
   adaptive_pointsize: True

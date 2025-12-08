@@ -40,11 +40,22 @@ def image_gradient_mask(image, eps=0.01):
 def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=False):
     image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
     
+    # --- [DEBUG START] ---
+    # 检查单目 + Depth Loss 的组合开关
     if config["Training"]["monocular"] and config["Dataset"]["depth_loss"]:
-        #return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
-        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
+        # 为了防止刷屏，我们随机只打印 1% 的日志，或者你可以看一眼后就停掉程序
+        if torch.rand(1).item() < 0.01: 
+            print("\033[92m[DEBUG SUCCESS] 正在调用 get_loss_tracking_rgbd (RGB-D模式已激活)\033[0m")
+        
+        # 确保这里解开了注释，调用的是 rgbd 版本
+        return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint, initialization)
+    # --- [DEBUG END] ---
+
     if config["Training"]["monocular"]:
+        if torch.rand(1).item() < 0.01:
+            print("\033[93m[DEBUG WARNING] 正在调用 get_loss_tracking_rgb (纯RGB模式，深度Loss未生效)\033[0m")
         return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
+        
     return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
 
 def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
@@ -66,13 +77,27 @@ def get_loss_tracking_rgbd(
     gt_depth = torch.from_numpy(viewpoint.mono_depth).to(
         dtype=torch.float32, device=image.device
     )[None]
+    
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     opacity_mask = (opacity > 0.95).view(*depth.shape)
 
     l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
     depth_mask = depth_pixel_mask * opacity_mask
-    l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
-    return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
+    
+    # Huber Loss 计算
+    pred_val = depth * depth_mask
+    gt_val = gt_depth * depth_mask
+    loss_depth = F.huber_loss(pred_val, gt_val, delta=0.2, reduction='mean')
+
+    # --- [DEBUG START] ---
+    # 打印具体的 Loss 数值
+    if torch.rand(1).item() < 0.01:
+        print(f"[DEBUG VALUE] Total: {(alpha * l1_rgb + (1 - alpha) * loss_depth).item():.4f} | "
+              f"RGB: {l1_rgb.item():.4f} | "
+              f"Depth(Huber): {loss_depth.item():.4f}")
+    # --- [DEBUG END] ---
+
+    return alpha * l1_rgb + (1 - alpha) * loss_depth
 
 def get_loss_mapping(config, image,  viewpoint, depth=None, initialization=False, monodepth = True):
     if initialization:
@@ -106,13 +131,22 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False)
     gt_depth = torch.from_numpy(viewpoint.mono_depth).to(
         dtype=torch.float32, device=image.device
     )[None]
+    
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
 
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
-    return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
-
+    
+    # [Modified] 将原本的 L1 Loss 替换为 Huber Loss
+    pred_val = depth * depth_pixel_mask
+    gt_val = gt_depth * depth_pixel_mask
+    
+    loss_depth = F.huber_loss(pred_val, gt_val, delta=0.2, reduction='mean')
+    
+    # 原代码: l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
+    # 原代码: return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+    
+    return alpha * l1_rgb.mean() + (1 - alpha) * loss_depth
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):
     depth = depth.detach().clone()
     opacity = opacity.detach()
