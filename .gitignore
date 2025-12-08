@@ -8,3 +8,5 @@ checkpoints/
 *.pth
 
 datasets/
+
+results/
