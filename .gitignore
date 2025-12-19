@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# ---- Build artifacts / binaries ----
+build/
+*/build/
+*.o
+*.obj
+*.so
+*.pyd
+*.dll
+*.dylib
+*.a
+*.lib
+*.exp
+
+# ---- Packaging ----
+*.egg-info/
+dist/
+wheelhouse/
+
+# ---- Common temp ----
+*.tmp
+*.swp
+.DS_Store
+checkpoints/
+datasets/
+data/
+logs/
+runs/
+outputs/
+results/
+
+# ---- If this repo contains large third-party code you don't want to commit ----
+# (comment these out if you DO want to track them)
+# dust3r/
+# croco/
