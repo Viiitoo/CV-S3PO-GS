@@ -17,6 +17,8 @@ import torch
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
+import torch.nn.functional as F
+
 
 from gaussian_splatting.utils.general_utils import (
     build_rotation,
@@ -44,6 +46,12 @@ class GaussianModel:
         self._opacity = torch.empty(0, device="cuda")
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
+
+        self.K_time = 3  # 先按 EH 常用 K=3
+        self.t_mu = nn.Parameter(torch.linspace(0.2, 0.8, self.K_time, device="cuda"))
+        self.t_sigma_raw = nn.Parameter(torch.zeros((self.K_time,), device="cuda"))  # softplus后约0.693
+        self._w_pos = torch.empty(0, self.K_time, 3, device="cuda")  # 先空，后面按N初始化
+
 
         self.unique_kfIDs = torch.empty(0).int()
         self.n_obs = torch.empty(0).int()
@@ -84,6 +92,38 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    def _time_phi(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        # t: shape [] or [1] or [B]; assumed normalized to [0,1]
+        #return: phi shape [B, K]
+        """
+        if t.dim() == 0:
+            t = t.view(1)
+        t = t.view(-1, 1)  # [B,1]
+        mu = self.t_mu.view(1, -1)  # [1,K]
+        sigma = F.softplus(self.t_sigma_raw).view(1, -1) + 1e-6
+        phi = torch.exp(-0.5 * ((t - mu) / sigma) ** 2)  # [B,K]
+        return phi
+
+    def get_xyz_t(self, t):
+        """
+        Return deformed xyz at time t. If t is None, fall back to canonical xyz.
+        We assume single-frame render (B=1) for now.
+        """
+        if t is None or self._w_pos.numel() == 0:
+            return self._xyz
+
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, device=self._xyz.device, dtype=self._xyz.dtype)
+        else:
+            t = t.to(device=self._xyz.device, dtype=self._xyz.dtype)
+
+        phi = self._time_phi(t)[0]  # [K]
+        # w_pos: [N,K,3], phi: [K] => delta: [N,3]
+        delta = torch.einsum("k,nkc->nc", phi, self._w_pos)
+        return self._xyz + delta
+
 
     @property
     def get_features(self):
@@ -169,53 +209,30 @@ class GaussianModel:
         )
         self.ply_input = pcd
 
-                # --- 把点云/颜色搬到 GPU ---
-        points_np = np.asarray(pcd.points)
-        colors_np = np.asarray(pcd.colors)
-
-        print("PCD points:", points_np.shape,
-              " approx mem (xyz float32):",
-              points_np.shape[0] * points_np.shape[1] * 4 / (1024**2), "MB")
-
-        fused_point_cloud = torch.from_numpy(points_np).float().cuda()
-        fused_color = RGB2SH(torch.from_numpy(colors_np).float().cuda())
-
+        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()     
+        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())   
         features = (
-            torch.zeros(
-                (fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2),
-                dtype=torch.float32,
-                device="cuda",
-            )
+            torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
+            .float()
+            .cuda()
         )
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
-        # === 关键修改：不再使用 distCUDA2，直接用场景尺度估计初始 Gaussian 半径 ===
-        # 1. 用点到原点的范数估计一个场景尺度（取 90% 分位数，避免少量远点影响）
-        with torch.no_grad():
-            radii = torch.linalg.norm(fused_point_cloud, dim=1)  # (N,)
-            scene_extent = torch.quantile(radii, 0.9).item()
-
-        # 2. 根据场景尺度 + point_size 给一个经验半径
-        #    比如：初始半径 ≈ scene_extent * 0.01 * point_size
-        base_scale = max(scene_extent * 0.01 * point_size, 1e-3)
-        # （你可以之后根据效果再调这个系数，比如 0.005、0.02 之类）
-
-        # 3. 写入 log-尺度（和原始代码接口一致）
-        scales = torch.full(
-            (fused_point_cloud.shape[0], 1),
-            np.log(base_scale),
-            dtype=torch.float32,
-            device="cuda",
+        dist2 = (
+            torch.clamp_min(
+                distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
+                0.0000001,
+            )
+            * point_size
         )
+        scales = torch.log(torch.sqrt(dist2))[..., None]
         if not self.isotropic:
             scales = scales.repeat(1, 3)
 
-        # --- 旋转 & 不透明度和原来一样 ---
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
-
-        opacities = inverse_sigmoid(
+        opacities = inverse_sigmoid(         
             0.5
             * torch.ones(
                 (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
@@ -223,7 +240,6 @@ class GaussianModel:
         )
 
         return fused_point_cloud, features, scales, rots, opacities
-
     
     def init_lr(self, spatial_lr_scale):
         self.spatial_lr_scale = spatial_lr_scale
@@ -301,6 +317,17 @@ class GaussianModel:
                 "lr": training_args.rotation_lr,
                 "name": "rotation",
             },
+            {
+                "params": [self._w_pos],
+                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.1,  # 建议比xyz小
+                "name": "w_pos",
+            },
+            {
+                "params": [self.t_mu, self.t_sigma_raw],
+                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.0,  # 更小
+                "name": "time_basis",
+            },
+
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -460,6 +487,13 @@ class GaussianModel:
         self._xyz = nn.Parameter(
             torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
         )
+
+        # 初始化 per-point 位移系数，默认 0 -> 退化成静态
+        self._w_pos = nn.Parameter(
+            torch.zeros((self._xyz.shape[0], self.K_time, 3), device="cuda", dtype=torch.float).requires_grad_(True)
+        )
+
+
         self._features_dc = nn.Parameter(
             torch.tensor(features_dc, dtype=torch.float, device="cuda")
             .transpose(1, 2)
@@ -488,6 +522,8 @@ class GaussianModel:
         self.unique_kfIDs = torch.zeros((self._xyz.shape[0]))
         self.n_obs = torch.zeros((self._xyz.shape[0]), device="cpu").int()
 
+    
+    
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -528,6 +564,8 @@ class GaussianModel:
     def prune_points(self, mask):
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
+
+        self._w_pos = optimizable_tensors["w_pos"]
 
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -588,6 +626,10 @@ class GaussianModel:
         new_kf_ids=None,
         new_n_obs=None,
     ):
+        # new_xyz: [M,3]
+        M = new_xyz.shape[0]
+        new_w_pos = torch.zeros((M, self.K_time, 3), device="cuda", dtype=new_xyz.dtype)
+
         d = {
             "xyz": new_xyz,
             "f_dc": new_features_dc,
@@ -595,23 +637,28 @@ class GaussianModel:
             "opacity": new_opacities,
             "scaling": new_scaling,
             "rotation": new_rotation,
+            "w_pos": new_w_pos,
         }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
+
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._w_pos = optimizable_tensors["w_pos"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
         if new_n_obs is not None:
             self.n_obs = torch.cat((self.n_obs, new_n_obs)).int()
+
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

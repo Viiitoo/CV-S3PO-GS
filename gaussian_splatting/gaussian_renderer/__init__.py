@@ -40,23 +40,32 @@ def render(
     if pc.get_xyz.shape[0] == 0:
         return None
 
+    # --- time for deformation ---
+    t = None
+    if hasattr(viewpoint_camera, "time"):
+        t = viewpoint_camera.time
+    elif hasattr(viewpoint_camera, "t"):
+        t = viewpoint_camera.t
+
+
+    means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
+
     screenspace_points = (
-        torch.zeros_like(
-            pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"
-        )
-        + 0
+        torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
     )
+
     try:
         screenspace_points.retain_grad()
     except Exception:
         pass
 
+
+    means2D = screenspace_points
+    opacity = pc.get_opacity
+
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    #print(f"Full projection transform: {viewpoint_camera.full_proj_transform}")
-    #print(f"projection matrix: {viewpoint_camera.projection_matrix}")
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -73,12 +82,9 @@ def render(
         prefiltered=False,
         debug=False,
     )
-
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
-    means2D = screenspace_points
-    opacity = pc.get_opacity
+
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -104,9 +110,11 @@ def render(
             shs_view = pc.get_features.transpose(1, 2).view(
                 -1, 3, (pc.max_sh_degree + 1) ** 2
             )
-            dir_pp = pc.get_xyz - viewpoint_camera.camera_center.repeat(
+
+            dir_pp = means3D - viewpoint_camera.camera_center.repeat(
                 pc.get_features.shape[0], 1
             )
+
             dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -129,6 +137,7 @@ def render(
             theta=viewpoint_camera.cam_rot_delta,
             rho=viewpoint_camera.cam_trans_delta,
         )
+        n_touched = None
     else:
         rendered_image, radii, depth, opacity, n_touched = rasterizer(
             means3D=means3D,
@@ -180,17 +189,12 @@ def render_with_custom_resolution(
     if pc.get_xyz.shape[0] == 0:
         return None
 
+    t = None
+    
+
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = (
-        torch.zeros_like(
-            pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"
-        )
-        + 0
-    )
-    try:
-        screenspace_points.retain_grad()
-    except Exception:
-        pass
+    
 
     # Get original resolution and compute scaling ratio to the new resolution
     scale_x = target_width / viewpoint_camera.image_width
@@ -237,9 +241,20 @@ def render_with_custom_resolution(
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
+
+    screenspace_points = (
+        torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
+    )
+    
+    try:
+        screenspace_points.retain_grad()
+    except Exception:
+        pass
+
     means2D = screenspace_points
     opacity = pc.get_opacity
+
 
     scales = None
     rotations = None
@@ -260,9 +275,10 @@ def render_with_custom_resolution(
             shs_view = pc.get_features.transpose(1, 2).view(
                 -1, 3, (pc.max_sh_degree + 1) ** 2
             )
-            dir_pp = pc.get_xyz - viewpoint_camera.camera_center.repeat(
+            dir_pp = means3D - viewpoint_camera.camera_center.repeat(
                 pc.get_features.shape[0], 1
             )
+
             dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -284,6 +300,7 @@ def render_with_custom_resolution(
             theta=viewpoint_camera.cam_rot_delta,
             rho=viewpoint_camera.cam_trans_delta,
         )
+        n_touched = None
     else:
         rendered_image, radii, depth, opacity, n_touched = rasterizer(
             means3D=means3D,
