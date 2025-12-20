@@ -36,3 +36,5 @@ results/
 # (comment these out if you DO want to track them)
 # dust3r/
 # croco/
+submodules/**/third_party/**/doc/
+submodules/**/third_party/**/docs/
