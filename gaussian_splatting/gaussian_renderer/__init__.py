@@ -47,6 +47,7 @@ def render(
     elif hasattr(viewpoint_camera, "t"):
         t = viewpoint_camera.t
 
+    print("DEBUG render t =", t)
 
     means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
 

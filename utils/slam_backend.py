@@ -7,6 +7,8 @@ import numpy as np
 from tqdm import tqdm
 import os
 
+from utils.time_utils import attach_time_to_viewpoint
+
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
@@ -30,6 +32,8 @@ class BackEnd(mp.Process):
         self.backend_queue = None
         self.live_mode = False
         self.save_dir = save_dir
+        self.num_frames = self.config["Dataset"].get("num_frames", None)
+
 
         self.pause = False
         self.device = "cuda"
@@ -99,6 +103,7 @@ class BackEnd(mp.Process):
             # print("rotation:", self.gaussians._rotation.shape)
             # print("opacity:", self.gaussians._opacity.shape)
 
+            attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=self.num_frames)
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )
@@ -164,7 +169,7 @@ class BackEnd(mp.Process):
         for cam_idx, viewpoint in self.viewpoints.items():  # Add viewpoints outside the current window to the random_viewpoint_stack
             if cam_idx in current_window_set:
                 continue
-            random_viewpoint_stack.append(viewpoint)        
+            random_viewpoint_stack.append((cam_idx, viewpoint))       
             
         for _ in range(iters):
             self.iteration_count += 1
@@ -181,9 +186,10 @@ class BackEnd(mp.Process):
             for cam_idx in range(len(current_window)):      # For each keyframe in the current window, perform rendering and compute loss
                 viewpoint = viewpoint_stack[cam_idx]
                 keyframes_opt.append(viewpoint)
-                render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
-                )
+                kf_idx = current_window[cam_idx]
+                attach_time_to_viewpoint(viewpoint, frame_idx=kf_idx, num_frames=self.num_frames)
+
+                render_pkg = render(viewpoint, self.gaussians, self.pipeline_params, self.background)
                 (                                          
                     image,
                     viewspace_point_tensor,                 
@@ -209,10 +215,10 @@ class BackEnd(mp.Process):
                 
             # In each iteration, randomly select two non-window keyframes for optimization
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:     
-                viewpoint = random_viewpoint_stack[cam_idx]
-                render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
-                )
+                kf_idx, viewpoint = random_viewpoint_stack[cam_idx]
+                attach_time_to_viewpoint(viewpoint, frame_idx=kf_idx, num_frames=self.num_frames)
+
+                render_pkg = render(viewpoint, self.gaussians, self.pipeline_params, self.background)
                 (
                     image,
                     viewspace_point_tensor,
@@ -336,6 +342,7 @@ class BackEnd(mp.Process):
                 random.randint(0, len(viewpoint_idx_stack) - 1)
             )
             viewpoint_cam = self.viewpoints[viewpoint_cam_idx]      
+            attach_time_to_viewpoint(viewpoint_cam, frame_idx=viewpoint_cam_idx, num_frames=self.num_frames)
             render_pkg = render(
                 viewpoint_cam, self.gaussians, self.pipeline_params, self.background
             )
@@ -408,6 +415,9 @@ class BackEnd(mp.Process):
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     depth_map = data[3]
+
+                    attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=self.num_frames)
+
                     Log("Resetting the system")
                     self.reset()
 
@@ -431,6 +441,9 @@ class BackEnd(mp.Process):
 
                     T_np = np.linalg.inv(getWorld2View2(viewpoint.R,viewpoint.T).cpu().numpy())
                     T = torch.from_numpy(T_np).to(self.device)
+
+                    attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=self.num_frames)
+
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
                     self.add_next_kf(cur_frame_idx, viewpoint, depth_map=depth_map)

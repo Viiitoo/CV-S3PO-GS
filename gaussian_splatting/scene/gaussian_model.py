@@ -10,7 +10,7 @@
 #
 
 import os
-
+import torch
 import numpy as np
 import open3d as o3d
 import torch
@@ -218,14 +218,21 @@ class GaussianModel:
         )
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
+        pts = np.asarray(pcd.points)
+        print("pcd.points shape =", pts.shape, "num_points =", pts.shape[0])
 
-        dist2 = (
-            torch.clamp_min(
-                distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
-                0.0000001,
-            )
-            * point_size
-        )
+        # === 科学验证：点数过大直接报出来 ===
+        assert pts.shape[0] < 100000, f"Too many points ({pts.shape[0]}) -> distCUDA2 likely OOM"
+
+        # 用 pts（不要再 np.asarray(pcd.points) 重复取）
+        pts_t = torch.from_numpy(pts).float().cuda()
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        print(f"[before distCUDA2] free={free/1e9:.2f}GB total={total/1e9:.2f}GB "
+            f"allocated={torch.cuda.memory_allocated()/1e9:.2f}GB "
+            f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB")
+        dist2 = torch.clamp_min(distCUDA2(pts_t), 1e-7) * point_size
+
         scales = torch.log(torch.sqrt(dist2))[..., None]
         if not self.isotropic:
             scales = scales.repeat(1, 3)
@@ -323,9 +330,14 @@ class GaussianModel:
                 "name": "w_pos",
             },
             {
-                "params": [self.t_mu, self.t_sigma_raw],
+                "params": [self.t_mu],
                 "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.0,  # 更小
-                "name": "time_basis",
+                "name": "t_mu",
+            },
+            {
+                "params": [self.t_sigma_raw],
+                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.0,  # 更小
+                "name": "t_sigma",
             },
 
         ]
@@ -541,25 +553,48 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
+        N = int(mask.numel())
+
+        # debug prints（你要的话保留）
+        print("mask shape:", mask.shape, "mask numel:", mask.numel())
+        for i, group in enumerate(self.optimizer.param_groups):
+            p = group["params"][0]
+            print(f"[group {i}] param shape:", tuple(p.shape), "name:", group.get("name", "NONAME"))
+
         for group in self.optimizer.param_groups:
-            stored_state = self.optimizer.state.get(group["params"][0], None)
+            p = group["params"][0]
+            name = group.get("name", "NONAME")
+
+            # 只裁剪 per-point 参数：第0维必须等于 N
+            # 例如 time_basis 是 (3,) -> p.shape[0]=3 != N(=0 or 当前点数)，应跳过
+            is_per_point = (p.ndim >= 1 and p.shape[0] == N)
+
+            if not is_per_point:
+                # 全局参数：不参与 prune，也不改 optimizer state
+                optimizable_tensors[name] = p
+                continue
+
+            stored_state = self.optimizer.state.get(p, None)
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                # Adam 的一阶/二阶动量也要同步裁剪
+                if "exp_avg" in stored_state:
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                if "exp_avg_sq" in stored_state:
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(
-                    (group["params"][0][mask].requires_grad_(True))
-                )
-                self.optimizer.state[group["params"][0]] = stored_state
-
-                optimizable_tensors[group["name"]] = group["params"][0]
+                # 重要：先删旧 key，再用新 Parameter 作为 key
+                del self.optimizer.state[p]
+                new_p = nn.Parameter(p[mask].detach(), requires_grad=True)
+                group["params"][0] = new_p
+                self.optimizer.state[new_p] = stored_state
+                optimizable_tensors[name] = new_p
             else:
-                group["params"][0] = nn.Parameter(
-                    group["params"][0][mask].requires_grad_(True)
-                )
-                optimizable_tensors[group["name"]] = group["params"][0]
+                new_p = nn.Parameter(p[mask].detach(), requires_grad=True)
+                group["params"][0] = new_p
+                optimizable_tensors[name] = new_p
+
         return optimizable_tensors
+
 
     def prune_points(self, mask):
         valid_points_mask = ~mask

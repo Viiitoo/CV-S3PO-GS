@@ -4,6 +4,8 @@ import torch
 import torch.multiprocessing as mp
 import os
 
+from utils.time_utils import attach_time_to_viewpoint
+
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 from gui import gui_utils
@@ -242,6 +244,7 @@ class FrontEnd(mp.Process):
 
         pose_optimizer = torch.optim.Adam(opt_params)
         for tracking_itr in range(self.tracking_itr_num):
+            attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=len(self.dataset))
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )
@@ -480,6 +483,7 @@ class FrontEnd(mp.Process):
                     continue
                 
                 viewpoint = Camera.init_from_dataset(self.dataset, cur_frame_idx, projection_matrix)
+                attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=len(self.dataset))
                 viewpoint.compute_grad_mask(self.config)
                 self.cameras[cur_frame_idx] = viewpoint
 

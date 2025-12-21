@@ -18,6 +18,8 @@ matplotlib.use('Agg')
 print("Current backend:", matplotlib.get_backend())
 from matplotlib import pyplot as plt
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from utils.time_utils import attach_time_to_viewpoint
+
 
 import wandb
 from gaussian_splatting.gaussian_renderer import render
@@ -162,6 +164,8 @@ def eval_rendering(
         saved_frame_idx.append(idx)
         frame = frames[idx]
         gt_image, _, _, _ = dataset[idx]
+
+        attach_time_to_viewpoint(frame, frame_idx=idx, num_frames=len(dataset))
 
         render_pkg = render(frame, gaussians, pipe, background)
         rendering = render_pkg["render"]
