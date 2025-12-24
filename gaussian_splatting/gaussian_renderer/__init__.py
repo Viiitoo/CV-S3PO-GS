@@ -47,8 +47,6 @@ def render(
     elif hasattr(viewpoint_camera, "t"):
         t = viewpoint_camera.t
 
-    print("DEBUG render t =", t)
-
     means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
 
     screenspace_points = (
@@ -190,11 +188,12 @@ def render_with_custom_resolution(
     if pc.get_xyz.shape[0] == 0:
         return None
 
+    # --- time for deformation ---
     t = None
-    
-
-
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    if hasattr(viewpoint_camera, "time"):
+        t = viewpoint_camera.time
+    elif hasattr(viewpoint_camera, "t"):
+        t = viewpoint_camera.t
     
 
     # Get original resolution and compute scaling ratio to the new resolution

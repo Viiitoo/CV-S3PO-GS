@@ -96,6 +96,7 @@ class SLAM:
         self.backend.frontend_queue = frontend_queue
         self.backend.backend_queue = backend_queue
         self.backend.live_mode = self.live_mode
+        self.backend.num_frames = len(self.dataset)  # 设置正确的 num_frames 用于时间归一化
 
         self.backend.set_hyperparams()
 

@@ -141,7 +141,15 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     W1 = view1['img'].shape[3]
     scale_H = H1 / viewpoint.image_height
     scale_W = W1 / viewpoint.image_width
-    
+    # #region agent log
+    import json
+    log_path = "/home/sjw/data0/lsx/S3PO_baseline/.cursor/debug.log"
+    try:
+        with open(log_path, 'a') as f:
+            json.dump({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"init_pose.py:145","message":"init_pose: before render_with_custom_resolution","data":{"has_time_attr":hasattr(viewpoint, "time"),"has_t_attr":hasattr(viewpoint, "t")},"timestamp":int(__import__('time').time()*1000)}, f)
+            f.write('\n')
+    except: pass
+    # #endregion
     render_pkg = render_with_custom_resolution(viewpoint, gaussians, pipeline_params, background, target_width=W1, target_height=H1)
     render_depth = render_pkg["depth"]
 

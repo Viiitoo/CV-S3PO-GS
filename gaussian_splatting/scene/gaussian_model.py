@@ -34,6 +34,7 @@ from gaussian_splatting.utils.system_utils import mkdir_p
 
 
 class GaussianModel:
+    # 初始化高斯模型
     def __init__(self, sh_degree: int, config=None):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
@@ -92,7 +93,7 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
-
+    
     def _time_phi(self, t: torch.Tensor) -> torch.Tensor:
         """
         # t: shape [] or [1] or [B]; assumed normalized to [0,1]
@@ -219,21 +220,35 @@ class GaussianModel:
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
         pts = np.asarray(pcd.points)
-        print("pcd.points shape =", pts.shape, "num_points =", pts.shape[0])
 
-        # === 科学验证：点数过大直接报出来 ===
-        assert pts.shape[0] < 100000, f"Too many points ({pts.shape[0]}) -> distCUDA2 likely OOM"
+        # 使用纯 PyTorch 实现的 KNN 距离计算（避免 distCUDA2 在多进程中的问题）
+        # 使用 K=3 最近邻的平均距离，与 distCUDA2 行为一致
+        device = torch.device("cuda:0")
+        pts_t = torch.from_numpy(pts).float().to(device).contiguous()
+        
+        N = pts_t.shape[0]
+        K = 3  # 与 distCUDA2 一致，使用 3 个最近邻
+        avg_knn_dists_sq = torch.zeros(N, device=device)
+        batch_size = 1024  # 分批计算以节省内存
+        
+        for i in range(0, N, batch_size):
+            end_i = min(i + batch_size, N)
+            batch_pts = pts_t[i:end_i]
+            diff = batch_pts.unsqueeze(1) - pts_t.unsqueeze(0)
+            dists_sq = (diff ** 2).sum(dim=-1)  # [batch, N]
+            # 将自身距离设为无穷大
+            for j in range(end_i - i):
+                dists_sq[j, i + j] = float('inf')
+            # 取 K 个最小距离的平均值
+            topk_dists, _ = torch.topk(dists_sq, K, dim=1, largest=False)
+            avg_knn_dists_sq[i:end_i] = topk_dists.mean(dim=1)
+        
+        dist2 = torch.clamp_min(avg_knn_dists_sq, 1e-7) * point_size
 
-        # 用 pts（不要再 np.asarray(pcd.points) 重复取）
-        pts_t = torch.from_numpy(pts).float().cuda()
-        torch.cuda.synchronize()
-        free, total = torch.cuda.mem_get_info()
-        print(f"[before distCUDA2] free={free/1e9:.2f}GB total={total/1e9:.2f}GB "
-            f"allocated={torch.cuda.memory_allocated()/1e9:.2f}GB "
-            f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB")
-        dist2 = torch.clamp_min(distCUDA2(pts_t), 1e-7) * point_size
-
+        # 确保 dist2 有合理的值，避免 log 产生 -inf
+        dist2 = torch.clamp(dist2, min=1e-7, max=1e6)
         scales = torch.log(torch.sqrt(dist2))[..., None]
+        scales = torch.clamp(scales, min=-10, max=10)
         if not self.isotropic:
             scales = scales.repeat(1, 3)
 
@@ -326,17 +341,17 @@ class GaussianModel:
             },
             {
                 "params": [self._w_pos],
-                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.1,  # 建议比xyz小
+                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.1,  # 位移权重，比xyz小
                 "name": "w_pos",
             },
             {
                 "params": [self.t_mu],
-                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.0,  # 更小
+                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.01,  # 基函数中心，较小学习率
                 "name": "t_mu",
             },
             {
                 "params": [self.t_sigma_raw],
-                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.0,  # 更小
+                "lr": training_args.position_lr_init * self.spatial_lr_scale * 0.01,  # 基函数宽度，较小学习率
                 "name": "t_sigma",
             },
 
@@ -620,7 +635,14 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
-            extension_tensor = tensors_dict[group["name"]]
+            name = group["name"]
+            
+            # 跳过不在 tensors_dict 中的全局参数（如 t_mu, t_sigma）
+            if name not in tensors_dict:
+                optimizable_tensors[name] = group["params"][0]
+                continue
+                
+            extension_tensor = tensors_dict[name]
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = torch.cat(
@@ -639,14 +661,14 @@ class GaussianModel:
                 )
                 self.optimizer.state[group["params"][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                optimizable_tensors[name] = group["params"][0]
             else:
                 group["params"][0] = nn.Parameter(
                     torch.cat(
                         (group["params"][0], extension_tensor), dim=0
                     ).requires_grad_(True)
                 )
-                optimizable_tensors[group["name"]] = group["params"][0]
+                optimizable_tensors[name] = group["params"][0]
 
         return optimizable_tensors
 

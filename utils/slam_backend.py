@@ -32,7 +32,7 @@ class BackEnd(mp.Process):
         self.backend_queue = None
         self.live_mode = False
         self.save_dir = save_dir
-        self.num_frames = self.config["Dataset"].get("num_frames", None)
+        self.num_frames = None  # 将在 slam.py 中设置为 len(dataset)
 
 
         self.pause = False
@@ -245,6 +245,17 @@ class BackEnd(mp.Process):
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping += 10 * isotropic_loss.mean()
+            
+            # time deformation regularization - 防止位移权重过大导致飘移
+            if hasattr(self.gaussians, '_w_pos') and self.gaussians._w_pos.numel() > 0:
+                # L2 正则化：鼓励小位移
+                w_pos_reg = self.gaussians._w_pos.pow(2).mean()
+                loss_mapping += 0.1 * w_pos_reg
+                
+                # 时间平滑正则化：相邻时间的位移应该相似（可选）
+                # sigma_reg = F.softplus(self.gaussians.t_sigma_raw).mean()
+                # loss_mapping += 0.01 * (1.0 / (sigma_reg + 1e-6))  # 鼓励较宽的基函数
+            
             loss_mapping.backward()
             gaussian_split = False
             
@@ -383,6 +394,10 @@ class BackEnd(mp.Process):
     # process backend messages, perform initialization, optimize keyframe map, color refinement,
     # synchronize data, and push updates to the frontend
     def run(self):
+        # 在子进程中显式设置 CUDA 设备，确保使用正确的 GPU
+        torch.cuda.set_device(0)  # CUDA_VISIBLE_DEVICES 已经限制了可见设备，所以这里用 0
+        torch.cuda.empty_cache()
+        
         while True:
             if self.backend_queue.empty():
                 if self.pause:
