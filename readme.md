@@ -83,6 +83,68 @@ $$
 
 ---
 
+---
+
+## 工具脚本
+
+### extract_rgb_video.py
+
+从可视化结果中提取Ground Truth和Rendered RGB图像，并生成对比视频。
+
+**功能**：
+- 从`viz`文件夹中提取每张图片的左上角（Ground Truth）和右上角（Rendered RGB）子图
+- 将两者并排拼接后生成视频文件
+- 支持多种视频编码器（OpenCV/ImageIO）
+
+**使用方法**：
+```bash
+python extract_rgb_video.py \
+    --viz_dir results/stereo_seq_easy_stereo_seq_easy/2025-12-28-14-13-07/viz \
+    --output gt_and_rendered_rgb_video.mp4 \
+    --fps 10
+```
+
+### view_time_models.py
+
+可视化时间形变模型，支持查看不同时刻的高斯点云。
+
+**功能**：
+- 查看单个时刻的模型
+- 对比多个时刻的模型
+- 动画播放时间形变过程
+- 对比canonical模型和形变后的模型
+
+**使用方法**：
+```bash
+# 查看单个时刻
+python view_time_models.py <save_dir> --frame 50
+
+# 对比多个时刻
+python view_time_models.py <save_dir> --frames 0 25 50 75 99
+
+# 动画播放
+python view_time_models.py <save_dir> --animate --start 0 --end 99 --step 5
+
+# 对比canonical模型
+python view_time_models.py <save_dir> --frame 50 --compare
+
+# 列出所有可用帧
+python view_time_models.py <save_dir> --list
+```
+
+---
+
 ## 历史记录
 
-2025/12/8: 12月4号meeting后开的新分支，意在在loss里把置信度先拿掉，用上鲁棒核函数；把点云选择部分的修改拿掉
+### 2025/12/28 - 🛠️ 工具脚本和文档更新
+
+- **新增工具**：
+  - `extract_rgb_video.py`: 从viz结果提取GT和渲染RGB对比视频
+  - `view_time_models.py`: 可视化时间形变模型
+- **新增文档**：
+  - `docs/distCUDA2_bug_report.md`: distCUDA2 CUDA内存分配错误报告和解决方案
+- **配置更新**：
+  - 更新配置文件结构
+  - 清理备份文件
+
+### 2025/12/8: 12月4号meeting后开的新分支，意在在loss里把置信度先拿掉，用上鲁棒核函数；把点云选择部分的修改拿掉

@@ -2,7 +2,7 @@ inherit_from: "configs/mono/Stereo/Stereo_seq_easy/base_config.yaml"
 
 Dataset:
   begin: 0
-  end: 300
+  # end: null  # 不设置 end 表示读取完整数据集（200张）
   dataset_path: "datasets/StereoMIS/stereo_seq_easy/stereo_seq_easy/train"
   Calibration:
     fx: 516.95
@@ -27,3 +27,4 @@ opt_params:
 Training:
     alpha: 0.98
     mapping_itr_nosingle: 30
+

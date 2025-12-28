@@ -32,6 +32,12 @@ runs/
 outputs/
 results/
 
+# ---- Video files ----
+*.mp4
+*.avi
+*.mov
+*.mkv
+
 # ---- If this repo contains large third-party code you don't want to commit ----
 # (comment these out if you DO want to track them)
 # dust3r/
