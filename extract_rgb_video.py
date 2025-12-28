@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 从viz文件夹中的图片提取左上角子图（Ground Truth）和右上角子图（Rendered rgb），
 将两者并排放置并组合成视频
@@ -256,7 +257,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--viz_dir",
         type=str,
-        default="results/stereo_seq_easy_stereo_seq_easy/2025-12-28-14-13-07/viz",
+        default="results/stereo_seq_easy_stereo_seq_easy/2025-12-28-22-41-58/viz",
         help="viz文件夹路径"
     )
     parser.add_argument(

@@ -13,7 +13,6 @@ import os
 import torch
 import numpy as np
 import open3d as o3d
-import torch
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
@@ -48,8 +47,8 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
 
-        # ========== 时间形变相关参数 ==========
-        # K_time: 时间基函数的数量
+        # ========== 时间形变相关参数（生命周期机制，参考EH-SurGS）==========
+        # K_time: 时间基函数的数量（basis_num）
         # EH-SurGS使用17-20个基函数，我们默认使用17个（与EH-SurGS默认值一致）
         # 更多基函数可以表达更复杂的时间变化，但会增加内存和计算开销
         # 可以通过config中的time_basis_num参数自定义，如果没有配置则使用默认值17
@@ -58,32 +57,29 @@ class GaussianModel:
         else:
             self.K_time = 17  # 默认值：与EH-SurGS的curve_num=17一致
         
-        # t_mu: 时间基函数的中心位置，均匀分布在[0.2, 0.8]区间
-        # 这些值会在训练过程中自动调整，找到最佳的时间分布
-        # 注意：如果K_time很大，这些初始值会均匀分布在整个时间区间
-        self.t_mu = nn.Parameter(torch.linspace(0.2, 0.8, self.K_time, device="cuda"))
+        # ch_num: 形变通道数
+        # 位置(3) + 旋转(4) + 放缩(3) + 不透明度(1) = 11
+        # 如果只使用位置形变，则为3
+        if config is not None and "deform_ch_num" in config.get("model_params", {}):
+            self.ch_num = config["model_params"]["deform_ch_num"]
+        else:
+            self.ch_num = 11  # 默认值：支持所有形变类型
         
-        # t_sigma_raw: 时间基函数的宽度参数（原始值，会通过softplus转换为正数）
-        # 控制每个基函数影响的时间范围，值越大影响范围越广
-        # 初始值设为0，经过softplus后约为0.693，这样每个基函数有适中的影响范围
-        self.t_sigma_raw = nn.Parameter(torch.zeros((self.K_time,), device="cuda"))
+        # ========== 形变系数参数（生命周期机制）==========
+        # _coefs: 形变系数 [N个点, ch_num个通道, 3个参数(weights/means/std_devs), K_time个基函数]
+        # 这是EH-SurGS的核心：每个点、每个通道、每个基函数都有自己的时间演化参数
+        # - weights: 形变权重
+        # - means: 时间中心位置（点特定的生命周期）
+        # - std_devs: 时间影响范围（点特定的生命周期）
+        # 形状: [N, ch_num, 3, K_time]
+        self._coefs = torch.empty(0, device="cuda")
         
-        # ========== 形变权重参数（每个高斯点都有这些参数）==========
-        # _w_pos: 位置形变权重 [N个点, K_time个基函数, 3维坐标(x,y,z)]
-        # 用来控制每个点在时间上的位置变化
-        self._w_pos = torch.empty(0, self.K_time, 3, device="cuda")
-        
-        # _w_rot: 旋转形变权重 [N个点, K_time个基函数, 4维四元数(w,x,y,z)]
-        # 用来控制每个点在时间上的旋转变化（比如物体转动）
-        self._w_rot = torch.empty(0, self.K_time, 4, device="cuda")
-        
-        # _w_scale: 放缩形变权重 [N个点, K_time个基函数, 3维放缩(sx,sy,sz)]
-        # 用来控制每个点在时间上的大小变化（比如物体膨胀或收缩）
-        self._w_scale = torch.empty(0, self.K_time, 3, device="cuda")
-        
-        # _w_opacity: 不透明度形变权重 [N个点, K_time个基函数, 1维不透明度]
-        # 用来控制每个点在时间上的透明度变化（比如物体出现或消失）
-        self._w_opacity = torch.empty(0, self.K_time, 1, device="cuda")
+        # 为了向后兼容，保留旧的参数名（但不再使用）
+        # 这些将在后续版本中移除
+        self._w_pos = torch.empty(0, device="cuda")
+        self._w_rot = torch.empty(0, device="cuda")
+        self._w_scale = torch.empty(0, device="cuda")
+        self._w_opacity = torch.empty(0, device="cuda")
         
         # ========== 形变点选择相关参数（参考EH-SurGS）==========
         # _deformation_table: 布尔表，标记哪些点需要形变 [N] bool
@@ -138,6 +134,7 @@ class GaussianModel:
         """
         # t: shape [] or [1] or [B]; assumed normalized to [0,1]
         #return: phi shape [B, K]
+        # 注意：这个方法保留用于向后兼容，但新的生命周期机制使用gaussian_deformation
         """
         if t.dim() == 0:
             t = t.view(1)
@@ -146,36 +143,212 @@ class GaussianModel:
         sigma = F.softplus(self.t_sigma_raw).view(1, -1) + 1e-6
         phi = torch.exp(-0.5 * ((t - mu) / sigma) ** 2)  # [B,K]
         return phi
+    
+    def gaussian_deformation(self, time, deformation_point, num_gaussians, ch_num=None, basis_num=None):
+        """
+        ========== 核心形变计算方法：生命周期机制（参考EH-SurGS）==========
+        
+        这个方法实现了基于生命周期的高斯形变模型，每个点都有自己的"生命周期"参数，
+        控制它在不同时间点的形变行为。这是整个形变系统的核心。
+        
+        【生命周期机制原理】
+        - 每个点、每个通道（位置/旋转/放缩/不透明度）都有K_time个高斯基函数
+        - 每个基函数有三个参数：
+          * weights: 形变权重，控制该基函数的贡献大小
+          * means: 时间中心位置，表示该基函数的"活跃时间"（点特定的生命周期）
+          * std_devs: 时间影响范围，表示该基函数在时间上的影响宽度
+        
+        【形变通道说明】
+        ch_num个通道的含义（默认11个）：
+        - 通道0-2: 位置形变（平移）[x, y, z]
+        - 通道3-6: 旋转形变（四元数）[w, x, y, z]
+        - 通道7-9: 放缩形变 [sx, sy, sz]
+        - 通道10: 不透明度形变 [opacity]
+        
+        【计算流程】
+        1. 从_coefs中提取每个点的形变系数（weights, means, std_devs）
+        2. 对每个基函数，计算高斯函数值：exp(-((time - means) / std_devs)^2)
+        3. 将高斯函数值与权重相乘，然后对所有基函数求和
+        4. 得到最终的形变值（每个通道一个值）
+        
+        Args:
+            time: 时间值，标量或tensor，应该在[0,1]范围内
+                 例如：0.0表示序列开始，1.0表示序列结束
+            deformation_point: 布尔mask，标记哪些点需要计算形变 [N]
+                               True表示该点需要形变，False表示静态点（跳过计算）
+            num_gaussians: 需要形变的点的数量（用于兼容性，实际从deformation_point计算）
+            ch_num: 通道数（如果None则使用self.ch_num，默认11）
+            basis_num: 基函数数量（如果None则使用self.K_time，默认17）
+            
+        Returns:
+            deformations: 形变值 [num_deform_points, ch_num]
+                         - 前3个通道是位置形变（平移）
+                         - 第4-7个通道是旋转形变（四元数）
+                         - 第8-10个通道是放缩形变
+                         - 第11个通道是不透明度形变
+        """
+        # ========== 边界情况处理 ==========
+        if self._coefs.numel() == 0:
+            # 如果没有初始化coefs（形变参数未初始化），返回零形变
+            # 这意味着所有点保持原始状态，不进行任何形变
+            num_deform = deformation_point.sum().item() if isinstance(deformation_point, torch.Tensor) else num_gaussians
+            ch = ch_num if ch_num is not None else self.ch_num
+            return torch.zeros((num_deform, ch), device="cuda")
+        
+        # ========== 参数初始化 ==========
+        if ch_num is None:
+            ch_num = self.ch_num  # 默认11：位置(3) + 旋转(4) + 放缩(3) + 不透明度(1)
+        if basis_num is None:
+            basis_num = self.K_time  # 默认17个基函数（与EH-SurGS一致）
+        
+        # ========== 时间参数处理 ==========
+        # 确保time是tensor格式，并移动到正确的设备
+        if not torch.is_tensor(time):
+            time = torch.tensor(time, device=self._coefs.device, dtype=self._coefs.dtype)
+        else:
+            time = time.to(device=self._coefs.device, dtype=self._coefs.dtype)
+        
+        # 确保time是标量（单个时间值）
+        # 如果输入是tensor，取第一个值（支持批量处理，但这里只处理单个时间）
+        if time.dim() > 0:
+            time = time.view(-1)[0]  # 取第一个值，转换为标量
+        
+        # ========== 数据一致性检查 ==========
+        num_points = len(self._xyz)
+        # 检查_coefs的形状是否正确：[N, ch_num * 3 * basis_num]
+        expected_coefs_size = num_points * ch_num * 3 * basis_num
+        if self._coefs.numel() != expected_coefs_size:
+            # 如果_coefs的大小不匹配，说明点数不一致（可能是densification后未更新）
+            # 返回零形变，避免计算错误
+            num_deform = deformation_point.sum().item() if isinstance(deformation_point, torch.Tensor) else num_gaussians
+            return torch.zeros((num_deform, ch_num), device=self._coefs.device, dtype=self._coefs.dtype)
+        
+        # ========== 提取形变系数 ==========
+        # 重塑coefs: [N, ch_num * 3 * basis_num] -> [N, ch_num, 3, basis_num]
+        # 其中3表示：weights(0), means(1), std_devs(2)
+        coefficients = self._coefs.reshape(num_points, ch_num, 3, basis_num).contiguous()
+        
+        # 只选择需要形变的点（deformation_point标记的点）
+        # 这样可以跳过静态点，节省计算资源
+        coefficients = coefficients[deformation_point, :, :, :]
+        # coefficients形状: [num_deform, ch_num, 3, basis_num]
+        # num_deform = deformation_point.sum()
+        
+        # ========== 分解形变参数 ==========
+        # 将coefficients分解为三个部分：weights, means, std_devs
+        weights, means, std_devs = torch.chunk(coefficients, 3, dim=-2)
+        # weights: [num_deform, ch_num, 1, basis_num] - 形变权重
+        # means: [num_deform, ch_num, 1, basis_num] - 时间中心位置（生命周期中心）
+        # std_devs: [num_deform, ch_num, 1, basis_num] - 时间影响范围（生命周期宽度）
+        
+        # ========== 计算高斯基函数值（生命周期机制的核心）==========
+        # 对每个基函数，计算它在当前时间点的激活值
+        # 公式：gaussian = exp(-((time - means) / std_devs)^2)
+        # 
+        # 物理意义：
+        # - means: 该基函数的"活跃时间"，例如means=0.5表示在序列中间最活跃
+        # - std_devs: 该基函数的"影响范围"，std_devs越大，影响的时间范围越广
+        # - 当time接近means时，gaussian值接近1（最大激活）
+        # - 当time远离means时，gaussian值接近0（几乎不激活）
+        #
+        # 1e-4是为了避免std_devs为0时除零错误
+        exponent = (time - means) ** 2 / (std_devs ** 2 + 1e-4)
+        gaussians = torch.exp(-exponent ** 2)  # [num_deform, ch_num, 1, basis_num]
+        # gaussians值域：[0, 1]，表示每个基函数在当前时间的激活程度
+        
+        # ========== 加权求和得到最终形变 ==========
+        # 将每个基函数的高斯值与其权重相乘，然后对所有基函数求和
+        # deformations = sum_k (gaussians[k] * weights[k])，k从0到basis_num-1
+        deformations = (gaussians * weights).sum(-1).squeeze(-2)  # [num_deform, ch_num]
+        
+        # 结果解释：
+        # - deformations[i, 0:3]: 第i个点的位置形变（平移）[dx, dy, dz]
+        # - deformations[i, 3:7]: 第i个点的旋转形变（四元数增量）[dw, dx, dy, dz]
+        # - deformations[i, 7:10]: 第i个点的放缩形变 [dsx, dsy, dsz]
+        # - deformations[i, 10]: 第i个点的不透明度形变 [dopacity]
+        
+        return deformations
 
     _time_deform_logged = False  # 类变量，只打印一次
     
     def get_xyz_t(self, t):
         """
-        Return deformed xyz at time t. If t is None, fall back to canonical xyz.
-        We assume single-frame render (B=1) for now.
+        ========== 获取时间t时的形变位置（平移）==========
+        
+        这个方法计算并返回在时间t时，所有高斯点的形变后位置。
+        它只处理位置形变（平移），不涉及旋转、放缩等其他属性。
+        
+        【功能说明】
+        - 输入：时间t（标量，范围[0,1]）
+        - 输出：形变后的3D位置 [N, 3]
+        - 公式：xyz_deformed = xyz_canonical + delta_position
+              其中 delta_position 是通过生命周期机制计算得到的位置偏移量
+        
+        【位置形变（平移）原理】
+        1. 调用 gaussian_deformation 计算所有通道的形变值
+        2. 提取前3个通道（通道0-2），这些是位置形变 [dx, dy, dz]
+        3. 将位置偏移量加到原始位置：xyz_new = xyz_old + [dx, dy, dz]
+        
+        【使用场景】
+        - 渲染时获取当前帧的点位置
+        - 可视化不同时间点的场景状态
+        - 计算位置相关的损失函数
+        
+        Args:
+            t: 时间值，应该在[0,1]范围内
+               - None: 返回原始位置（不应用形变）
+               - 标量或tensor: 计算该时间点的形变位置
+        
+        Returns:
+            xyz_deformed: 形变后的3D位置 [N, 3]
+                         - 如果t为None或形变参数未初始化，返回原始位置
+                         - 否则返回 xyz_canonical + position_deformation
         """
-        if t is None or self._w_pos.numel() == 0:
+        # ========== 边界情况处理 ==========
+        if t is None or self._coefs.numel() == 0:
+            # 如果没有指定时间，或者形变参数未初始化，返回原始位置
+            # 这适用于静态场景或形变系统未启用的情况
             return self._xyz
 
+        # ========== 时间参数处理 ==========
+        # 确保t是tensor格式，并移动到正确的设备
         if not torch.is_tensor(t):
             t = torch.tensor(t, device=self._xyz.device, dtype=self._xyz.dtype)
         else:
             t = t.to(device=self._xyz.device, dtype=self._xyz.dtype)
 
-        phi = self._time_phi(t)[0]  # [K]
-        # w_pos: [N,K,3], phi: [K] => delta: [N,3]
-        delta = torch.einsum("k,nkc->nc", phi, self._w_pos)
+        # ========== 计算位置形变（平移）==========
+        # 创建全True的deformation_point，表示所有点都需要计算形变
+        # 注意：这里没有使用_deformation_table来过滤静态点，而是计算所有点
+        # 这是因为get_xyz_t通常用于渲染，需要所有点的位置信息
+        deformation_point = torch.ones(self._xyz.shape[0], dtype=torch.bool, device="cuda")
         
-        # 时间形变信息已在backend中输出，这里不再单独打印
-        # if not GaussianModel._time_deform_logged:
-        #     print(f"[TimeDeform] using time varied gaussian center: t={t.item():.4f}, N={self._xyz.shape[0]}, delta_norm={delta.norm().item():.6f}")
-        #     GaussianModel._time_deform_logged = True
+        # 调用核心形变计算方法，获取所有通道的形变值
+        # deform形状: [N, ch_num]，其中ch_num默认是11
+        deform = self.gaussian_deformation(t, deformation_point, self._xyz.shape[0], 
+                                          ch_num=self.ch_num, basis_num=self.K_time)
         
+        # ========== 提取位置形变（前3个通道）==========
+        # deform[:, 0:3] 是位置形变，表示每个点在x、y、z方向上的偏移量
+        # delta形状: [N, 3]，表示位置偏移 [dx, dy, dz]
+        if deform.shape[1] >= 3:
+            delta = deform[:, :3]  # [N, 3] - 位置形变（平移）
+        else:
+            # 如果形变通道数不足3，说明位置形变未启用，返回零偏移
+            delta = torch.zeros_like(self._xyz)
+        
+        # ========== 应用位置形变 ==========
+        # 将位置偏移量加到原始位置，得到形变后的位置
+        # xyz_deformed = xyz_canonical + delta_position
+        # 其中：
+        # - xyz_canonical: 原始（规范）位置，在训练过程中学习得到
+        # - delta_position: 时间相关的偏移量，通过生命周期机制计算
         return self._xyz + delta
 
     def get_deformed_attributes_t(self, t):
         """
         返回时间t时的所有形变属性（位置、旋转、放缩、不透明度）
+        使用生命周期机制（参考EH-SurGS）
         
         Args:
             t: 时间值，应该在[0,1]范围内，可以是标量或tensor
@@ -184,7 +357,7 @@ class GaussianModel:
             tuple: (xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed)
         """
         # 如果没有时间或形变参数未初始化，返回原始值
-        if t is None or self._w_pos.numel() == 0:
+        if t is None or self._coefs.numel() == 0:
             return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
 
         # 确保t是tensor格式
@@ -193,9 +366,6 @@ class GaussianModel:
         else:
             t = t.to(device=self._xyz.device, dtype=self._xyz.dtype)
 
-        # 计算时间基函数权重
-        phi = self._time_phi(t)[0]  # [K]
-        
         # 检查是否使用形变点选择
         use_deformation_table = (
             hasattr(self, '_deformation_table') and 
@@ -209,65 +379,108 @@ class GaussianModel:
             
             # 初始化结果（所有点保持原值）
             xyz_deformed = self._xyz.clone()
-            # 获取原始值（使用属性访问，然后clone）
             rotation_deformed = self.rotation_activation(self._rotation).clone()
             scaling_deformed = self.scaling_activation(self._scaling).clone()
             opacity_deformed = self.opacity_activation(self._opacity).clone()
             
             # 只对标记的点计算形变
-            if deformation_mask.any() and self._w_pos.numel() > 0:
-                # 位置形变
-                delta_pos = torch.zeros_like(self._xyz)
-                delta_pos[deformation_mask] = torch.einsum("k,nkc->nc", phi, self._w_pos[deformation_mask])
-                xyz_deformed = xyz_deformed + delta_pos
+            if deformation_mask.any():
+                # 使用生命周期机制计算形变
+                deform = self.gaussian_deformation(t, deformation_mask, deformation_mask.sum().item(), 
+                                                   ch_num=self.ch_num, basis_num=self.K_time)
+                # deform: [num_deform, ch_num]
                 
-                # 旋转形变
-                if self._w_rot.numel() > 0:
-                    delta_rot = torch.zeros_like(self._rotation)
-                    delta_rot[deformation_mask] = torch.einsum("k,nkc->nc", phi, self._w_rot[deformation_mask])
-                    rotation_deformed = self.rotation_activation(self._rotation + delta_rot)
+                # 应用形变（参考EH-SurGS的apply_deformations）
+                deformation_config = {
+                    "xyz_scale": 4.0,
+                    "rotation_scale": 6.0,
+                    "opacity_scale": 20.0
+                }
                 
-                # 放缩形变
-                if self._w_scale.numel() > 0:
-                    delta_scale = torch.zeros_like(self._scaling)
-                    delta_scale[deformation_mask] = torch.einsum("k,nkc->nc", phi, self._w_scale[deformation_mask])
-                    scaling_deformed = self.scaling_activation(self._scaling + delta_scale)
+                # 位置形变（前3个通道）
+                if deform.shape[1] >= 3:
+                    xyz_deform = deform[:, :3] * deformation_config["xyz_scale"]
+                    xyz_deformed[deformation_mask] = xyz_deformed[deformation_mask] + xyz_deform
                 
-                # 不透明度形变
-                if self._w_opacity.numel() > 0:
-                    delta_opacity = torch.zeros_like(self._opacity)
-                    w_opacity_flat = self._w_opacity.squeeze(-1)  # [N, K]
-                    delta_opacity[deformation_mask] = torch.einsum("k,nk->n", phi, w_opacity_flat[deformation_mask]).unsqueeze(-1)
-                    opacity_deformed = self.opacity_activation(self._opacity + delta_opacity)
+                # 旋转形变（第4-7个通道）
+                if deform.shape[1] >= 7:
+                    rot_deform = deform[:, 3:7] * deformation_config["rotation_scale"]
+                    rotation_deformed[deformation_mask] = self.rotation_activation(
+                        self._rotation[deformation_mask] + rot_deform
+                    )
+                
+                # 放缩形变（第8-10个通道，如果有）
+                if deform.shape[1] >= 10:
+                    scale_deform = deform[:, 7:10]
+                    scaling_deformed[deformation_mask] = self.scaling_activation(
+                        self._scaling[deformation_mask] + scale_deform
+                    )
+                
+                # 不透明度形变（第11个通道，如果有）
+                if deform.shape[1] >= 11:
+                    opacity_deform = deform[:, 10:11] * deformation_config["opacity_scale"]
+                    opacity_deformed[deformation_mask] = self.opacity_activation(
+                        self._opacity[deformation_mask] + opacity_deform
+                    )
         else:
-            # 所有点都计算形变（向后兼容）
-            # 位置形变
-            if self._w_pos.numel() > 0:
-                delta_pos = torch.einsum("k,nkc->nc", phi, self._w_pos)
-                xyz_deformed = self._xyz + delta_pos
-            else:
-                xyz_deformed = self._xyz
+            # 所有点都计算形变
+            # 确保_xyz的形状是[N, 3]，如果不是则尝试修复
+            xyz = self._xyz
+            if xyz.dim() != 2 or xyz.shape[1] != 3:
+                # 如果形状不对，尝试重塑为[N, 3]
+                if xyz.numel() % 3 == 0:
+                    expected_num_points = xyz.numel() // 3
+                    xyz = xyz.reshape(expected_num_points, 3)
+                else:
+                    # 如果无法重塑，返回原始值（不应用形变）
+                    return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
             
-            # 旋转形变 (quaternion)
-            if self._w_rot.numel() > 0:
-                delta_rot = torch.einsum("k,nkc->nc", phi, self._w_rot)
-                rotation_deformed = self.rotation_activation(self._rotation + delta_rot)
-            else:
-                rotation_deformed = self.get_rotation
+            num_points = xyz.shape[0]
+            deformation_point = torch.ones(num_points, dtype=torch.bool, device=xyz.device)
+            deform = self.gaussian_deformation(t, deformation_point, num_points, 
+                                              ch_num=self.ch_num, basis_num=self.K_time)
+            
+            # 检查deform的形状是否正确
+            if deform.shape[0] != num_points:
+                # 如果形状不匹配，返回原始值（不应用形变）
+                return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
+            
+            # 初始化结果（所有点保持原值）
+            xyz_deformed = xyz.clone()
+            rotation_deformed = self.rotation_activation(self._rotation).clone()
+            scaling_deformed = self.scaling_activation(self._scaling).clone()
+            opacity_deformed = self.opacity_activation(self._opacity).clone()
+            
+            # 应用形变
+            deformation_config = {
+                "xyz_scale": 4.0,
+                "rotation_scale": 6.0,
+                "opacity_scale": 20.0
+            }
+            
+            # 位置形变
+            if deform.shape[1] >= 3:
+                xyz_deform = deform[:, :3] * deformation_config["xyz_scale"]
+                # 最终检查：确保形状匹配
+                if xyz_deformed.shape != xyz_deform.shape:
+                    # 如果形状仍然不匹配，返回原始值（不应用形变）
+                    return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
+                xyz_deformed = xyz_deformed + xyz_deform
+            
+            # 旋转形变
+            if deform.shape[1] >= 7:
+                rot_deform = deform[:, 3:7] * deformation_config["rotation_scale"]
+                rotation_deformed = self.rotation_activation(self._rotation + rot_deform)
             
             # 放缩形变
-            if self._w_scale.numel() > 0:
-                delta_scale = torch.einsum("k,nkc->nc", phi, self._w_scale)
-                scaling_deformed = self.scaling_activation(self._scaling + delta_scale)
-            else:
-                scaling_deformed = self.get_scaling
+            if deform.shape[1] >= 10:
+                scale_deform = deform[:, 7:10]
+                scaling_deformed = self.scaling_activation(self._scaling + scale_deform)
             
             # 不透明度形变
-            if self._w_opacity.numel() > 0:
-                delta_opacity = torch.einsum("k,nk->n", phi, self._w_opacity.squeeze(-1)).unsqueeze(-1)
-                opacity_deformed = self.opacity_activation(self._opacity + delta_opacity)
-            else:
-                opacity_deformed = self.get_opacity
+            if deform.shape[1] >= 11:
+                opacity_deform = deform[:, 10:11] * deformation_config["opacity_scale"]
+                opacity_deformed = self.opacity_activation(self._opacity + opacity_deform)
         
         return xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed
 
@@ -430,8 +643,9 @@ class GaussianModel:
         new_n_obs = torch.zeros((new_xyz.shape[0])).int()
         
         # 初始化形变点选择参数（如果还没有初始化）
+        # 注意：_coefs的初始化由densification_postfix统一处理，避免重复初始化
+        N = new_xyz.shape[0]
         if self._deformation_table.numel() == 0:
-            N = new_xyz.shape[0]
             self._deformation_table = torch.ones(N, dtype=torch.bool, device="cuda")
             self._deformation_accum = torch.zeros(N, device="cuda")
         
@@ -494,7 +708,7 @@ class GaussianModel:
             },
         ]
         
-        # ========== 形变参数优化器配置 ==========
+        # ========== 形变参数优化器配置（生命周期机制）==========
         # 形变参数需要单独的学习率，通常比位置参数小10倍
         # 原因：形变是细微的变化，如果学习率太大，会导致训练不稳定
         
@@ -506,39 +720,13 @@ class GaussianModel:
             training_args.position_lr_init * 0.1  # 否则用位置学习率的10%
         ) * self.spatial_lr_scale  # 乘以空间缩放因子
         
-        # 将形变参数添加到优化器配置列表中
-        l.extend([
-            {
-                "params": [self._w_pos],
+        # 将形变系数参数添加到优化器配置列表中（生命周期机制）
+        if self._coefs.numel() > 0:
+            l.append({
+                "params": [self._coefs],
                 "lr": deformation_lr,
-                "name": "w_pos",  # 位置形变参数
-            },
-            {
-                "params": [self._w_rot],
-                "lr": deformation_lr,
-                "name": "w_rot",  # 旋转形变参数
-            },
-            {
-                "params": [self._w_scale],
-                "lr": deformation_lr,
-                "name": "w_scale",  # 放缩形变参数
-            },
-            {
-                "params": [self._w_opacity],
-                "lr": deformation_lr,
-                "name": "w_opacity",  # 不透明度形变参数
-            },
-            {
-                "params": [self.t_mu],
-                "lr": 0.0,  # 暂时关闭训练
-                "name": "t_mu",
-            },
-            {
-                "params": [self.t_sigma_raw],
-                "lr": 0.0,  # 暂时关闭训练
-                "name": "t_sigma",
-            },
-        ])
+                "name": "coefs",  # 形变系数（包含weights, means, std_devs）
+            })
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
@@ -581,6 +769,10 @@ class GaussianModel:
             l.append("scale_{}".format(i))
         for i in range(self._rotation.shape[1]):
             l.append("rot_{}".format(i))
+        # 添加形变系数（生命周期机制）
+        if self._coefs.numel() > 0:
+            for i in range(self._coefs.shape[1]):
+                l.append("coefs_{}".format(i))
         return l
 
     def save_ply(self, path):
@@ -607,14 +799,47 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        
+        # 添加形变系数（生命周期机制）
+        coefs = None
+        coefs_valid = False
+        if self._coefs.numel() > 0:
+            coefs_numpy = self._coefs.detach().cpu().numpy()
+            # 检查coefs的形状是否与xyz匹配
+            if coefs_numpy.shape[0] == xyz.shape[0]:
+                coefs = coefs_numpy
+                coefs_valid = True
+            else:
+                # 如果形状不匹配，跳过coefs（避免保存错误）
+                print(f"Warning: coefs shape {coefs_numpy.shape[0]} doesn't match xyz shape {xyz.shape[0]}, skipping coefs in PLY save")
 
-        dtype_full = [
-            (attribute, "f4") for attribute in self.construct_list_of_attributes()
-        ]
+        # 构建属性列表（根据coefs是否有效）
+        attributes_list = ["x", "y", "z", "nx", "ny", "nz"]
+        # All channels except the 3 DC
+        for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
+            attributes_list.append("f_dc_{}".format(i))
+        for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
+            attributes_list.append("f_rest_{}".format(i))
+        attributes_list.append("opacity")
+        for i in range(self._scaling.shape[1]):
+            attributes_list.append("scale_{}".format(i))
+        for i in range(self._rotation.shape[1]):
+            attributes_list.append("rot_{}".format(i))
+        # 只有在coefs有效时才添加coefs属性
+        if coefs_valid:
+            for i in range(coefs.shape[1]):
+                attributes_list.append("coefs_{}".format(i))
+        
+        dtype_full = [(attribute, "f4") for attribute in attributes_list]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
-        )
+        if coefs_valid:
+            attributes = np.concatenate(
+                (xyz, normals, f_dc, f_rest, opacities, scale, rotation, coefs), axis=1
+            )
+        else:
+            attributes = np.concatenate(
+                (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
+            )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
@@ -669,16 +894,22 @@ class GaussianModel:
             (attribute, "f4") for attribute in self.construct_list_of_attributes()
         ]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
-        )
+        
+        # 构建attributes列表，注意construct_list_of_attributes可能包含coefs
+        attributes_list = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
+        # 如果construct_list_of_attributes包含coefs，也需要添加到attributes中
+        if self._coefs.numel() > 0:
+            coefs = self._coefs.detach().cpu().numpy()
+            attributes_list.append(coefs)
+        
+        attributes = np.concatenate(attributes_list, axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
         
     def save_deformation_params(self, path):
         """
-        保存形变参数（权重和时间基函数参数）为.npz文件
+        保存形变参数（生命周期机制的系数）为.npz文件
         
         Args:
             path: 保存路径（.npz文件）
@@ -686,12 +917,8 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
         
         params = {
-            'w_pos': self._w_pos.detach().cpu().numpy() if self._w_pos.numel() > 0 else None,
-            'w_rot': self._w_rot.detach().cpu().numpy() if self._w_rot.numel() > 0 else None,
-            'w_scale': self._w_scale.detach().cpu().numpy() if self._w_scale.numel() > 0 else None,
-            'w_opacity': self._w_opacity.detach().cpu().numpy() if self._w_opacity.numel() > 0 else None,
-            't_mu': self.t_mu.detach().cpu().numpy(),
-            't_sigma': F.softplus(self.t_sigma_raw).detach().cpu().numpy(),
+            'coefs': self._coefs.detach().cpu().numpy() if self._coefs.numel() > 0 else None,
+            'ch_num': self.ch_num,
             'K_time': self.K_time,
         }
         
@@ -771,25 +998,42 @@ class GaussianModel:
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        
+        # 加载形变系数（生命周期机制）
+        coef_names = [
+            p.name for p in plydata.elements[0].properties if p.name.startswith("coefs_")
+        ]
+        coefs = None
+        if len(coef_names) > 0:
+            coef_names = sorted(coef_names, key=lambda x: int(x.split("_")[-1]))
+            coefs = np.zeros((xyz.shape[0], len(coef_names)))
+            for idx, attr_name in enumerate(coef_names):
+                coefs[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         self._xyz = nn.Parameter(
             torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
         )
 
-        # 初始化 per-point 位移系数，默认 0 -> 退化成静态
-        self._w_pos = nn.Parameter(
-            torch.zeros((self._xyz.shape[0], self.K_time, 3), device="cuda", dtype=torch.float).requires_grad_(True)
-        )
-        # 初始化其他形变参数
-        self._w_rot = nn.Parameter(
-            torch.zeros((self._xyz.shape[0], self.K_time, 4), device="cuda", dtype=torch.float).requires_grad_(True)
-        )
-        self._w_scale = nn.Parameter(
-            torch.zeros((self._xyz.shape[0], self.K_time, 3), device="cuda", dtype=torch.float).requires_grad_(True)
-        )
-        self._w_opacity = nn.Parameter(
-            torch.zeros((self._xyz.shape[0], self.K_time, 1), device="cuda", dtype=torch.float).requires_grad_(True)
-        )
+        # 初始化形变系数（生命周期机制）
+        if coefs is not None:
+            # 从PLY文件加载
+            self._coefs = nn.Parameter(
+                torch.tensor(coefs, dtype=torch.float, device="cuda").requires_grad_(True)
+            )
+        else:
+            # 初始化新的形变系数
+            N = self._xyz.shape[0]
+            weight_coefs = torch.zeros((N, self.ch_num, self.K_time), device="cuda")
+            position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(N, self.ch_num, 1)
+            shape_coefs = torch.full((N, self.ch_num, self.K_time), 0.01, device="cuda")
+            _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
+            self._coefs = nn.Parameter(_coefs.requires_grad_(True))
+        
+        # 为了向后兼容，保留旧的参数名（但不再使用）
+        self._w_pos = torch.empty(0, device="cuda")
+        self._w_rot = torch.empty(0, device="cuda")
+        self._w_scale = torch.empty(0, device="cuda")
+        self._w_opacity = torch.empty(0, device="cuda")
 
 
         self._features_dc = nn.Parameter(
@@ -900,13 +1144,11 @@ class GaussianModel:
         
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
-        # ========== 更新形变参数 ==========
-        # 删除被prune的点的形变参数，只保留有效点的参数
+        # ========== 更新形变系数（生命周期机制）==========
+        # 删除被prune的点的形变系数，只保留有效点的参数
         # 这样优化器中的参数和实际数据保持一致
-        self._w_pos = optimizable_tensors["w_pos"]
-        self._w_rot = optimizable_tensors["w_rot"]
-        self._w_scale = optimizable_tensors["w_scale"]
-        self._w_opacity = optimizable_tensors["w_opacity"]
+        if "coefs" in optimizable_tensors:
+            self._coefs = optimizable_tensors["coefs"]
 
         # ========== 更新其他参数 ==========
         self._xyz = optimizable_tensors["xyz"]
@@ -953,6 +1195,17 @@ class GaussianModel:
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
+        
+        # 如果优化器还没有初始化，直接返回tensors_dict中的值（转换为Parameter）
+        if self.optimizer is None:
+            for name, tensor in tensors_dict.items():
+                if isinstance(tensor, nn.Parameter):
+                    optimizable_tensors[name] = tensor
+                else:
+                    optimizable_tensors[name] = nn.Parameter(tensor.requires_grad_(True))
+            return optimizable_tensors
+        
+        # 处理优化器中已存在的参数组
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
             name = group["name"]
@@ -989,6 +1242,15 @@ class GaussianModel:
                     ).requires_grad_(True)
                 )
                 optimizable_tensors[name] = group["params"][0]
+        
+        # 处理tensors_dict中存在但优化器中还没有的参数组（如coefs在优化器初始化前）
+        for name, tensor in tensors_dict.items():
+            if name not in optimizable_tensors:
+                # 如果优化器中没有这个参数组，直接返回tensor（转换为Parameter）
+                if isinstance(tensor, nn.Parameter):
+                    optimizable_tensors[name] = tensor
+                else:
+                    optimizable_tensors[name] = nn.Parameter(tensor.requires_grad_(True))
 
         return optimizable_tensors
 
@@ -1012,23 +1274,20 @@ class GaussianModel:
         # new_xyz: [M,3] M是新点的数量
         M = new_xyz.shape[0]
         
-        # ========== 初始化新点的形变参数 ==========
-        # 新点的形变参数都初始化为0，意味着：
-        # 1. 新点默认是静态的（不随时间变化）
-        # 2. 训练过程中，如果发现这个点需要动，优化器会自动调整这些参数
-        # 3. 这样初始化是安全的，不会破坏现有场景
+        # 如果没有新点，直接返回（避免空张量操作）
+        if M == 0:
+            return
         
-        # 位置形变权重：新点默认不移动
-        new_w_pos = torch.zeros((M, self.K_time, 3), device="cuda", dtype=new_xyz.dtype)
-        
-        # 旋转形变权重：新点默认不旋转
-        new_w_rot = torch.zeros((M, self.K_time, 4), device="cuda", dtype=new_xyz.dtype)
-        
-        # 放缩形变权重：新点默认大小不变
-        new_w_scale = torch.zeros((M, self.K_time, 3), device="cuda", dtype=new_xyz.dtype)
-        
-        # 不透明度形变权重：新点默认透明度不变
-        new_w_opacity = torch.zeros((M, self.K_time, 1), device="cuda", dtype=new_xyz.dtype)
+        # ========== 初始化新点的形变系数（生命周期机制）==========
+        # 新点的形变系数初始化（参考EH-SurGS）：
+        # - weights: 初始化为0（新点默认不形变）
+        # - means: 均匀分布在[0,1]（时间中心位置）
+        # - std_devs: 初始化为0.01（时间影响范围）
+        weight_coefs = torch.zeros((M, self.ch_num, self.K_time), device="cuda", dtype=new_xyz.dtype)
+        position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(M, self.ch_num, 1)
+        shape_coefs = torch.full((M, self.ch_num, self.K_time), 0.01, device="cuda", dtype=new_xyz.dtype)
+        # 堆叠为 [M, ch_num, 3, K_time] 然后reshape为 [M, ch_num * 3 * K_time]
+        new_coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(M, -1)
         
         # ========== 初始化新点的形变点选择参数 ==========
         # 新点默认都标记为需要形变（True），这样它们可以学习形变
@@ -1054,10 +1313,7 @@ class GaussianModel:
             "opacity": new_opacities,
             "scaling": new_scaling,
             "rotation": new_rotation,
-            "w_pos": new_w_pos,
-            "w_rot": new_w_rot,
-            "w_scale": new_w_scale,
-            "w_opacity": new_w_opacity,
+            "coefs": new_coefs,
         }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -1068,10 +1324,17 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._w_pos = optimizable_tensors["w_pos"]
-        self._w_rot = optimizable_tensors["w_rot"]
-        self._w_scale = optimizable_tensors["w_scale"]
-        self._w_opacity = optimizable_tensors["w_opacity"]
+        
+        # 安全处理coefs：如果优化器中还没有coefs参数组，使用传入的new_coefs
+        if "coefs" in optimizable_tensors:
+            self._coefs = optimizable_tensors["coefs"]
+        else:
+            # 如果优化器还没有初始化coefs参数组，直接使用new_coefs
+            # 这会在training_setup时被添加到优化器
+            if isinstance(new_coefs, nn.Parameter):
+                self._coefs = new_coefs
+            else:
+                self._coefs = nn.Parameter(new_coefs.requires_grad_(True))
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1262,9 +1525,11 @@ class GaussianModel:
             '_w_rot': self._w_rot,
             '_w_scale': self._w_scale,
             '_w_opacity': self._w_opacity,
-            't_mu': self.t_mu,
-            't_sigma_raw': self.t_sigma_raw,
+            '_coefs': getattr(self, '_coefs', torch.empty(0, device="cuda")),
+            't_mu': getattr(self, 't_mu', None),
+            't_sigma_raw': getattr(self, 't_sigma_raw', None),
             'K_time': self.K_time,
+            'ch_num': getattr(self, 'ch_num', 11),
             'optimizer': self.optimizer.state_dict() if self.optimizer is not None else None,
             'max_radii2D': self.max_radii2D,
             'xyz_gradient_accum': self.xyz_gradient_accum,
@@ -1293,13 +1558,13 @@ class GaussianModel:
         self.active_sh_degree = checkpoint_dict['active_sh_degree']
         self.max_sh_degree = checkpoint_dict.get('max_sh_degree', self.max_sh_degree)
         
-        # 恢复模型参数
-        self._xyz = checkpoint_dict['_xyz']
-        self._features_dc = checkpoint_dict['_features_dc']
-        self._features_rest = checkpoint_dict['_features_rest']
-        self._scaling = checkpoint_dict['_scaling']
-        self._rotation = checkpoint_dict['_rotation']
-        self._opacity = checkpoint_dict['_opacity']
+        # 恢复模型参数（确保它们是Parameter并且requires_grad=True）
+        self._xyz = nn.Parameter(checkpoint_dict['_xyz'].requires_grad_(True))
+        self._features_dc = nn.Parameter(checkpoint_dict['_features_dc'].requires_grad_(True))
+        self._features_rest = nn.Parameter(checkpoint_dict['_features_rest'].requires_grad_(True))
+        self._scaling = nn.Parameter(checkpoint_dict['_scaling'].requires_grad_(True))
+        self._rotation = nn.Parameter(checkpoint_dict['_rotation'].requires_grad_(True))
+        self._opacity = nn.Parameter(checkpoint_dict['_opacity'].requires_grad_(True))
         
         # 恢复形变参数（如果存在）
         if '_w_pos' in checkpoint_dict:
@@ -1310,12 +1575,26 @@ class GaussianModel:
             self._w_scale = checkpoint_dict['_w_scale']
         if '_w_opacity' in checkpoint_dict:
             self._w_opacity = checkpoint_dict['_w_opacity']
-        if 't_mu' in checkpoint_dict:
+        if '_coefs' in checkpoint_dict and checkpoint_dict['_coefs'].numel() > 0:
+            self._coefs = nn.Parameter(checkpoint_dict['_coefs'].requires_grad_(True))
+        elif self._xyz.shape[0] > 0:
+            # 如果checkpoint中没有_coefs，但有点存在，需要初始化
+            N = self._xyz.shape[0]
+            ch_num = checkpoint_dict.get('ch_num', self.ch_num)
+            K_time = checkpoint_dict.get('K_time', self.K_time)
+            weight_coefs = torch.zeros((N, ch_num, K_time), device="cuda")
+            position_coefs = torch.linspace(0, 1, K_time, device="cuda").view(1, 1, -1).repeat(N, ch_num, 1)
+            shape_coefs = torch.full((N, ch_num, K_time), 0.01, device="cuda")
+            _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
+            self._coefs = nn.Parameter(_coefs.requires_grad_(True))
+        if 't_mu' in checkpoint_dict and checkpoint_dict['t_mu'] is not None:
             self.t_mu = checkpoint_dict['t_mu']
-        if 't_sigma_raw' in checkpoint_dict:
+        if 't_sigma_raw' in checkpoint_dict and checkpoint_dict['t_sigma_raw'] is not None:
             self.t_sigma_raw = checkpoint_dict['t_sigma_raw']
         if 'K_time' in checkpoint_dict:
             self.K_time = checkpoint_dict['K_time']
+        if 'ch_num' in checkpoint_dict:
+            self.ch_num = checkpoint_dict['ch_num']
         
         # 恢复形变点选择参数（如果存在）
         if '_deformation_table' in checkpoint_dict:
