@@ -8,6 +8,7 @@ Results:
   use_wandb: False
   color_refinement: True
   global_BA: False
+  checkpoint_iterations: []  # 在哪些迭代保存checkpoint，例如: [1000, 3000, 5000]
 
 Dataset:
   type: 'tum'
@@ -74,6 +75,24 @@ opt_params:
   densify_until_iter: 15000
   densify_grad_threshold: 0.0002
   init_lr: 6
+  
+  # ========== 形变相关学习率参数（新增）==========
+  # 这些参数控制形变参数（位置、旋转、放缩、不透明度的形变权重）的学习速度
+  # 
+  # deformation_lr_init: 形变参数的初始学习率
+  #   值越小，形变参数变化越慢，训练越稳定，但可能需要更多迭代次数
+  #   推荐值：0.00016（是位置学习率的10%）
+  deformation_lr_init: 0.00016
+  
+  # deformation_lr_final: 形变参数的最终学习率
+  #   训练后期会逐渐降低到这个值，让模型更精细地调整
+  #   推荐值：0.000016（是初始值的10%）
+  deformation_lr_final: 0.000016
+  
+  # deformation_lr_delay_mult: 学习率延迟倍数
+  #   控制学习率衰减的速度，值越小衰减越快
+  #   推荐值：0.01
+  deformation_lr_delay_mult: 0.01
 
 depth:
   patch_size: 10
@@ -90,6 +109,11 @@ model_params:
   resolution: -1
   white_background: False
   data_device: "cuda"
+  # 时间基函数数量（可选，默认17）
+  # EH-SurGS使用17-20个，更多基函数可以表达更复杂的时间变化
+  # 但会增加内存：每点约增加 (K_time-3) * (3+4+3+1) = (K_time-3) * 11 个参数
+  # 例如：K_time=17时，每点增加约154个参数（相比K_time=3）
+  time_basis_num: 17
 
 pipeline_params:
   convert_SHs_python: False

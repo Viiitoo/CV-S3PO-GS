@@ -33,6 +33,8 @@ class BackEnd(mp.Process):
         self.live_mode = False
         self.save_dir = save_dir
         self.num_frames = None  # 将在 slam.py 中设置为 len(dataset)
+        self.checkpoint_iterations = config.get("Results", {}).get("checkpoint_iterations", [])
+        self.iteration_count_global = 0  # 全局迭代计数，用于checkpoint保存
 
 
         self.pause = False
@@ -97,11 +99,6 @@ class BackEnd(mp.Process):
     def initialize_map(self, cur_frame_idx, viewpoint):
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
-            # print(">>> Before first render:")
-            # print("xyz:", self.gaussians._xyz.shape)
-            # print("scaling:", self.gaussians._scaling.shape)
-            # print("rotation:", self.gaussians._rotation.shape)
-            # print("opacity:", self.gaussians._opacity.shape)
 
             attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=self.num_frames)
             render_pkg = render(
@@ -153,8 +150,16 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.step()                         
                 self.gaussians.optimizer.zero_grad(set_to_none=True)    
 
-        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()   
-        Log("Initialized map")
+        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
+        
+        # 输出初始化信息（包含形变状态）
+        num_points = self.gaussians._xyz.shape[0]
+        has_deformation = hasattr(self.gaussians, '_w_pos') and self.gaussians._w_pos.numel() > 0
+        deform_info = ""
+        if has_deformation:
+            w_pos = self.gaussians._w_pos
+            deform_info = f", Deform params: {w_pos.shape}, K_time={self.gaussians.K_time}"
+        Log(f"[Init] Map initialized at frame {cur_frame_idx}, Points: {num_points}{deform_info}")
         return render_pkg
     # Optimize keyframe poses and Gaussians scene
     def map(self, current_window, prune=False, iters=1, up_pose = True):
@@ -173,6 +178,7 @@ class BackEnd(mp.Process):
             
         for _ in range(iters):
             self.iteration_count += 1
+            self.iteration_count_global += 1
             self.last_sent += 1
 
             loss_mapping = 0
@@ -180,6 +186,8 @@ class BackEnd(mp.Process):
             visibility_filter_acm = []                      
             radii_acm = []                                  
             n_touched_acm = []                            
+            # Track which keyframes successfully rendered (kf_idx -> index in n_touched_acm)
+            kf_to_n_touched_idx = {}
 
             keyframes_opt = []          
 
@@ -190,6 +198,10 @@ class BackEnd(mp.Process):
                 attach_time_to_viewpoint(viewpoint, frame_idx=kf_idx, num_frames=self.num_frames)
 
                 render_pkg = render(viewpoint, self.gaussians, self.pipeline_params, self.background)
+                # Check if rendering failed (e.g., no points initialized yet)
+                if render_pkg is None:
+                    # Skip this keyframe if no points are available yet
+                    continue
                 (                                          
                     image,
                     viewspace_point_tensor,                 
@@ -211,7 +223,9 @@ class BackEnd(mp.Process):
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
-                n_touched_acm.append(n_touched)     
+                n_touched_acm.append(n_touched)
+                # Record the mapping from kf_idx to index in n_touched_acm
+                kf_to_n_touched_idx[kf_idx] = len(n_touched_acm) - 1     
                 
             # In each iteration, randomly select two non-window keyframes for optimization
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:     
@@ -219,6 +233,10 @@ class BackEnd(mp.Process):
                 attach_time_to_viewpoint(viewpoint, frame_idx=kf_idx, num_frames=self.num_frames)
 
                 render_pkg = render(viewpoint, self.gaussians, self.pipeline_params, self.background)
+                # Check if rendering failed (e.g., no points initialized yet)
+                if render_pkg is None:
+                    # Skip this keyframe if no points are available yet
+                    continue
                 (
                     image,
                     viewspace_point_tensor,
@@ -261,43 +279,64 @@ class BackEnd(mp.Process):
             
             # Deinsifying / Pruning Gaussians
             with torch.no_grad():
-                self.occ_aware_visibility = {}            
-                for idx in range((len(current_window))):
-                    kf_idx = current_window[idx]
-                    n_touched = n_touched_acm[idx]
-                    self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
+                self.occ_aware_visibility = {}
+                # Check if gaussians are initialized
+                if hasattr(self.gaussians, '_xyz') and self.gaussians._xyz is not None and self.gaussians._xyz.shape[0] > 0:
+                    # Only process keyframes that successfully rendered
+                    for kf_idx in current_window:
+                        if kf_idx in kf_to_n_touched_idx:
+                            n_touched_idx = kf_to_n_touched_idx[kf_idx]
+                            n_touched = n_touched_acm[n_touched_idx]
+                            self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
+                        else:
+                            # If rendering failed, set visibility to zero
+                            self.occ_aware_visibility[kf_idx] = torch.zeros(
+                                self.gaussians._xyz.shape[0], dtype=torch.long, device=self.device
+                            )
+                else:
+                    # If no gaussians initialized yet, create empty visibility dict
+                    for kf_idx in current_window:
+                        self.occ_aware_visibility[kf_idx] = None
 
                 # Only prune on the last iteration and when we have full window
                 if prune:     
                     if len(current_window) == self.config["Training"]["window_size"]:
-                        prune_mode = self.config["Training"]["prune_mode"]
-                        prune_coviz = self.config["Training"]["prune_num"]  # prune parameter
-                        self.gaussians.n_obs.fill_(0)
-                        for window_idx, visibility in self.occ_aware_visibility.items():
-                            self.gaussians.n_obs += visibility.cpu()
-                        to_prune = None
-                        if prune_mode == "odometry":
-                            to_prune = self.gaussians.n_obs < 3
-                            # make sure we don't split the gaussians, break here.
-                        if prune_mode == "slam":
-                            # only prune keyframes which are relatively new
-                            sorted_window = sorted(current_window, reverse=True)
-                            mask = self.gaussians.unique_kfIDs >= sorted_window[2]
-                            if not self.initialized:
-                                mask = self.gaussians.unique_kfIDs >= 0
-                            to_prune = torch.logical_and(
-                                self.gaussians.n_obs <= prune_coviz, mask
-                            )
-                        if to_prune is not None and self.monocular:       
-                            self.gaussians.prune_points(to_prune.cuda())
-                            for idx in range((len(current_window))):
-                                current_idx = current_window[idx]
-                                self.occ_aware_visibility[current_idx] = (                
-                                    self.occ_aware_visibility[current_idx][~to_prune]
+                        # Check if we have valid visibility data
+                        has_valid_visibility = any(
+                            v is not None for v in self.occ_aware_visibility.values()
+                        )
+                        if has_valid_visibility:
+                            prune_mode = self.config["Training"]["prune_mode"]
+                            prune_coviz = self.config["Training"]["prune_num"]  # prune parameter
+                            self.gaussians.n_obs.fill_(0)
+                            for window_idx, visibility in self.occ_aware_visibility.items():
+                                if visibility is not None:
+                                    self.gaussians.n_obs += visibility.cpu()
+                            to_prune = None
+                            if prune_mode == "odometry":
+                                to_prune = self.gaussians.n_obs < 3
+                                # make sure we don't split the gaussians, break here.
+                            if prune_mode == "slam":
+                                # only prune keyframes which are relatively new
+                                sorted_window = sorted(current_window, reverse=True)
+                                mask = self.gaussians.unique_kfIDs >= sorted_window[2]
+                                if not self.initialized:
+                                    mask = self.gaussians.unique_kfIDs >= 0
+                                to_prune = torch.logical_and(
+                                    self.gaussians.n_obs <= prune_coviz, mask
                                 )
+                            if to_prune is not None and self.monocular:       
+                                self.gaussians.prune_points(to_prune.cuda())
+                                for idx in range((len(current_window))):
+                                    current_idx = current_window[idx]
+                                    if self.occ_aware_visibility.get(current_idx) is not None:
+                                        self.occ_aware_visibility[current_idx] = (                
+                                            self.occ_aware_visibility[current_idx][~to_prune]
+                                        )
                         if not self.initialized:
                             self.initialized = True
-                            Log("Initialized SLAM")
+                            num_points = self.gaussians._xyz.shape[0]
+                            Log(f"[Init] SLAM initialized, Total points: {num_points}")
                     return False
 
                 for idx in range(len(viewspace_point_tensor_acm)):
@@ -324,7 +363,8 @@ class BackEnd(mp.Process):
 
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
                     not update_gaussian) :
-                    Log("Resetting the opacity of non-visible Gaussians")
+                    num_points = self.gaussians._xyz.shape[0]
+                    Log(f"[Densify] Resetting opacity of non-visible Gaussians, Points: {num_points}")
                     self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                     gaussian_split = True
 
@@ -333,6 +373,57 @@ class BackEnd(mp.Process):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+                
+                # 监控时间变形状态（每200次迭代输出一次）
+                if self.iteration_count % 200 == 0 and hasattr(self.gaussians, '_w_pos'):
+                    if self.gaussians._w_pos.numel() > 0:
+                        w_pos = self.gaussians._w_pos
+                        w_rot = self.gaussians._w_rot if self.gaussians._w_rot.numel() > 0 else None
+                        w_scale = self.gaussians._w_scale if self.gaussians._w_scale.numel() > 0 else None
+                        
+                        # 位置形变统计
+                        w_pos_norm = w_pos.norm().item()
+                        w_pos_max = w_pos.abs().max().item()
+                        w_pos_mean = w_pos.abs().mean().item()
+                        
+                        # 旋转形变统计
+                        w_rot_info = ""
+                        if w_rot is not None:
+                            w_rot_norm = w_rot.norm().item()
+                            w_rot_max = w_rot.abs().max().item()
+                            w_rot_info = f", rot_norm={w_rot_norm:.6f}, rot_max={w_rot_max:.6f}"
+                        
+                        # 放缩形变统计
+                        w_scale_info = ""
+                        if w_scale is not None:
+                            w_scale_norm = w_scale.norm().item()
+                            w_scale_max = w_scale.abs().max().item()
+                            w_scale_info = f", scale_norm={w_scale_norm:.6f}, scale_max={w_scale_max:.6f}"
+                        
+                        # 时间基函数信息
+                        t_mu = self.gaussians.t_mu.detach().cpu().numpy()
+                        t_sigma = torch.nn.functional.softplus(self.gaussians.t_sigma_raw).detach().cpu().numpy()
+                        t_mu_range = f"[{t_mu.min():.3f}, {t_mu.max():.3f}]"
+                        t_sigma_mean = t_sigma.mean()
+                        
+                        Log(f"[Deform] iter={self.iteration_count}, points={w_pos.shape[0]}, "
+                            f"pos_norm={w_pos_norm:.6f}, pos_max={w_pos_max:.6f}, pos_mean={w_pos_mean:.6f}"
+                            f"{w_rot_info}{w_scale_info}, "
+                            f"t_mu={t_mu_range}, t_sigma_mean={t_sigma_mean:.4f}")
+                        
+                        # 更新形变点选择表（每200次迭代更新一次）
+                        if hasattr(self.gaussians, 'update_deformation_table'):
+                            self.gaussians.update_deformation_table(threshold=0.01)
+                
+                # 保存checkpoint（参考EH-SurGS的方式）
+                if self.save_dir and len(self.checkpoint_iterations) > 0:
+                    if self.iteration_count_global in self.checkpoint_iterations:
+                        checkpoint_path = os.path.join(self.save_dir, "checkpoints", f"chkpnt_{self.iteration_count_global}.pth")
+                        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+                        checkpoint_data = (self.gaussians.capture(), self.iteration_count_global)
+                        torch.save(checkpoint_data, checkpoint_path)
+                        Log(f"[Checkpoint] Saved checkpoint at iteration {self.iteration_count_global} to {checkpoint_path}")
+                
                 # Pose update
                 if up_pose:
                     for cam_idx in range(min(frames_to_optimize, len(current_window))):
@@ -433,7 +524,7 @@ class BackEnd(mp.Process):
 
                     attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=self.num_frames)
 
-                    Log("Resetting the system")
+                    Log(f"[Init] Resetting system at frame {cur_frame_idx}")
                     self.reset()
 
                     self.viewpoints[cur_frame_idx] = viewpoint
@@ -451,8 +542,16 @@ class BackEnd(mp.Process):
                     current_window = data[3]
                     depth_map = data[4]
                     self.theta = data[5]
-                    theta_value = self.theta.item()
-                    print("current keyframe ",cur_frame_idx,'window is ',current_window)
+                    
+                    # 输出关键帧和形变状态信息
+                    if hasattr(self.gaussians, '_w_pos') and self.gaussians._w_pos.numel() > 0:
+                        num_points = self.gaussians._xyz.shape[0]
+                        w_pos_active = (self.gaussians._w_pos.abs() > 1e-6).any(dim=-1).sum().item()
+                        w_pos_ratio = w_pos_active / num_points if num_points > 0 else 0
+                        Log(f"[Keyframe] Frame {cur_frame_idx}, Window: {current_window}, "
+                            f"Points: {num_points}, Active deform: {w_pos_active} ({w_pos_ratio*100:.1f}%)")
+                    else:
+                        Log(f"[Keyframe] Frame {cur_frame_idx}, Window: {current_window}")
 
                     T_np = np.linalg.inv(getWorld2View2(viewpoint.R,viewpoint.T).cpu().numpy())
                     T = torch.from_numpy(T_np).to(self.device)
@@ -476,7 +575,8 @@ class BackEnd(mp.Process):
                                 self.config["Training"]["window_size"] - 1
                             )
                             iter_per_kf = 50 if self.live_mode else 300
-                            Log("Performing initial BA for initialization")
+                            num_points = self.gaussians._xyz.shape[0]
+                            Log(f"[BA] Performing initial BA, Points: {num_points}, Iters: {iter_per_kf}")
                         else:
                             iter_per_kf = self.mapping_itr_num
                     for cam_idx in range(len(self.current_window)):     

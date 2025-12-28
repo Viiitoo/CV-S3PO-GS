@@ -40,14 +40,56 @@ def render(
     if pc.get_xyz.shape[0] == 0:
         return None
 
-    # --- time for deformation ---
+    # ========== 时间形变处理 ==========
+    # 从相机对象中获取时间信息（如果存在）
+    # 时间用于计算动态场景中高斯点的形变
     t = None
     if hasattr(viewpoint_camera, "time"):
         t = viewpoint_camera.time
     elif hasattr(viewpoint_camera, "t"):
         t = viewpoint_camera.t
 
-    means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
+    # ========== 获取形变后的高斯属性 ==========
+    # 这是关键步骤：根据时间t计算所有高斯点的形变属性
+    # 如果支持完整形变（位置+旋转+放缩+不透明度），就用新方法
+    if hasattr(pc, "get_deformed_attributes_t") and t is not None:
+        # 调用新实现的形变函数，一次性获取所有形变后的属性
+        # 这比只变形位置更强大，可以处理旋转、缩放、透明度变化
+        means3D, rotations, scales, opacity = pc.get_deformed_attributes_t(t)
+        
+        # ========== 累积形变量（用于形变点选择）==========
+        # 如果支持形变点选择，累积形变量用于后续更新deformation_table
+        if hasattr(pc, '_deformation_table') and pc._deformation_table.numel() > 0:
+            if hasattr(pc, '_deformation_accum'):
+                # 计算形变量（形变后的位置 - 原始位置）
+                deformation_amount = torch.norm(means3D - pc._xyz, dim=-1)  # [N]
+                # 累积形变量（使用torch.no_grad避免影响梯度）
+                with torch.no_grad():
+                    if pc._deformation_accum.numel() == 0 or pc._deformation_accum.shape[0] != means3D.shape[0]:
+                        # 如果accum未初始化或尺寸不匹配，重新初始化
+                        pc._deformation_accum = torch.zeros(means3D.shape[0], device=means3D.device)
+                    # 累积形变量（可以取最大值或平均值，这里用最大值）
+                    pc._deformation_accum = torch.maximum(
+                        pc._deformation_accum, 
+                        deformation_amount.detach()
+                    )
+        
+        # 处理各向同性放缩的情况（如果scaling只有1维，复制成3维）
+        # 各向同性：x、y、z三个方向的放缩相同
+        if scales.shape[-1] == 1:
+            scales = scales.repeat(1, 3)
+    else:
+        # ========== 向后兼容：回退到旧方法 ==========
+        # 如果模型不支持完整形变，或者没有时间信息，就回退到：
+        # 1. 只变形位置（如果支持get_xyz_t）
+        # 2. 或者完全不变形（使用原始值）
+        # 这样保证旧代码不会出错
+        means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
+        rotations = pc.get_rotation
+        scales = pc.get_scaling
+        if scales.shape[-1] == 1:
+            scales = scales.repeat(1, 3)
+        opacity = pc.get_opacity
 
     screenspace_points = (
         torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
@@ -60,7 +102,6 @@ def render(
 
 
     means2D = screenspace_points
-    opacity = pc.get_opacity
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -87,18 +128,11 @@ def render(
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        # check if the covariance is isotropic
-        if pc.get_scaling.shape[-1] == 1:
-            scales = pc.get_scaling.repeat(1, 3)
-        else:
-            scales = pc.get_scaling
-        rotations = pc.get_rotation
+        # 如果使用形变后的属性，需要重新计算covariance
+        # 注意：这里使用形变后的scaling和rotation
+        cov3D_precomp = pc.covariance_activation(scales, scaling_modifier, rotations)
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -200,18 +234,13 @@ def render_with_custom_resolution(
     scale_x = target_width / viewpoint_camera.image_width
     scale_y = target_height / viewpoint_camera.image_height
     device = bg_color.device
-    #print("scale_x:",scale_x, "scale_y:",scale_y)
     
     # Adjust the camera intrinsic matrix
     fx_new = viewpoint_camera.fx * scale_x
     fy_new = viewpoint_camera.fy * scale_y
     cx_new = viewpoint_camera.cx * scale_x
     cy_new = viewpoint_camera.cy * scale_y
-    #print(f"fx_new: {fx_new}, fy_new: {fy_new}, cx_new: {cx_new}, cy_new: {cy_new}")
 
-    #print(f"Full projection transform before trans: {viewpoint_camera.full_proj_transform}")
-    #print(f"projection matrix before trans: {viewpoint_camera.projection_matrix}")
-    
     # Generate new projection matrix
     new_proj = getProjectionMatrix2(
         znear=0.01, zfar=100.0, fx=fx_new, fy=fy_new, cx=cx_new, cy=cy_new, W=target_width, H=target_height
@@ -241,7 +270,20 @@ def render_with_custom_resolution(
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
+    # 获取形变后的属性（如果支持完整形变）或仅位置形变
+    if hasattr(pc, "get_deformed_attributes_t") and t is not None:
+        means3D, rotations, scales, opacity = pc.get_deformed_attributes_t(t)
+        # 确保scales的形状正确
+        if scales.shape[-1] == 1:
+            scales = scales.repeat(1, 3)
+    else:
+        # 回退到仅位置形变或原始值
+        means3D = pc.get_xyz_t(t) if hasattr(pc, "get_xyz_t") else pc.get_xyz
+        rotations = pc.get_rotation
+        scales = pc.get_scaling
+        if scales.shape[-1] == 1:
+            scales = scales.repeat(1, 3)
+        opacity = pc.get_opacity
 
     screenspace_points = (
         torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
@@ -253,20 +295,11 @@ def render_with_custom_resolution(
         pass
 
     means2D = screenspace_points
-    opacity = pc.get_opacity
 
-
-    scales = None
-    rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        if pc.get_scaling.shape[-1] == 1:
-            scales = pc.get_scaling.repeat(1, 3)
-        else:
-            scales = pc.get_scaling
-        rotations = pc.get_rotation
+        # 如果使用形变后的属性，需要重新计算covariance
+        cov3D_precomp = pc.build_covariance_from_scaling_rotation(scales, scaling_modifier, rotations)
 
     shs = None
     colors_precomp = None

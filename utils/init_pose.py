@@ -141,17 +141,17 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     W1 = view1['img'].shape[3]
     scale_H = H1 / viewpoint.image_height
     scale_W = W1 / viewpoint.image_width
-    # #region agent log
-    import json
-    log_path = "/home/sjw/data0/lsx/S3PO_baseline/.cursor/debug.log"
-    try:
-        with open(log_path, 'a') as f:
-            json.dump({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"init_pose.py:145","message":"init_pose: before render_with_custom_resolution","data":{"has_time_attr":hasattr(viewpoint, "time"),"has_t_attr":hasattr(viewpoint, "t")},"timestamp":int(__import__('time').time()*1000)}, f)
-            f.write('\n')
-    except: pass
-    # #endregion
     render_pkg = render_with_custom_resolution(viewpoint, gaussians, pipeline_params, background, target_width=W1, target_height=H1)
-    render_depth = render_pkg["depth"]
+    # Check if rendering failed (e.g., no points initialized yet)
+    if render_pkg is None:
+        # Use MASt3R depth as fallback when no gaussians are available
+        mono_depth = get_depth(img2, img2, model, return_conf=False)
+        # Convert to tensor with same format as rendered depth: [1, H, W]
+        render_depth = torch.from_numpy(mono_depth).float().to(device)
+        if len(render_depth.shape) == 2:
+            render_depth = render_depth.unsqueeze(0)  # Add batch dimension if needed
+    else:
+        render_depth = render_pkg["depth"]
 
     # Adjust camera intrinsic matrix
     fx_new = viewpoint.fx * scale_W

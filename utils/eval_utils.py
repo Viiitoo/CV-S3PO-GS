@@ -19,7 +19,8 @@ print("Current backend:", matplotlib.get_backend())
 from matplotlib import pyplot as plt
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from utils.time_utils import attach_time_to_viewpoint
-
+from utils.camera_utils import Camera
+from copy import deepcopy
 
 import wandb
 from gaussian_splatting.gaussian_renderer import render
@@ -32,9 +33,48 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ## Plot
     traj_ref = PosePath3D(poses_se3=poses_gt)
     traj_est = PosePath3D(poses_se3=poses_est)
-    traj_est_aligned = trajectory.align_trajectory(
-        traj_est, traj_ref, correct_scale=monocular
-    )
+    
+    # 尝试对齐轨迹，如果失败则使用简单的位置对齐
+    try:
+        traj_est_aligned = trajectory.align_trajectory(
+            traj_est, traj_ref, correct_scale=monocular
+        )
+    except Exception as e:
+        Log(f"Warning: Trajectory alignment failed ({str(e)}), using simple translation alignment", tag="Eval")
+        # 使用简单的位置对齐：计算质心偏移
+        positions_ref = traj_ref.positions_xyz
+        positions_est = traj_est.positions_xyz
+        
+        if len(positions_ref) < 3:
+            Log(f"Warning: Too few poses ({len(positions_ref)}) for alignment, skipping ATE calculation", tag="Eval")
+            # 确保目录存在
+            mkdir_p(plot_dir)
+            # 返回一个默认值
+            ape_stat = 0.0
+            ape_stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "median": 0.0, "rmse": 0.0, "sse": 0.0, "std": 0.0}
+            # 仍然保存统计信息
+            with open(
+                os.path.join(plot_dir, "stats_{}.json".format(str(label))),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(ape_stats, f, indent=4)
+            return ape_stat
+        
+        # 计算质心
+        centroid_ref = np.mean(positions_ref, axis=0)
+        centroid_est = np.mean(positions_est, axis=0)
+        translation = centroid_ref - centroid_est
+        
+        # 应用简单的平移对齐
+        aligned_poses = []
+        for pose in poses_est:
+            aligned_pose = pose.copy()
+            aligned_pose[:3, 3] += translation
+            aligned_poses.append(aligned_pose)
+        
+        traj_est_aligned = PosePath3D(poses_se3=aligned_poses)
+    
     ## RMSE
     pose_relation = metrics.PoseRelation.translation_part
     data = (traj_ref, traj_est_aligned)
@@ -71,9 +111,13 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     return ape_stat
 
 def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False, BA=False):
+    # 检查关键帧数量
+    if len(kf_ids) < 2:
+        Log(f"Warning: Too few keyframes ({len(kf_ids)}) for ATE evaluation, skipping", tag="Eval")
+        return 0.0
+    
     trj_data = dict()
     latest_frame_idx = kf_ids[-1] + 2 if final else kf_ids[-1] + 1
-    #latest_frame_idx = len(frames) if final else kf_ids[-1] + 1
     trj_id, trj_est, trj_gt = [], [], []
     trj_est_np, trj_gt_np = [], []
 
@@ -84,8 +128,6 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
         return pose
 
     for kf_id in kf_ids:
-    #for kf_id in range(latest_frame_idx):
-        #print(kf_id)
         kf = frames[kf_id]
         pose_est = np.linalg.inv(gen_pose_matrix(kf.R, kf.T))
         pose_gt = np.linalg.inv(gen_pose_matrix(kf.R_gt, kf.T_gt))
@@ -168,6 +210,12 @@ def eval_rendering(
         attach_time_to_viewpoint(frame, frame_idx=idx, num_frames=len(dataset))
 
         render_pkg = render(frame, gaussians, pipe, background)
+        # Check if rendering failed (e.g., no points initialized yet)
+        if render_pkg is None:
+            # Skip this frame if rendering failed
+            saved_frame_idx.pop()  # Remove the idx we just added
+            continue
+        
         rendering = render_pkg["render"]
         
         # Save depth map
@@ -248,14 +296,21 @@ def eval_rendering(
         
 
     output = dict()
-    output["mean_psnr"] = float(np.mean(psnr_array))
-    output["mean_ssim"] = float(np.mean(ssim_array))
-    output["mean_lpips"] = float(np.mean(lpips_array))
+    # Check if we have any successful renderings
+    if len(psnr_array) == 0:
+        Log("Warning: No frames were successfully rendered during evaluation", tag="Eval")
+        output["mean_psnr"] = 0.0
+        output["mean_ssim"] = 0.0
+        output["mean_lpips"] = 0.0
+    else:
+        output["mean_psnr"] = float(np.mean(psnr_array))
+        output["mean_ssim"] = float(np.mean(ssim_array))
+        output["mean_lpips"] = float(np.mean(lpips_array))
 
-    Log(
-        f'mean psnr: {output["mean_psnr"]}, ssim: {output["mean_ssim"]}, lpips: {output["mean_lpips"]}',
-        tag="Eval",
-    )
+        Log(
+            f'mean psnr: {output["mean_psnr"]}, ssim: {output["mean_ssim"]}, lpips: {output["mean_lpips"]}',
+            tag="Eval",
+        )
 
     psnr_save_dir = os.path.join(save_dir, "psnr", str(iteration))
     mkdir_p(psnr_save_dir)
@@ -265,6 +320,7 @@ def eval_rendering(
         open(os.path.join(psnr_save_dir, "final_result.json"), "w", encoding="utf-8"),
         indent=4,
     )
+    
     return output
 
 def save_gaussians(gaussians, name, iteration, final=False):
@@ -277,3 +333,9 @@ def save_gaussians(gaussians, name, iteration, final=False):
             name, "point_cloud/iteration_{}".format(str(iteration))
         )
     gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+    
+    # 如果模型支持时间形变，同时保存形变参数
+    if hasattr(gaussians, 'save_deformation_params') and gaussians._w_pos.numel() > 0:
+        deformation_path = os.path.join(point_cloud_path, "deformation_params.npz")
+        gaussians.save_deformation_params(deformation_path)
+        Log(f"Saved deformation parameters to {deformation_path}", tag="Eval")

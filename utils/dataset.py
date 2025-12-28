@@ -156,8 +156,16 @@ class ReplicaParser:
 
 
 class TUMParser:
-    def __init__(self, input_folder):   
+    def __init__(self, input_folder, config=None):   
         self.input_folder = input_folder
+        self.config = config
+        # 获取 begin 和 end 参数，如果不存在则使用默认值
+        if config is not None and "Dataset" in config:
+            self.begin = config["Dataset"].get("begin", 0)
+            self.end = config["Dataset"].get("end", None)
+        else:
+            self.begin = 0
+            self.end = None
         self.load_poses(self.input_folder, frame_rate=32)
         self.n_img = len(self.color_paths)
 
@@ -204,7 +212,6 @@ class TUMParser:
         tstamp_depth = depth_data[:, 0].astype(np.float64)
         tstamp_pose = pose_data[:, 0].astype(np.float64)
         associations = self.associate_frames(tstamp_image, tstamp_depth, tstamp_pose)
-        # print("标号:", tstamp_image[471])
 
         indicies = [0]
         for i in range(1, len(associations)):
@@ -212,6 +219,12 @@ class TUMParser:
             t1 = tstamp_image[associations[i][0]]
             if t1 - t0 > 1.0 / frame_rate:
                 indicies += [i]
+
+        # 应用 begin 和 end 限制
+        if self.end is not None:
+            indicies = indicies[self.begin:self.end]
+        else:
+            indicies = indicies[self.begin:]
 
         self.color_paths, self.poses, self.depth_paths, self.frames, self.mono_depth_paths = [], [], [], [], []
 
@@ -456,7 +469,7 @@ class TUMDataset(MonocularDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         dataset_path = config["Dataset"]["dataset_path"]
-        parser = TUMParser(dataset_path)
+        parser = TUMParser(dataset_path, config)
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.depth_paths = parser.depth_paths

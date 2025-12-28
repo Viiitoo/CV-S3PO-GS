@@ -160,7 +160,6 @@ class SLAM:
                 FPS,
             )
             
-            
             if self.color_refinement:
                 # re-used the frontend queue to retrive the gaussians from the backend.
                 while not frontend_queue.empty():       
@@ -240,6 +239,7 @@ if __name__ == "__main__":
         config = yaml.safe_load(yml)
 
     config = load_config(args.config)
+    config["config_file_path"] = args.config  # 保存配置文件路径
     save_dir = None
 
     if args.alpha is not None:

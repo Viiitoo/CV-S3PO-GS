@@ -15,7 +15,7 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
-from utils.init_pose import get_pose, get_depth, save_confidence_map
+from utils.init_pose import get_pose, get_depth
 from utils.depth_utils import process_depth
 
 class FrontEnd(mp.Process):
@@ -67,11 +67,9 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]
-        self.confidence_dir = os.path.join(self.save_dir, "confidence")
         self.plot_dir = os.path.join(self.save_dir, "plot")
         
         if self.save_results:
-            os.makedirs(self.confidence_dir, exist_ok=True)
             os.makedirs(self.plot_dir, exist_ok=True)       
     
     # Add a new keyframe. Create valid pixel mask using RGB boundary threshold from config, then generate initial depth map
@@ -93,18 +91,11 @@ class FrontEnd(mp.Process):
             theta_rad = torch.acos((trace_R_diff - 1) / 2)
             theta_deg = torch.rad2deg(theta_rad)
             self.theta = theta_deg
-        #print("angular difference is:",self.theta)
         gt_img = viewpoint.original_image.cuda()
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]      # Check if sum of RGB channels exceeds threshold; add a new dimension to match expected shape
         if self.monocular:
             if depth is None:
                 initial_depth = torch.from_numpy(viewpoint.mono_depth).unsqueeze(0)     # For the first frame, use MASt3R to estimate depth during map initialization
-                print("Initial depth map stats for frame", cur_frame_idx, ":",
-                    f"Max: {torch.max(initial_depth).item()}",
-                    f"Min: {torch.min(initial_depth).item()}",
-                    f"Mean: {torch.mean(initial_depth).item()}",
-                    f"Median: {torch.median(initial_depth).item()}",
-                    f"Std: {torch.std(initial_depth).item()}")
                 initial_depth[~valid_rgb.cpu()] = 0
                 return initial_depth[0].numpy()
             else:                                               # For non-initial keyframes, use rendered depth
@@ -126,11 +117,6 @@ class FrontEnd(mp.Process):
                 viewpoint.mono_depth = viewpoint.mono_depth * scale_factor
 
                 pixel_num = viewpoint.image_height * viewpoint.image_width
-                #print("Initialization info for frame", cur_frame_idx, ":", 
-                #    f"Max: {np.max(initial_depth)}", f"Min: {np.min(initial_depth)}", f"Mean: {np.mean(initial_depth)}",
-                #    f"Median: {np.median(initial_depth)}", f"Std: {np.std(initial_depth)}", f"Scale Factor: {scale_factor}", 
-                #    f"Accurate Pixel Ratio: {num_accurate_pixels / pixel_num}", f"Accurate Pixel Ratio: {np.sum(error_mask) / pixel_num}")
-                
                 valid_rgb_np = valid_rgb.cpu().numpy() if isinstance(valid_rgb, torch.Tensor) else valid_rgb
                 if initial_depth.shape == valid_rgb_np.shape[1:]:
                     initial_depth[~valid_rgb_np[0]] = 0 
@@ -157,14 +143,8 @@ class FrontEnd(mp.Process):
 
         # get mono_depth from MASt3R
         img = viewpoint.original_image
-        
-        # 1. 调用函数，要求返回置信度
-        depth, conf = get_depth(img, img, self.model, return_conf=True)
+        depth = get_depth(img, img, self.model, return_conf=False)
         viewpoint.mono_depth = depth
-        
-        # 2. 保存置信度图到 save_dir
-        print(f"debug: saving confidence map for frame {cur_frame_idx}...")
-        save_confidence_map(conf, cur_frame_idx, self.confidence_dir)
         
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
@@ -188,14 +168,9 @@ class FrontEnd(mp.Process):
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
                             viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background)
         
-        # get mono_depth from MASt3R (Modified with confidence return)
-        depth, conf = get_depth(img2, img2, self.model, return_conf=True)
+        # get mono_depth from MASt3R
+        depth = get_depth(img2, img2, self.model, return_conf=False)
         viewpoint.mono_depth = depth
-        
-        # 保存置信度图
-        if cur_frame_idx % 10 == 0: 
-            print(f"Saving confidence map for frame {cur_frame_idx}")
-            save_confidence_map(conf, cur_frame_idx, self.confidence_dir)
         
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)
@@ -248,6 +223,10 @@ class FrontEnd(mp.Process):
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )
+            # Check if rendering failed (e.g., no points initialized yet)
+            if render_pkg is None:
+                # Return None to indicate tracking failed
+                return None
             image, depth, opacity = (
                 render_pkg["render"],
                 render_pkg["depth"],
@@ -464,7 +443,7 @@ class FrontEnd(mp.Process):
                         
                         # 2. 保存所有帧的轨迹到 full_trajectory.json
                         full_trj_path = os.path.join(self.plot_dir, "full_trajectory.json")
-                        print(f"Saving FULL trajectory ({len(self.full_trajectory_data['trj_id'])} frames) to {full_trj_path}...")
+                        # Log(f"[Traj] Saving full trajectory ({len(self.full_trajectory_data['trj_id'])} frames)")  # 减少冗余输出
                         with open(full_trj_path, "w") as f:
                             json.dump(self.full_trajectory_data, f, indent=4)
                             
@@ -497,6 +476,12 @@ class FrontEnd(mp.Process):
 
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
+                
+                # Check if tracking failed (e.g., no points initialized yet)
+                if render_pkg is None:
+                    # Skip this frame if tracking failed
+                    cur_frame_idx += 1
+                    continue
                 
                 # =========================================================
                 # [Modified] 3. 强制记录每一帧的位姿 (在 Tracking 之后)
@@ -555,7 +540,6 @@ class FrontEnd(mp.Process):
                 
                 cur_frame_idx += 1          
 
-                # 这里原有的 eval_ate 不用动，它只负责中间的 Debug
                 if (self.save_results and self.save_trj and create_kf and len(self.kf_indices) % self.save_trj_kf_intv == 0):
                     Log("Evaluating ATE at frame: ", cur_frame_idx)
                     eval_ate(self.cameras, self.kf_indices, self.save_dir, cur_frame_idx, monocular=self.monocular)
