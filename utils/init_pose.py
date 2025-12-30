@@ -141,7 +141,31 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     W1 = view1['img'].shape[3]
     scale_H = H1 / viewpoint.image_height
     scale_W = W1 / viewpoint.image_width
-    render_pkg = render_with_custom_resolution(viewpoint, gaussians, pipeline_params, background, target_width=W1, target_height=H1)
+    
+    # ========== 静态掩码过滤：只渲染静态高斯点 ==========
+    # 获取静态掩码：_deformation_table 中 True 表示动态点，取反得到静态点
+    static_mask = None
+    use_static_filter = False
+    if hasattr(gaussians, '_deformation_table') and gaussians._deformation_table.numel() > 0:
+        if gaussians._deformation_table.shape[0] == gaussians._xyz.shape[0]:
+            static_mask = ~gaussians._deformation_table  # 静态点为 True
+            num_static = static_mask.sum().item()
+            num_total = static_mask.shape[0]
+            # 只有当静态点足够多时才使用过滤
+            if num_static >= 100:  # 至少需要100个静态点
+                use_static_filter = True
+                print(f"[PnP] 使用静态掩码渲染: {num_static}/{num_total} 静态点 ({num_static/num_total*100:.1f}%)")
+            else:
+                static_mask = None
+                print(f"[PnP] 静态点太少({num_static})，使用全部点渲染")
+    
+    # 渲染深度图（如果有静态掩码，只渲染静态点）
+    render_pkg = render_with_custom_resolution(
+        viewpoint, gaussians, pipeline_params, background, 
+        target_width=W1, target_height=H1,
+        mask=static_mask  # 传入静态掩码
+    )
+    
     # Check if rendering failed (e.g., no points initialized yet)
     if render_pkg is None:
         # Use MASt3R depth as fallback when no gaussians are available
@@ -150,6 +174,7 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
         render_depth = torch.from_numpy(mono_depth).float().to(device)
         if len(render_depth.shape) == 2:
             render_depth = render_depth.unsqueeze(0)  # Add batch dimension if needed
+        use_static_filter = False  # 使用 MASt3R 深度时不做过滤
     else:
         render_depth = render_pkg["depth"]
 
@@ -171,6 +196,34 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     objectPoints = pts3d[matches_im1[:, 1].astype(int), matches_im1[:, 0].astype(int), :]
     objectPoints = objectPoints.astype(np.float32)
     imagePoints = matches_im2.astype(np.float32)
+    
+    # ========== 过滤深度无效的匹配点（动态区域深度 ≈ 0）==========
+    if use_static_filter:
+        # 深度有效的点：Z > 0.01m（1cm）
+        valid_depth_mask = objectPoints[:, 2] > 0.01
+        num_valid = valid_depth_mask.sum()
+        num_matches = len(objectPoints)
+        
+        MIN_POINTS_FOR_PNP = 10  # PnP 至少需要的点数
+        
+        if num_valid >= MIN_POINTS_FOR_PNP:
+            objectPoints = objectPoints[valid_depth_mask]
+            imagePoints = imagePoints[valid_depth_mask]
+            print(f"[PnP] 过滤后有效匹配点: {num_valid}/{num_matches} ({num_valid/num_matches*100:.1f}%)")
+        else:
+            # 回退：静态点太少，重新渲染全部点的深度图
+            print(f"[PnP] 静态区域有效匹配点太少({num_valid})，回退使用全部点")
+            render_pkg_full = render_with_custom_resolution(
+                viewpoint, gaussians, pipeline_params, background, 
+                target_width=W1, target_height=H1,
+                mask=None  # 不使用掩码
+            )
+            if render_pkg_full is not None:
+                render_depth = render_pkg_full["depth"]
+                pts3d = depth_to_3d(render_depth.detach().cpu().numpy(), K_new, dist_coeffs=dist_coeffs)
+                objectPoints = pts3d[matches_im1[:, 1].astype(int), matches_im1[:, 0].astype(int), :]
+                objectPoints = objectPoints.astype(np.float32)
+                imagePoints = matches_im2.astype(np.float32)
 
     # Skip PnP if there are not enough points
     if len(objectPoints) < 6 or len(imagePoints) < 6:

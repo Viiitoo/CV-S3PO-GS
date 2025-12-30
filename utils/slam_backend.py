@@ -375,30 +375,16 @@ class BackEnd(mp.Process):
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
                 
                 # 监控时间变形状态（每200次迭代输出一次）
-                if self.iteration_count % 200 == 0 and hasattr(self.gaussians, '_w_pos'):
-                    if self.gaussians._w_pos.numel() > 0:
-                        w_pos = self.gaussians._w_pos
-                        w_rot = self.gaussians._w_rot if self.gaussians._w_rot.numel() > 0 else None
-                        w_scale = self.gaussians._w_scale if self.gaussians._w_scale.numel() > 0 else None
-                        
-                        # 位置形变统计
-                        w_pos_norm = w_pos.norm().item()
-                        w_pos_max = w_pos.abs().max().item()
-                        w_pos_mean = w_pos.abs().mean().item()
-                        
-                        # 旋转形变统计
-                        w_rot_info = ""
-                        if w_rot is not None:
-                            w_rot_norm = w_rot.norm().item()
-                            w_rot_max = w_rot.abs().max().item()
-                            w_rot_info = f", rot_norm={w_rot_norm:.6f}, rot_max={w_rot_max:.6f}"
-                        
-                        # 放缩形变统计
-                        w_scale_info = ""
-                        if w_scale is not None:
-                            w_scale_norm = w_scale.norm().item()
-                            w_scale_max = w_scale.abs().max().item()
-                            w_scale_info = f", scale_norm={w_scale_norm:.6f}, scale_max={w_scale_max:.6f}"
+                # 注意：当前版本使用 _coefs 存储形变系数，而不是 _w_pos
+                if self.iteration_count % 200 == 0:
+                    has_coefs = hasattr(self.gaussians, '_coefs') and self.gaussians._coefs.numel() > 0
+                    has_t_mu = hasattr(self.gaussians, 't_mu') and self.gaussians.t_mu is not None
+                    
+                    if has_coefs and has_t_mu:
+                        coefs = self.gaussians._coefs
+                        coefs_norm = coefs.norm().item()
+                        coefs_max = coefs.abs().max().item()
+                        coefs_mean = coefs.abs().mean().item()
                         
                         # 时间基函数信息
                         t_mu = self.gaussians.t_mu.detach().cpu().numpy()
@@ -406,14 +392,20 @@ class BackEnd(mp.Process):
                         t_mu_range = f"[{t_mu.min():.3f}, {t_mu.max():.3f}]"
                         t_sigma_mean = t_sigma.mean()
                         
-                        Log(f"[Deform] iter={self.iteration_count}, points={w_pos.shape[0]}, "
-                            f"pos_norm={w_pos_norm:.6f}, pos_max={w_pos_max:.6f}, pos_mean={w_pos_mean:.6f}"
-                            f"{w_rot_info}{w_scale_info}, "
+                        Log(f"[Deform] iter={self.iteration_count}, points={self.gaussians._xyz.shape[0]}, "
+                            f"coefs_norm={coefs_norm:.6f}, coefs_max={coefs_max:.6f}, coefs_mean={coefs_mean:.6f}, "
                             f"t_mu={t_mu_range}, t_sigma_mean={t_sigma_mean:.4f}")
-                        
-                        # 更新形变点选择表（每200次迭代更新一次）
-                        if hasattr(self.gaussians, 'update_deformation_table'):
-                            self.gaussians.update_deformation_table(threshold=0.01)
+                    
+                    # 更新形变点选择表（每200次迭代更新一次）
+                    # 无论是否有 _coefs，都尝试更新 deformation_table
+                    if hasattr(self.gaussians, 'update_deformation_table'):
+                        self.gaussians.update_deformation_table(threshold=0.01)
+                        # 输出 deformation_table 统计信息
+                        if hasattr(self.gaussians, '_deformation_table') and self.gaussians._deformation_table.numel() > 0:
+                            num_dynamic = self.gaussians._deformation_table.sum().item()
+                            num_total = self.gaussians._deformation_table.shape[0]
+                            num_static = num_total - num_dynamic
+                            Log(f"[DeformTable] Static: {num_static}/{num_total} ({num_static/num_total*100:.1f}%), Dynamic: {num_dynamic}/{num_total} ({num_dynamic/num_total*100:.1f}%)")
                 
                 # 保存checkpoint（参考EH-SurGS的方式）
                 if self.save_dir and len(self.checkpoint_iterations) > 0:

@@ -158,7 +158,7 @@ def render(
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     if mask is not None:
-        rendered_image, radii, depth, opacity = rasterizer(
+        rendered_image, radii, depth, opacity, n_touched = rasterizer(
             means3D=means3D[mask],
             means2D=means2D[mask],
             shs=shs[mask],
@@ -170,7 +170,6 @@ def render(
             theta=viewpoint_camera.cam_rot_delta,
             rho=viewpoint_camera.cam_trans_delta,
         )
-        n_touched = None
     else:
         rendered_image, radii, depth, opacity, n_touched = rasterizer(
             means3D=means3D,
@@ -321,7 +320,7 @@ def render_with_custom_resolution(
         colors_precomp = override_color
 
     if mask is not None:
-        rendered_image, radii, depth, opacity = rasterizer(
+        rendered_image, radii, depth, opacity, n_touched = rasterizer(
             means3D=means3D[mask],
             means2D=means2D[mask],
             shs=shs[mask],
@@ -333,7 +332,6 @@ def render_with_custom_resolution(
             theta=viewpoint_camera.cam_rot_delta,
             rho=viewpoint_camera.cam_trans_delta,
         )
-        n_touched = None
     else:
         rendered_image, radii, depth, opacity, n_touched = rasterizer(
             means3D=means3D,
