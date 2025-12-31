@@ -257,13 +257,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--viz_dir",
         type=str,
-        default="results/stereo_seq_easy_stereo_seq_easy/2025-12-28-22-41-58/viz",
+        default="results/stereo_seq_easy_stereo_seq_easy/2025-12-31-14-01-36/viz",
         help="viz文件夹路径"
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="gt_and_rendered_rgb_video.mp4",
+        default="dynamic.mp4",
         help="输出视频文件路径"
     )
     parser.add_argument(
