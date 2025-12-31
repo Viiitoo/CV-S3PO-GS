@@ -27,6 +27,12 @@ Training:
   init_gaussian_extent: 30
   tracking_itr_num: 100
   mapping_itr_num: 150
+  
+  # ========== 动态点过滤开关 ==========
+  # use_static_filter_pnp: 是否在 PnP 位姿估计时过滤动态点
+  #   True: 只使用静态高斯点渲染深度图，提高动态场景下的位姿估计鲁棒性
+  #   False: 使用全部高斯点（传统方式）
+  use_static_filter_pnp: True
   global_BA_itr_num: 500
   gaussian_update_every: 150
   gaussian_update_offset: 50

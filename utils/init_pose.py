@@ -120,7 +120,26 @@ def depth_to_3d1(depth_map, K):
     return points_3d
 
 # Estimate relative pose and return rendered depth
-def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_params, background):
+def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_params, background, use_static_filter_pnp=True):
+    """
+    使用 PnP 算法估计相机位姿
+    
+    Args:
+        img1, img2: 输入图像对
+        model: MASt3R 模型
+        dist_coeffs: 畸变系数
+        viewpoint: 相机视点
+        gaussians: 高斯模型
+        pipeline_params: 渲染管线参数
+        background: 背景颜色
+        use_static_filter_pnp: 是否使用静态点过滤（过滤动态高斯点）
+            - True: 只使用静态点渲染深度图，提高动态场景鲁棒性
+            - False: 使用全部点（传统方式）
+    
+    Returns:
+        pose_w2c: 4x4 位姿矩阵
+        render_depth: 渲染的深度图
+    """
     device = 'cuda'
     schedule = 'cosine'
     lr = 0.01
@@ -146,18 +165,23 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     # 获取静态掩码：_deformation_table 中 True 表示动态点，取反得到静态点
     static_mask = None
     use_static_filter = False
-    if hasattr(gaussians, '_deformation_table') and gaussians._deformation_table.numel() > 0:
-        if gaussians._deformation_table.shape[0] == gaussians._xyz.shape[0]:
-            static_mask = ~gaussians._deformation_table  # 静态点为 True
-            num_static = static_mask.sum().item()
-            num_total = static_mask.shape[0]
-            # 只有当静态点足够多时才使用过滤
-            if num_static >= 100:  # 至少需要100个静态点
-                use_static_filter = True
-                print(f"[PnP] 使用静态掩码渲染: {num_static}/{num_total} 静态点 ({num_static/num_total*100:.1f}%)")
-            else:
-                static_mask = None
-                print(f"[PnP] 静态点太少({num_static})，使用全部点渲染")
+    
+    # 只有开启了静态过滤开关才尝试过滤
+    if use_static_filter_pnp:
+        if hasattr(gaussians, '_deformation_table') and gaussians._deformation_table.numel() > 0:
+            if gaussians._deformation_table.shape[0] == gaussians._xyz.shape[0]:
+                static_mask = ~gaussians._deformation_table  # 静态点为 True
+                num_static = static_mask.sum().item()
+                num_total = static_mask.shape[0]
+                # 只有当静态点足够多时才使用过滤
+                if num_static >= 100:  # 至少需要100个静态点
+                    use_static_filter = True
+                    print(f"[PnP] 使用静态掩码渲染: {num_static}/{num_total} 静态点 ({num_static/num_total*100:.1f}%)")
+                else:
+                    static_mask = None
+                    print(f"[PnP] 静态点太少({num_static})，使用全部点渲染")
+    else:
+        print(f"[PnP] 静态过滤已关闭，使用全部点渲染")
     
     # 渲染深度图（如果有静态掩码，只渲染静态点）
     render_pkg = render_with_custom_resolution(

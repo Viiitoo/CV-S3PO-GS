@@ -69,6 +69,9 @@ class FrontEnd(mp.Process):
         self.single_thread = self.config["Training"]["single_thread"]
         self.plot_dir = os.path.join(self.save_dir, "plot")
         
+        # 动态点过滤开关（默认开启）
+        self.use_static_filter_pnp = self.config["Training"].get("use_static_filter_pnp", True)
+        
         if self.save_results:
             os.makedirs(self.plot_dir, exist_ok=True)       
     
@@ -166,7 +169,8 @@ class FrontEnd(mp.Process):
         # Estimate the relative pose between the current frame and its adjacent keyframe
         img2 = viewpoint.original_image
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
-                            viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background)
+                            viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background,
+                            use_static_filter_pnp=self.use_static_filter_pnp)
         
         # get mono_depth from MASt3R
         depth = get_depth(img2, img2, self.model, return_conf=False)
