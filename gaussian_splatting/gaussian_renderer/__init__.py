@@ -53,6 +53,9 @@ def render(
     # 这是关键步骤：根据时间t计算所有高斯点的形变属性
     # 如果支持完整形变（位置+旋转+放缩+不透明度），就用新方法
     if hasattr(pc, "get_deformed_attributes_t") and t is not None:
+        # 调试：检查时间值
+        print(f"[DEBUG] Render time t={t}")
+
         # 调用新实现的形变函数，一次性获取所有形变后的属性
         # 这比只变形位置更强大，可以处理旋转、缩放、透明度变化
         means3D, rotations, scales, opacity = pc.get_deformed_attributes_t(t)

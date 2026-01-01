@@ -382,19 +382,22 @@ class GaussianModel:
         if use_deformation_table:
             # 只对标记的点计算形变（EH-SurGS策略）
             deformation_mask = self._deformation_table
-            
+
+            print(f"[DEBUG] get_deformed_attributes_t: deformation_mask.any()={deformation_mask.any()}, sum={deformation_mask.sum().item()}")
+
             # 初始化结果（所有点保持原值）
             xyz_deformed = self._xyz.clone()
             rotation_deformed = self.rotation_activation(self._rotation).clone()
             scaling_deformed = self.scaling_activation(self._scaling).clone()
             opacity_deformed = self.opacity_activation(self._opacity).clone()
-            
+
             # 只对标记的点计算形变
             if deformation_mask.any():
                 # 使用生命周期机制计算形变
-                deform = self.gaussian_deformation(t, deformation_mask, deformation_mask.sum().item(), 
+                deform = self.gaussian_deformation(t, deformation_mask, deformation_mask.sum().item(),
                                                    ch_num=self.ch_num, basis_num=self.K_time)
                 # deform: [num_deform, ch_num]
+                print(f"[DEBUG] gaussian_deformation result: shape={deform.shape}, max={deform.abs().max().item():.6f}")
                 
                 # 应用形变（参考EH-SurGS的apply_deformations）
                 deformation_config = {
@@ -1509,10 +1512,17 @@ class GaussianModel:
 
         # 只有形变量超过阈值的点才需要形变
         self._deformation_table = max_deform > threshold
-        
-        # 可选：输出统计信息
+
+        # 确保至少有一些点是动态的（避免死循环）
         num_deform_points = self._deformation_table.sum().item()
         total_points = self._deformation_table.shape[0]
+
+        if num_deform_points == 0 and total_points > 0:
+            # 如果没有点超过阈值，选择形变量最大的点
+            _, top_indices = torch.topk(max_deform, min(10, total_points), largest=True)
+            self._deformation_table[top_indices] = True
+            num_deform_points = self._deformation_table.sum().item()
+            print(f"[DEBUG] Force selected {num_deform_points} points as dynamic (no points exceeded threshold)")
 
         # 调试：输出累积量统计
         accum_max = self._deformation_accum.max().item() if self._deformation_accum.numel() > 0 else 0
