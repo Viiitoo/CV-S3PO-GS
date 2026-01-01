@@ -260,9 +260,14 @@ class GaussianModel:
         # gaussians值域：[0, 1]，表示每个基函数在当前时间的激活程度
 
         # 调试：检查coefs的实际值
-        print(f"[DEBUG] gaussian_deformation: coefs_shape={self._coefs.shape}, coefs_max={self._coefs.max().item():.6f}")
+        print(f"[DEBUG] gaussian_deformation: coefs_shape={self._coefs.shape}, coefs_max={self._coefs.max().item():.6f}, coefs_min={self._coefs.min().item():.6f}")
         print(f"[DEBUG] gaussian_deformation: time={time:.6f}, gaussians_max={gaussians.max().item():.6f}, weights_max={weights.max().item():.6f}")
         print(f"[DEBUG] means_range=[{means.min().item():.6f}, {means.max().item():.6f}], std_devs_range=[{std_devs.min().item():.6f}, {std_devs.max().item():.6f}]")
+
+        # 检查是否有有效的权重
+        if weights.max().item() < 0.001:
+            print(f"[DEBUG] WARNING: All weights are very small! Max weight: {weights.max().item():.10f}")
+            print(f"[DEBUG] WARNING: Coefs may not be properly initialized or trained!")
         
         # ========== 加权求和得到最终形变 ==========
         # 将每个基函数的高斯值与其权重相乘，然后对所有基函数求和
