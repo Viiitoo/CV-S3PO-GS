@@ -268,6 +268,10 @@ class GaussianModel:
         if weights.max().item() < 0.001:
             print(f"[DEBUG] WARNING: All weights are very small! Max weight: {weights.max().item():.10f}")
             print(f"[DEBUG] WARNING: Coefs may not be properly initialized or trained!")
+            # 打印前几个点的weights
+            print(f"[DEBUG] First few weights: {weights[0, 0, :5].flatten()}")
+            print(f"[DEBUG] First few means: {means[0, 0, :5].flatten()}")
+            print(f"[DEBUG] First few std_devs: {std_devs[0, 0, :5].flatten()}")
         
         # ========== 加权求和得到最终形变 ==========
         # 将每个基函数的高斯值与其权重相乘，然后对所有基函数求和
