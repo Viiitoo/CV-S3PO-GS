@@ -259,7 +259,8 @@ class GaussianModel:
         gaussians = torch.exp(-exponent ** 2)  # [num_deform, ch_num, 1, basis_num]
         # gaussians值域：[0, 1]，表示每个基函数在当前时间的激活程度
 
-        # 调试：检查高斯函数值
+        # 调试：检查coefs的实际值
+        print(f"[DEBUG] gaussian_deformation: coefs_shape={self._coefs.shape}, coefs_max={self._coefs.max().item():.6f}")
         print(f"[DEBUG] gaussian_deformation: time={time:.6f}, gaussians_max={gaussians.max().item():.6f}, weights_max={weights.max().item():.6f}")
         print(f"[DEBUG] means_range=[{means.min().item():.6f}, {means.max().item():.6f}], std_devs_range=[{std_devs.min().item():.6f}, {std_devs.max().item():.6f}]")
         
@@ -1316,6 +1317,7 @@ class GaussianModel:
         shape_coefs = torch.full((M, self.ch_num, self.K_time), 0.01, device="cuda", dtype=new_xyz.dtype)
         # 堆叠为 [M, ch_num, 3, K_time] 然后reshape为 [M, ch_num * 3 * K_time]
         new_coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(M, -1)
+        print(f"[DEBUG] densification_postfix: new_coefs_shape={new_coefs.shape}, max={new_coefs.max().item():.6f}")
         
         # ========== 初始化新点的形变点选择参数 ==========
         # 新点默认都标记为需要形变（True），这样它们可以学习形变
