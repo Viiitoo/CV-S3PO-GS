@@ -62,18 +62,30 @@ def render(
         if hasattr(pc, '_deformation_table') and pc._deformation_table.numel() > 0:
             if hasattr(pc, '_deformation_accum'):
                 # 计算形变量（形变后的位置 - 原始位置）
-                # 只有实际进行了形变的点才有意义累积
                 position_diff = torch.abs(means3D - pc._xyz)  # [N, 3]
-                # 累积形变量（使用torch.no_grad避免影响梯度）
+
+                # 调试：检查累积条件
+                has_table = hasattr(pc, '_deformation_table')
+                table_size = pc._deformation_table.numel() if has_table else 0
+                diff_max = position_diff.max().item()
+                print(f"[DEBUG] Accum check: has_table={has_table}, table_size={table_size}, diff_max={diff_max:.6f}")
+
+                # 累积形变量：记录每个点的最大形变幅度
                 with torch.no_grad():
                     if pc._deformation_accum.numel() == 0 or pc._deformation_accum.shape != position_diff.shape:
                         # 如果accum未初始化或尺寸不匹配，重新初始化为[N, 3]
                         pc._deformation_accum = torch.zeros_like(position_diff)
+                        print(f"[DEBUG] Initialized deformation_accum with shape {pc._deformation_accum.shape}")
+
                     # 累积每个方向的形变量（取最大值）
+                    old_max = pc._deformation_accum.max().item()
                     pc._deformation_accum = torch.maximum(
                         pc._deformation_accum,
                         position_diff.detach()
                     )
+                    new_max = pc._deformation_accum.max().item()
+                    if new_max > old_max:
+                        print(f"[DEBUG] Accum updated: {old_max:.6f} -> {new_max:.6f}")
         
         # 处理各向同性放缩的情况（如果scaling只有1维，复制成3维）
         # 各向同性：x、y、z三个方向的放缩相同

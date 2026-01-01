@@ -259,7 +259,7 @@ class GaussianModel:
         # ========== 加权求和得到最终形变 ==========
         # 将每个基函数的高斯值与其权重相乘，然后对所有基函数求和
         # deformations = sum_k (gaussians[k] * weights[k])，k从0到basis_num-1
-        deformations = (gaussians * weights).sum(-1).squeeze(-2)  # [num_deform, ch_num]
+        deformations = (gaussians * weights).sum(-1).squeeze(-1)  # [num_deform, ch_num]
         
         # 结果解释：
         # - deformations[i, 0:3]: 第i个点的位置形变（平移）[dx, dy, dz]
@@ -332,7 +332,13 @@ class GaussianModel:
         # deform[:, 0:3] 是位置形变，表示每个点在x、y、z方向上的偏移量
         # delta形状: [N, 3]，表示位置偏移 [dx, dy, dz]
         if deform.shape[1] >= 3:
-            delta = deform[:, :3]  # [N, 3] - 位置形变（平移）
+            # 与get_deformed_attributes_t保持一致的缩放
+            deformation_config = {
+                "xyz_scale": 4.0,
+                "rotation_scale": 6.0,
+                "opacity_scale": 20.0
+            }
+            delta = deform[:, :3] * deformation_config["xyz_scale"]  # [N, 3] - 位置形变（平移）
         else:
             # 如果形变通道数不足3，说明位置形变未启用，返回零偏移
             delta = torch.zeros_like(self._xyz)
@@ -647,7 +653,7 @@ class GaussianModel:
         N = new_xyz.shape[0]
         if self._deformation_table.numel() == 0:
             self._deformation_table = torch.ones(N, dtype=torch.bool, device="cuda")
-            self._deformation_accum = torch.zeros(N, device="cuda")
+            self._deformation_accum = torch.zeros((N, 3), device="cuda")
         
         self.densification_postfix(
             new_xyz,
@@ -1021,7 +1027,7 @@ class GaussianModel:
             # 初始化新的形变系数
             N = self._xyz.shape[0]
             # 随机初始化权重，避免死循环（而不是初始化为0）
-            weight_coefs = torch.randn((N, self.ch_num, self.K_time), device="cuda") * 0.01
+            weight_coefs = torch.randn((N, self.ch_num, self.K_time), device="cuda") * 0.1
             position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(N, self.ch_num, 1)
             shape_coefs = torch.full((N, self.ch_num, self.K_time), 0.01, device="cuda")
             _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
@@ -1200,10 +1206,10 @@ class GaussianModel:
                 self._deformation_accum = self._deformation_accum[valid_points_mask]
             else:
                 # 尺寸不匹配，重新初始化
-                self._deformation_accum = torch.zeros(expected_num_points_after_prune, device="cuda")
+                self._deformation_accum = torch.zeros((expected_num_points_after_prune, 3), device="cuda")
         else:
             # 如果未初始化，初始化
-            self._deformation_accum = torch.zeros(expected_num_points_after_prune, device="cuda")
+            self._deformation_accum = torch.zeros((expected_num_points_after_prune, 3), device="cuda")
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -1295,7 +1301,7 @@ class GaussianModel:
         # - weights: 随机初始化，避免死循环
         # - means: 均匀分布在[0,1]（时间中心位置）
         # - std_devs: 初始化为0.01（时间影响范围）
-        weight_coefs = torch.randn((M, self.ch_num, self.K_time), device="cuda", dtype=new_xyz.dtype) * 0.01
+        weight_coefs = torch.randn((M, self.ch_num, self.K_time), device="cuda", dtype=new_xyz.dtype) * 0.1
         position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(M, self.ch_num, 1)
         shape_coefs = torch.full((M, self.ch_num, self.K_time), 0.01, device="cuda", dtype=new_xyz.dtype)
         # 堆叠为 [M, ch_num, 3, K_time] 然后reshape为 [M, ch_num * 3 * K_time]
@@ -1305,16 +1311,17 @@ class GaussianModel:
         # 新点默认都标记为需要形变（True），这样它们可以学习形变
         # 如果后续发现它们是静态的，update_deformation_table会更新标记
         new_deformation_table = torch.ones(M, dtype=torch.bool, device="cuda")
-        new_deformation_accum = torch.zeros(M, device="cuda", dtype=new_xyz.dtype)
+        # 累积量现在是[N, 3]格式，存储每个点的x,y,z方向的累积形变
+        new_deformation_accum = torch.zeros((M, 3), device="cuda", dtype=new_xyz.dtype)
         
         # 将新点的形变点选择参数添加到现有参数中
         if self._deformation_table.numel() > 0:
             self._deformation_table = torch.cat([self._deformation_table, new_deformation_table])
         else:
             self._deformation_table = new_deformation_table
-            
+
         if self._deformation_accum.numel() > 0:
-            self._deformation_accum = torch.cat([self._deformation_accum, new_deformation_accum])
+            self._deformation_accum = torch.cat([self._deformation_accum, new_deformation_accum], dim=0)
         else:
             self._deformation_accum = new_deformation_accum
 
@@ -1488,7 +1495,7 @@ class GaussianModel:
         
         if self._deformation_accum.shape[0] != self._xyz.shape[0]:
             # 如果尺寸不匹配，重新初始化
-            self._deformation_accum = torch.zeros(self._xyz.shape[0], device=self._xyz.device)
+            self._deformation_accum = torch.zeros((self._xyz.shape[0], 3), device=self._xyz.device)
             self._deformation_table = torch.ones(self._xyz.shape[0], dtype=torch.bool, device=self._xyz.device)
             return
         
@@ -1506,6 +1513,11 @@ class GaussianModel:
         # 可选：输出统计信息
         num_deform_points = self._deformation_table.sum().item()
         total_points = self._deformation_table.shape[0]
+
+        # 调试：输出累积量统计
+        accum_max = self._deformation_accum.max().item() if self._deformation_accum.numel() > 0 else 0
+        max_deform_max = max_deform.max().item() if max_deform.numel() > 0 else 0
+        print(f"[DEBUG] Deformation accum max: {accum_max:.6f}, max_deform max: {max_deform_max:.6f}, threshold: {threshold}")
         if total_points > 0:
             deform_ratio = num_deform_points / total_points
             # 只在形变点比例变化较大时输出（避免输出过多）
@@ -1597,7 +1609,7 @@ class GaussianModel:
             N = self._xyz.shape[0]
             ch_num = checkpoint_dict.get('ch_num', self.ch_num)
             K_time = checkpoint_dict.get('K_time', self.K_time)
-            weight_coefs = torch.randn((N, ch_num, K_time), device="cuda") * 0.01
+            weight_coefs = torch.randn((N, ch_num, K_time), device="cuda") * 0.1
             position_coefs = torch.linspace(0, 1, K_time, device="cuda").view(1, 1, -1).repeat(N, ch_num, 1)
             shape_coefs = torch.full((N, ch_num, K_time), 0.01, device="cuda")
             _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
@@ -1622,7 +1634,7 @@ class GaussianModel:
             self._deformation_accum = checkpoint_dict['_deformation_accum']
         elif self._xyz.shape[0] > 0:
             # 如果checkpoint中没有，但有点存在，初始化为全0
-            self._deformation_accum = torch.zeros(self._xyz.shape[0], device="cuda")
+            self._deformation_accum = torch.zeros((self._xyz.shape[0], 3), device="cuda")
         
         # 恢复训练状态
         self.max_radii2D = checkpoint_dict['max_radii2D']
