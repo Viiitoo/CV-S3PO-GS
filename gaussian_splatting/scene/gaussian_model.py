@@ -217,10 +217,13 @@ class GaussianModel:
         num_points = len(self._xyz)
         # 检查_coefs的形状是否正确：[N, ch_num * 3 * basis_num]
         expected_coefs_size = num_points * ch_num * 3 * basis_num
+        print(f"[DEBUG] gaussian_deformation: num_points={num_points}, expected_coefs_size={expected_coefs_size}, actual_coefs_size={self._coefs.numel()}")
+
         if self._coefs.numel() != expected_coefs_size:
             # 如果_coefs的大小不匹配，说明点数不一致（可能是densification后未更新）
             # 返回零形变，避免计算错误
             num_deform = deformation_point.sum().item() if isinstance(deformation_point, torch.Tensor) else num_gaussians
+            print(f"[DEBUG] Coefs size mismatch, returning zeros")
             return torch.zeros((num_deform, ch_num), device=self._coefs.device, dtype=self._coefs.dtype)
         
         # ========== 提取形变系数 ==========
@@ -244,7 +247,7 @@ class GaussianModel:
         # ========== 计算高斯基函数值（生命周期机制的核心）==========
         # 对每个基函数，计算它在当前时间点的激活值
         # 公式：gaussian = exp(-((time - means) / std_devs)^2)
-        # 
+        #
         # 物理意义：
         # - means: 该基函数的"活跃时间"，例如means=0.5表示在序列中间最活跃
         # - std_devs: 该基函数的"影响范围"，std_devs越大，影响的时间范围越广
@@ -255,6 +258,10 @@ class GaussianModel:
         exponent = (time - means) ** 2 / (std_devs ** 2 + 1e-4)
         gaussians = torch.exp(-exponent ** 2)  # [num_deform, ch_num, 1, basis_num]
         # gaussians值域：[0, 1]，表示每个基函数在当前时间的激活程度
+
+        # 调试：检查高斯函数值
+        print(f"[DEBUG] gaussian_deformation: time={time:.6f}, gaussians_max={gaussians.max().item():.6f}, weights_max={weights.max().item():.6f}")
+        print(f"[DEBUG] means_range=[{means.min().item():.6f}, {means.max().item():.6f}], std_devs_range=[{std_devs.min().item():.6f}, {std_devs.max().item():.6f}]")
         
         # ========== 加权求和得到最终形变 ==========
         # 将每个基函数的高斯值与其权重相乘，然后对所有基函数求和
