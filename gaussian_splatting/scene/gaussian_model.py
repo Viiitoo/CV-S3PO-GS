@@ -1359,11 +1359,24 @@ class GaussianModel:
             self._coefs = optimizable_tensors["coefs"]
         else:
             # 如果优化器还没有初始化coefs参数组，直接使用new_coefs
-            # 这会在training_setup时被添加到优化器
             if isinstance(new_coefs, nn.Parameter):
                 self._coefs = new_coefs
             else:
                 self._coefs = nn.Parameter(new_coefs.requires_grad_(True))
+
+        # 确保新初始化的coefs被添加到优化器中
+        if hasattr(self, 'optimizer') and self.optimizer is not None and hasattr(self, '_coefs') and self._coefs.numel() > 0:
+            # 检查优化器是否已经有coefs参数
+            has_coefs = any(group.get('name') == 'coefs' for group in self.optimizer.param_groups)
+            if not has_coefs:
+                # 添加coefs到优化器
+                deformation_lr = getattr(self, 'lr_init', 0.00016) * 0.1  # 使用保守的学习率
+                self.optimizer.add_param_group({
+                    'params': [self._coefs],
+                    'lr': deformation_lr,
+                    'name': 'coefs'
+                })
+                print(f"[DEBUG] Added coefs to optimizer in densification_postfix with lr={deformation_lr}")
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
