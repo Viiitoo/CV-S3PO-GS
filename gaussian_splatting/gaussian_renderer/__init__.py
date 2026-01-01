@@ -62,16 +62,17 @@ def render(
         if hasattr(pc, '_deformation_table') and pc._deformation_table.numel() > 0:
             if hasattr(pc, '_deformation_accum'):
                 # 计算形变量（形变后的位置 - 原始位置）
-                deformation_amount = torch.norm(means3D - pc._xyz, dim=-1)  # [N]
+                # 只有实际进行了形变的点才有意义累积
+                position_diff = torch.abs(means3D - pc._xyz)  # [N, 3]
                 # 累积形变量（使用torch.no_grad避免影响梯度）
                 with torch.no_grad():
-                    if pc._deformation_accum.numel() == 0 or pc._deformation_accum.shape[0] != means3D.shape[0]:
-                        # 如果accum未初始化或尺寸不匹配，重新初始化
-                        pc._deformation_accum = torch.zeros(means3D.shape[0], device=means3D.device)
-                    # 累积形变量（可以取最大值或平均值，这里用最大值）
+                    if pc._deformation_accum.numel() == 0 or pc._deformation_accum.shape != position_diff.shape:
+                        # 如果accum未初始化或尺寸不匹配，重新初始化为[N, 3]
+                        pc._deformation_accum = torch.zeros_like(position_diff)
+                    # 累积每个方向的形变量（取最大值）
                     pc._deformation_accum = torch.maximum(
-                        pc._deformation_accum, 
-                        deformation_amount.detach()
+                        pc._deformation_accum,
+                        position_diff.detach()
                     )
         
         # 处理各向同性放缩的情况（如果scaling只有1维，复制成3维）

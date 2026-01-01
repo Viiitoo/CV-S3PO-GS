@@ -721,12 +721,9 @@ class GaussianModel:
         ) * self.spatial_lr_scale  # 乘以空间缩放因子
         
         # 将形变系数参数添加到优化器配置列表中（生命周期机制）
-        if self._coefs.numel() > 0:
-            l.append({
-                "params": [self._coefs],
-                "lr": deformation_lr,
-                "name": "coefs",  # 形变系数（包含weights, means, std_devs）
-            })
+        # 注意：coefs可能在training_setup时还没有初始化，会在load_ply后动态添加
+        # 这里暂时不添加，稍后通过add_param_group添加
+        pass
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
@@ -1023,12 +1020,27 @@ class GaussianModel:
         else:
             # 初始化新的形变系数
             N = self._xyz.shape[0]
-            weight_coefs = torch.zeros((N, self.ch_num, self.K_time), device="cuda")
+            # 随机初始化权重，避免死循环（而不是初始化为0）
+            weight_coefs = torch.randn((N, self.ch_num, self.K_time), device="cuda") * 0.01
             position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(N, self.ch_num, 1)
             shape_coefs = torch.full((N, self.ch_num, self.K_time), 0.01, device="cuda")
             _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
             self._coefs = nn.Parameter(_coefs.requires_grad_(True))
         
+        # 确保形变参数被添加到优化器中
+        if hasattr(self, 'optimizer') and self.optimizer is not None and self._coefs.numel() > 0:
+            # 检查优化器是否已经有coefs参数
+            has_coefs = any(group.get('name') == 'coefs' for group in self.optimizer.param_groups)
+            if not has_coefs:
+                # 添加coefs到优化器
+                deformation_lr = getattr(self, 'lr_init', 0.00016) * 0.1  # 使用保守的学习率
+                self.optimizer.add_param_group({
+                    'params': [self._coefs],
+                    'lr': deformation_lr,
+                    'name': 'coefs'
+                })
+                print(f"[DEBUG] Added coefs to optimizer with lr={deformation_lr}")
+
         # 为了向后兼容，保留旧的参数名（但不再使用）
         self._w_pos = torch.empty(0, device="cuda")
         self._w_rot = torch.empty(0, device="cuda")
@@ -1280,10 +1292,10 @@ class GaussianModel:
         
         # ========== 初始化新点的形变系数（生命周期机制）==========
         # 新点的形变系数初始化（参考EH-SurGS）：
-        # - weights: 初始化为0（新点默认不形变）
+        # - weights: 随机初始化，避免死循环
         # - means: 均匀分布在[0,1]（时间中心位置）
         # - std_devs: 初始化为0.01（时间影响范围）
-        weight_coefs = torch.zeros((M, self.ch_num, self.K_time), device="cuda", dtype=new_xyz.dtype)
+        weight_coefs = torch.randn((M, self.ch_num, self.K_time), device="cuda", dtype=new_xyz.dtype) * 0.01
         position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(M, self.ch_num, 1)
         shape_coefs = torch.full((M, self.ch_num, self.K_time), 0.01, device="cuda", dtype=new_xyz.dtype)
         # 堆叠为 [M, ch_num, 3, K_time] 然后reshape为 [M, ch_num * 3 * K_time]
@@ -1482,9 +1494,12 @@ class GaussianModel:
         
         # 计算每个点的最大形变量（参考EH-SurGS的实现）
         # EH-SurGS使用: max_deform = _deformation_accum.max(dim=-1).values / 100
-        # 这里简化处理，直接使用累积的形变量
-        max_deform = self._deformation_accum
-        
+        # 对每个点，取x,y,z三个方向中的最大值，然后除以100进行归一化
+        if self._deformation_accum.dim() > 1:
+            max_deform = self._deformation_accum.max(dim=-1).values / 100
+        else:
+            max_deform = self._deformation_accum / 100
+
         # 只有形变量超过阈值的点才需要形变
         self._deformation_table = max_deform > threshold
         
@@ -1582,7 +1597,7 @@ class GaussianModel:
             N = self._xyz.shape[0]
             ch_num = checkpoint_dict.get('ch_num', self.ch_num)
             K_time = checkpoint_dict.get('K_time', self.K_time)
-            weight_coefs = torch.zeros((N, ch_num, K_time), device="cuda")
+            weight_coefs = torch.randn((N, ch_num, K_time), device="cuda") * 0.01
             position_coefs = torch.linspace(0, 1, K_time, device="cuda").view(1, 1, -1).repeat(N, ch_num, 1)
             shape_coefs = torch.full((N, ch_num, K_time), 0.01, device="cuda")
             _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
