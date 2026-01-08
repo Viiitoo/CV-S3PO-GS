@@ -57,23 +57,6 @@ def render(
         # 这比只变形位置更强大，可以处理旋转、缩放、透明度变化
         means3D, rotations, scales, opacity = pc.get_deformed_attributes_t(t)
         
-        # ========== 累积形变量（用于形变点选择）==========
-        # 如果支持形变点选择，累积形变量用于后续更新deformation_table
-        if hasattr(pc, '_deformation_table') and pc._deformation_table.numel() > 0:
-            if hasattr(pc, '_deformation_accum'):
-                # 计算形变量（形变后的位置 - 原始位置）
-                deformation_amount = torch.norm(means3D - pc._xyz, dim=-1)  # [N]
-                # 累积形变量（使用torch.no_grad避免影响梯度）
-                with torch.no_grad():
-                    if pc._deformation_accum.numel() == 0 or pc._deformation_accum.shape[0] != means3D.shape[0]:
-                        # 如果accum未初始化或尺寸不匹配，重新初始化
-                        pc._deformation_accum = torch.zeros(means3D.shape[0], device=means3D.device)
-                    # 累积形变量（可以取最大值或平均值，这里用最大值）
-                    pc._deformation_accum = torch.maximum(
-                        pc._deformation_accum, 
-                        deformation_amount.detach()
-                    )
-        
         # 处理各向同性放缩的情况（如果scaling只有1维，复制成3维）
         # 各向同性：x、y、z三个方向的放缩相同
         if scales.shape[-1] == 1:

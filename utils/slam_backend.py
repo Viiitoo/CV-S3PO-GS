@@ -410,10 +410,6 @@ class BackEnd(mp.Process):
                             f"pos_norm={w_pos_norm:.6f}, pos_max={w_pos_max:.6f}, pos_mean={w_pos_mean:.6f}"
                             f"{w_rot_info}{w_scale_info}, "
                             f"t_mu={t_mu_range}, t_sigma_mean={t_sigma_mean:.4f}")
-                        
-                        # 更新形变点选择表（每200次迭代更新一次）
-                        if hasattr(self.gaussians, 'update_deformation_table'):
-                            self.gaussians.update_deformation_table(threshold=0.01)
                 
                 # 保存checkpoint（参考EH-SurGS的方式）
                 if self.save_dir and len(self.checkpoint_iterations) > 0:
