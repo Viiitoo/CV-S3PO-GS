@@ -52,10 +52,33 @@ def render(
     # ========== 获取形变后的高斯属性 ==========
     # 这是关键步骤：根据时间t计算所有高斯点的形变属性
     # 如果支持完整形变（位置+旋转+放缩+不透明度），就用新方法
+    original_means3D = None  # 保存原始位置，用于累积形变量
     if hasattr(pc, "get_deformed_attributes_t") and t is not None:
+        # 保存原始位置，用于计算形变量
+        original_means3D = pc.get_xyz.clone()
+        
         # 调用新实现的形变函数，一次性获取所有形变后的属性
         # 这比只变形位置更强大，可以处理旋转、缩放、透明度变化
         means3D, rotations, scales, opacity = pc.get_deformed_attributes_t(t)
+        
+        # ========== 累积形变量到 _deformation_accum（参考EH-SurGS）==========
+        # 只在训练时累积形变量（梯度计算时），使用 torch.no_grad() 避免影响梯度流
+        if hasattr(pc, '_deformation_accum') and hasattr(pc, '_deformation_table'):
+            with torch.no_grad():
+                # 检查 deformation_accum 和 deformation_table 是否已初始化
+                if (pc._deformation_accum.numel() > 0 and 
+                    pc._deformation_accum.shape[0] == means3D.shape[0] and
+                    pc._deformation_table.numel() > 0 and
+                    pc._deformation_table.shape[0] == means3D.shape[0]):
+                    # 只对标记为需要形变的点累积形变量（参考EH-SurGS）
+                    deformation_point = pc._deformation_table
+                    if deformation_point.any():
+                        # 计算形变量：形变后的位置 - 原始位置
+                        # 使用绝对值累积（参考EH-SurGS）
+                        # _deformation_accum 形状为 [N, 3]，存储 x, y, z 三个方向的累积形变量
+                        pc._deformation_accum[deformation_point] += torch.abs(
+                            means3D[deformation_point] - original_means3D[deformation_point]
+                        )
         
         # 处理各向同性放缩的情况（如果scaling只有1维，复制成3维）
         # 各向同性：x、y、z三个方向的放缩相同

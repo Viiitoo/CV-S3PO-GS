@@ -158,8 +158,9 @@ class BackEnd(mp.Process):
         deform_info = ""
         if has_deformation:
             w_pos = self.gaussians._w_pos
-            deform_info = f", Deform params: {w_pos.shape}, K_time={self.gaussians.K_time}"
-        Log(f"[Init] Map initialized at frame {cur_frame_idx}, Points: {num_points}{deform_info}")
+            from utils.logging_utils import format_number
+            deform_info = f" | 形变参数: [cyan]{w_pos.shape}[/cyan], K_time={self.gaussians.K_time}"
+        Log(f"地图初始化完成 | 帧: {cur_frame_idx} | 点数: [green]{num_points:,}[/green]{deform_info}", tag="Init")
         return render_pkg
     # Optimize keyframe poses and Gaussians scene
     def map(self, current_window, prune=False, iters=1, up_pose = True):
@@ -327,6 +328,10 @@ class BackEnd(mp.Process):
                                 )
                             if to_prune is not None and self.monocular:       
                                 self.gaussians.prune_points(to_prune.cuda())
+                                # 在prune后更新deformation table，确保只有需要形变的点被标记
+                                # 这样可以优化性能并改善建模效果
+                                if hasattr(self.gaussians, 'update_deformation_table'):
+                                    self.gaussians.update_deformation_table()
                                 for idx in range((len(current_window))):
                                     current_idx = current_window[idx]
                                     if self.occ_aware_visibility.get(current_idx) is not None:
@@ -336,7 +341,7 @@ class BackEnd(mp.Process):
                         if not self.initialized:
                             self.initialized = True
                             num_points = self.gaussians._xyz.shape[0]
-                            Log(f"[Init] SLAM initialized, Total points: {num_points}")
+                            Log(f"SLAM系统初始化完成 | 总点数: [green]{num_points:,}[/green]", tag="Init")
                     return False
 
                 for idx in range(len(viewspace_point_tensor_acm)):
@@ -359,12 +364,16 @@ class BackEnd(mp.Process):
                         self.gaussian_extent,
                         self.size_threshold,
                     )
+                    # 在densify_and_prune后更新deformation table
+                    # 新点的deformation_table会在densify_and_prune中初始化，这里更新确保阈值正确
+                    if hasattr(self.gaussians, 'update_deformation_table'):
+                        self.gaussians.update_deformation_table()
                     gaussian_split = True
 
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
                     not update_gaussian) :
                     num_points = self.gaussians._xyz.shape[0]
-                    Log(f"[Densify] Resetting opacity of non-visible Gaussians, Points: {num_points}")
+                    Log(f"重置不可见高斯点不透明度 | 当前点数: [yellow]{num_points:,}[/yellow]", tag="Densify")
                     self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                     gaussian_split = True
 
@@ -406,10 +415,9 @@ class BackEnd(mp.Process):
                         t_mu_range = f"[{t_mu.min():.3f}, {t_mu.max():.3f}]"
                         t_sigma_mean = t_sigma.mean()
                         
-                        Log(f"[Deform] iter={self.iteration_count}, points={w_pos.shape[0]}, "
-                            f"pos_norm={w_pos_norm:.6f}, pos_max={w_pos_max:.6f}, pos_mean={w_pos_mean:.6f}"
-                            f"{w_rot_info}{w_scale_info}, "
-                            f"t_mu={t_mu_range}, t_sigma_mean={t_sigma_mean:.4f}")
+                        # 移除详细的形变参数数值输出，这些对用户没有直观价值
+                        # 只保留关键信息，如动态点比例等（在update_deformation_table中输出）
+                        pass
                 
                 # 保存checkpoint（参考EH-SurGS的方式）
                 if self.save_dir and len(self.checkpoint_iterations) > 0:
@@ -418,7 +426,7 @@ class BackEnd(mp.Process):
                         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
                         checkpoint_data = (self.gaussians.capture(), self.iteration_count_global)
                         torch.save(checkpoint_data, checkpoint_path)
-                        Log(f"[Checkpoint] Saved checkpoint at iteration {self.iteration_count_global} to {checkpoint_path}")
+                        Log(f"已保存检查点 | 迭代: [cyan]{self.iteration_count_global}[/cyan] | 路径: {checkpoint_path}", tag="INFO")
                 
                 # Pose update
                 if up_pose:
@@ -431,7 +439,7 @@ class BackEnd(mp.Process):
                 
     # Run color refinement as a post-processing step after SLAM
     def color_refinement(self):
-        Log("Starting color refinement")
+        Log("开始颜色精化", tag="INFO")
 
         iteration_total = 26000
         for iteration in tqdm(range(1, iteration_total + 1)):
@@ -464,7 +472,7 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(26000)
-        Log("Map refinement done")
+        Log("地图精化完成", tag="INFO")
 
     def push_to_frontend(self, tag=None):
         self.last_sent = 0
@@ -520,7 +528,7 @@ class BackEnd(mp.Process):
 
                     attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=self.num_frames)
 
-                    Log(f"[Init] Resetting system at frame {cur_frame_idx}")
+                    Log(f"重置系统 | 帧: {cur_frame_idx}", tag="Init")
                     self.reset()
 
                     self.viewpoints[cur_frame_idx] = viewpoint
@@ -539,15 +547,30 @@ class BackEnd(mp.Process):
                     depth_map = data[4]
                     self.theta = data[5]
                     
-                    # 输出关键帧和形变状态信息
-                    if hasattr(self.gaussians, '_w_pos') and self.gaussians._w_pos.numel() > 0:
+                    # 输出关键帧信息（使用颜色标记）
                         num_points = self.gaussians._xyz.shape[0]
-                        w_pos_active = (self.gaussians._w_pos.abs() > 1e-6).any(dim=-1).sum().item()
-                        w_pos_ratio = w_pos_active / num_points if num_points > 0 else 0
-                        Log(f"[Keyframe] Frame {cur_frame_idx}, Window: {current_window}, "
-                            f"Points: {num_points}, Active deform: {w_pos_active} ({w_pos_ratio*100:.1f}%)")
+                    from utils.logging_utils import format_percentage
+                    # 计算动态点比例（如果deformation_table存在）
+                    if hasattr(self.gaussians, '_deformation_table') and self.gaussians._deformation_table.numel() > 0:
+                        if self.gaussians._deformation_table.shape[0] == num_points:
+                            dynamic_points = self.gaussians._deformation_table.sum().item()
+                            dynamic_ratio = dynamic_points / num_points if num_points > 0 else 0
+                            dynamic_pct = format_percentage(dynamic_ratio, 1)
+                            Log(f"关键帧: [cyan]{cur_frame_idx}[/cyan] | "
+                                f"窗口: {current_window} | "
+                                f"点数: [green]{num_points:,}[/green] | "
+                                f"动态点: {dynamic_pct}", 
+                                tag="Keyframe")
+                        else:
+                            Log(f"关键帧: [cyan]{cur_frame_idx}[/cyan] | "
+                                f"窗口: {current_window} | "
+                                f"点数: [green]{num_points:,}[/green]", 
+                                tag="Keyframe")
                     else:
-                        Log(f"[Keyframe] Frame {cur_frame_idx}, Window: {current_window}")
+                        Log(f"关键帧: [cyan]{cur_frame_idx}[/cyan] | "
+                            f"窗口: {current_window} | "
+                            f"点数: [green]{num_points:,}[/green]", 
+                            tag="Keyframe")
 
                     T_np = np.linalg.inv(getWorld2View2(viewpoint.R,viewpoint.T).cpu().numpy())
                     T = torch.from_numpy(T_np).to(self.device)
@@ -572,7 +595,7 @@ class BackEnd(mp.Process):
                             )
                             iter_per_kf = 50 if self.live_mode else 300
                             num_points = self.gaussians._xyz.shape[0]
-                            Log(f"[BA] Performing initial BA, Points: {num_points}, Iters: {iter_per_kf}")
+                            Log(f"执行初始BA优化 | 点数: [green]{num_points:,}[/green] | 迭代: [cyan]{iter_per_kf}[/cyan]", tag="BA")
                         else:
                             iter_per_kf = self.mapping_itr_num
                     for cam_idx in range(len(self.current_window)):     

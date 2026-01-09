@@ -90,6 +90,13 @@ model_params:
   resolution: -1
   white_background: False
   data_device: "cuda"
+  # ========== 形变表相关参数（新增）==========
+  # deform_table_threshold: 形变表阈值，只有形变量超过此值的点才会被标记为需要形变
+  #   值越小，更多点会被标记为需要形变，建模效果可能更好但计算开销更大
+  #   值越大，只有形变量大的点才需要形变，计算更快但可能丢失细节
+  #   推荐值：0.0001-0.001（比默认0.01小100-10倍），根据场景动态调整
+  #   如果建模效果差（点太少），可以降低此值
+  deform_table_threshold: 0.0001
 
 pipeline_params:
   convert_SHs_python: False

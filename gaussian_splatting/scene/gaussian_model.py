@@ -47,6 +47,22 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
 
+        # ========== 形变表相关参数（参考EH-SurGS）==========
+        # _deformation_table: 布尔表，标记哪些点需要形变 [N] bool
+        # True 表示该点需要形变，False 表示静态点（不需要形变）
+        # 用于优化：只对需要形变的点计算形变，节省计算资源
+        self._deformation_table = torch.empty(0, dtype=torch.bool, device="cuda")
+        # _deformation_accum: 累积形变量 [N, 3] (x, y, z 三个方向的累积形变量)
+        # 用于动态更新 deformation_table：只有形变量超过阈值的点才需要形变
+        # 形状 [N, 3] 与 EH-SurGS 一致
+        self._deformation_accum = torch.empty(0, device="cuda")
+        # deform_table_threshold: 形变表阈值，从配置读取或使用默认值
+        # 默认值从0.01降低到0.0001，让更多点参与形变以改善建模效果
+        if config is not None and "deform_table_threshold" in config.get("model_params", {}):
+            self.deform_table_threshold = config["model_params"]["deform_table_threshold"]
+        else:
+            self.deform_table_threshold = 0.0001  # 默认值：比原0.01小100倍
+
         # ========== 时间形变相关参数（生命周期机制，参考EH-SurGS）==========
         # K_time: 时间基函数的数量（basis_num）
         # EH-SurGS使用17-20个基函数，我们默认使用17个（与EH-SurGS默认值一致）
@@ -211,10 +227,10 @@ class GaussianModel:
         expected_coefs_size = num_points * ch_num * 3 * basis_num
         if self._coefs.numel() != expected_coefs_size:
             # 如果_coefs的大小不匹配，说明点数不一致（可能是densification后未更新）
-            # 输出调试信息
+            # 输出警告信息（使用颜色输出）
             if not hasattr(self, '_coefs_mismatch_warned') or not self._coefs_mismatch_warned:
-                print(f"[WARNING] _coefs大小不匹配: _coefs.numel()={self._coefs.numel()}, 期望={expected_coefs_size}, num_points={num_points}, ch_num={ch_num}, basis_num={basis_num}")
-                print(f"  _coefs.shape={self._coefs.shape}, _xyz.shape={self._xyz.shape}")
+                from utils.logging_utils import Log
+                Log(f"形变系数大小不匹配，已自动重新初始化 (点数: {num_points})", tag="WARNING")
                 self._coefs_mismatch_warned = True
             # 返回零形变，避免计算错误
             num_deform = deformation_point.sum().item() if isinstance(deformation_point, torch.Tensor) else num_gaussians
@@ -255,7 +271,43 @@ class GaussianModel:
         # ========== 加权求和得到最终形变 ==========
         # 将每个基函数的高斯值与其权重相乘，然后对所有基函数求和
         # deformations = sum_k (gaussians[k] * weights[k])，k从0到basis_num-1
-        deformations = (gaussians * weights).sum(-1).squeeze(-2)  # [num_deform, ch_num]
+        # gaussians * weights: [num_deform, ch_num, 1, basis_num]
+        # sum(-1): [num_deform, ch_num, 1] (对最后一个维度求和，移除 basis_num 维度)
+        # squeeze(-1): [num_deform, ch_num] (移除最后一个维度，即维度2)
+        weighted_sum = (gaussians * weights).sum(-1)  # [num_deform, ch_num, 1]
+        deformations = weighted_sum.squeeze(-1)  # [num_deform, ch_num] (移除最后一个维度)
+        
+        # 确保 deformations 是二维的 [num_deform, ch_num]
+        # 如果 squeeze 移除了错误的维度（例如当 num_deform=1 或 ch_num=1 时），需要恢复
+        if deformations.dim() == 1:
+            # 如果变成一维了，可能是 squeeze 移除了错误的维度
+            # 需要根据实际情况恢复正确的形状
+            num_deform = deformation_point.sum().item() if isinstance(deformation_point, torch.Tensor) else num_gaussians
+            if num_deform == 1:
+                # 如果只有一个点，reshape为 [1, ch_num]
+                deformations = deformations.unsqueeze(0)  # [ch_num] -> [1, ch_num]
+            elif deformations.shape[0] == num_deform:
+                # 如果第一维是正确的，说明 ch_num=1，需要添加第二维
+                deformations = deformations.unsqueeze(-1)  # [num_deform] -> [num_deform, 1]
+            else:
+                # 尝试根据 ch_num 恢复
+                ch = ch_num if ch_num is not None else self.ch_num
+                if deformations.shape[0] % ch == 0:
+                    deformations = deformations.view(-1, ch)
+                else:
+                    # 如果无法恢复，报错
+                    raise RuntimeError(f"gaussian_deformation returned 1D tensor with shape {deformations.shape}, "
+                                     f"expected 2D tensor [{num_deform}, {ch}]. "
+                                     f"deformation_point.sum()={num_deform}, ch_num={ch}")
+        elif deformations.dim() == 0:
+            # 如果变成标量了，说明有严重问题
+            raise RuntimeError(f"gaussian_deformation returned scalar, expected 2D tensor [num_deform, ch_num]")
+        elif deformations.dim() > 2:
+            # 如果维度太多，尝试squeeze所有大小为1的维度
+            deformations = deformations.squeeze()
+            if deformations.dim() != 2:
+                raise RuntimeError(f"gaussian_deformation returned {deformations.dim()}-D tensor with shape {deformations.shape}, "
+                                 f"expected 2D tensor [num_deform, ch_num]")
         
         # Debug: 检查形变计算过程（降低频率，更早输出）
         if not hasattr(self, '_gaussian_deform_debug_count'):
@@ -270,15 +322,8 @@ class GaussianModel:
             weighted_sum_mean = (gaussians * weights).abs().mean().item()
             deform_max = deformations.abs().max().item()
             deform_mean = deformations.abs().mean().item()
-            print(f"[DEBUG] gaussian_deformation #{self._gaussian_deform_debug_count} - time={time.item():.4f}")
-            print(f"  weights: abs_max={weights_abs_max:.6f}, abs_mean={weights_abs_mean:.6f}")
-            print(f"  gaussians: max={gaussians_max:.6f}, mean={gaussians_mean:.6f}")
-            print(f"  weighted_sum: abs_max={weighted_sum_max:.6f}, abs_mean={weighted_sum_mean:.6f}")
-            print(f"  deformations: abs_max={deform_max:.6f}, abs_mean={deform_mean:.6f}")
-            if deformations.shape[1] >= 3:
-                xyz_deform_max = deformations[:, :3].abs().max().item()
-                xyz_deform_mean = deformations[:, :3].abs().mean().item()
-                print(f"  xyz_deform: abs_max={xyz_deform_max:.6f}, abs_mean={xyz_deform_mean:.6f}")
+            # 移除详细的debug输出，只保留关键警告
+            pass  # 已清理：这些详细数值对用户没有直观价值
         
         # 结果解释：
         # - deformations[i, 0:3]: 第i个点的位置形变（平移）[dx, dy, dz]
@@ -383,7 +428,14 @@ class GaussianModel:
         else:
             t = t.to(device=self._xyz.device, dtype=self._xyz.dtype)
 
-        # 所有点都计算形变
+        # 检查是否使用形变点选择（deformation_table）
+        # 如果启用了 deformation_table，只对标记的点计算形变，节省计算资源
+        use_deformation_table = (
+            hasattr(self, '_deformation_table') and 
+            self._deformation_table.numel() > 0 and
+            self._deformation_table.shape[0] == self._xyz.shape[0]
+        )
+        
         # 确保_xyz的形状是[N, 3]，如果不是则尝试修复
         xyz = self._xyz
         if xyz.dim() != 2 or xyz.shape[1] != 3:
@@ -396,14 +448,14 @@ class GaussianModel:
                 return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
         
         num_points = xyz.shape[0]
-        deformation_point = torch.ones(num_points, dtype=torch.bool, device=xyz.device)
-        deform = self.gaussian_deformation(t, deformation_point, num_points, 
-                                          ch_num=self.ch_num, basis_num=self.K_time)
         
-        # 检查deform的形状是否正确
-        if deform.shape[0] != num_points:
-            # 如果形状不匹配，返回原始值（不应用形变）
-            return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
+        # 根据 deformation_table 决定哪些点需要形变
+        if use_deformation_table:
+            # 只对标记的点计算形变（EH-SurGS策略）
+            deformation_mask = self._deformation_table
+        else:
+            # 如果没有启用 deformation_table，所有点都计算形变（向后兼容）
+            deformation_mask = torch.ones(num_points, dtype=torch.bool, device=xyz.device)
         
         # 初始化结果（所有点保持原值）
         xyz_deformed = xyz.clone()
@@ -411,39 +463,179 @@ class GaussianModel:
         scaling_deformed = self.scaling_activation(self._scaling).clone()
         opacity_deformed = self.opacity_activation(self._opacity).clone()
         
-        # 应用形变
+        # 只对标记的点计算形变
+        if deformation_mask.any():
+            num_deform_points = deformation_mask.sum().item()
+            deform = self.gaussian_deformation(t, deformation_mask, num_deform_points, 
+                                              ch_num=self.ch_num, basis_num=self.K_time)
+            
+            # 移除详细的shape调试信息，只保留错误警告
+            pass  # 已清理：shape信息只在出错时输出
+        else:
+            # 如果没有点需要形变，直接返回原始值
+            return xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed
+        
+        # 检查deform的形状是否正确
+        # deform 的形状应该是 [num_deform_points, ch_num]，其中 num_deform_points = deformation_mask.sum()
+        num_deform_points = deformation_mask.sum().item()
+        
+        # 确保 deform 是二维的 [num_deform_points, ch_num]
+        if deform.dim() == 1:
+            # 如果是一维的，说明可能只有一个点，需要reshape为 [1, ch_num]
+            if num_deform_points == 1:
+                deform = deform.unsqueeze(0)  # [ch_num] -> [1, ch_num]
+            else:
+                # 如果应该有多个点但返回的是一维的，说明有问题
+                from utils.logging_utils import Log
+                Log(f"形变计算错误：返回了1D张量而非预期形状", tag="WARNING")
+                return xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed
+        
+        if deform.shape[0] != num_deform_points:
+            # 如果形状不匹配，返回原始值（不应用形变）
+            from utils.logging_utils import Log
+            Log(f"形变张量形状不匹配，已跳过形变应用", tag="WARNING")
+            return xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed
+        
+        # 确保 deform 有足够的通道数
+        if deform.shape[1] < 3:
+            from utils.logging_utils import Log
+            Log(f"形变通道数不足（至少需要3个，当前{deform.shape[1]}），已跳过形变应用", tag="WARNING")
+            return xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed
+        
+        # 应用形变（参考EH-SurGS的apply_deformations）
         deformation_config = {
             "xyz_scale": 4.0,
             "rotation_scale": 6.0,
             "opacity_scale": 20.0
         }
         
-        # 位置形变
+        # 位置形变（前3个通道）
         if deform.shape[1] >= 3:
             xyz_deform = deform[:, :3] * deformation_config["xyz_scale"]
-            # 最终检查：确保形状匹配
-            if xyz_deformed.shape != xyz_deform.shape:
-                # 如果形状仍然不匹配，返回原始值（不应用形变）
-                return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
-            xyz_deformed = xyz_deformed + xyz_deform
+            # 确保 xyz_deform 的形状是 [num_deform_points, 3]
+            if xyz_deform.dim() == 1:
+                xyz_deform = xyz_deform.unsqueeze(0)
+            # 只对标记的点应用形变
+            xyz_deformed[deformation_mask] = xyz_deformed[deformation_mask] + xyz_deform
         
-        # 旋转形变
+        # 旋转形变（第4-7个通道）
         if deform.shape[1] >= 7:
             rot_deform = deform[:, 3:7] * deformation_config["rotation_scale"]
-            rotation_deformed = self.rotation_activation(self._rotation + rot_deform)
+            rotation_deformed[deformation_mask] = self.rotation_activation(
+                self._rotation[deformation_mask] + rot_deform
+            )
         
-        # 放缩形变
+        # 放缩形变（第8-10个通道）
         if deform.shape[1] >= 10:
             scale_deform = deform[:, 7:10]
-            scaling_deformed = self.scaling_activation(self._scaling + scale_deform)
+            scaling_deformed[deformation_mask] = self.scaling_activation(
+                self._scaling[deformation_mask] + scale_deform
+            )
         
-        # 不透明度形变
+        # 不透明度形变（第11个通道）
         if deform.shape[1] >= 11:
             opacity_deform = deform[:, 10:11] * deformation_config["opacity_scale"]
-            opacity_deformed = self.opacity_activation(self._opacity + opacity_deform)
+            opacity_deformed[deformation_mask] = self.opacity_activation(
+                self._opacity[deformation_mask] + opacity_deform
+            )
         
         return xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed
 
+    @torch.no_grad()
+    def update_deformation_table(self, threshold=None):
+        """
+        根据形变累积量更新形变表（参考EH-SurGS）
+        
+        只有形变累积量超过阈值的点才会被标记为需要形变。
+        这样可以自动识别静态点，节省计算资源。
+        
+        【更新策略（参考EH-SurGS）】
+        1. 计算每个点在 x, y, z 三个方向上的最大形变量
+        2. 除以 100 进行归一化（EH-SurGS 的做法）
+        3. 如果最大形变量超过阈值，标记为需要形变
+        
+        Args:
+            threshold: 形变阈值，只有形变量超过此值的点才会被标记为需要形变
+                      如果为None，则使用self.deform_table_threshold（从配置读取或默认0.0001）
+        """
+        # 使用传入的阈值，或从配置/默认值获取
+        if threshold is None:
+            threshold = getattr(self, 'deform_table_threshold', 0.0001)
+        
+        # 检查 deformation_accum 是否已初始化
+        if self._deformation_accum.numel() == 0:
+            # 如果还没累积形变量，初始化所有点都需要形变（训练初期）
+            if self._xyz.numel() > 0:
+                self._deformation_accum = torch.zeros((self._xyz.shape[0], 3), device=self._xyz.device)
+                self._deformation_table = torch.ones(self._xyz.shape[0], dtype=torch.bool, device=self._xyz.device)
+            return
+        
+        # 检查尺寸是否匹配
+        if self._deformation_accum.shape[0] != self._xyz.shape[0]:
+            # 如果尺寸不匹配，重新初始化
+            self._deformation_accum = torch.zeros((self._xyz.shape[0], 3), device=self._xyz.device)
+            # 初始化为全 True（所有点都需要形变）
+            self._deformation_table = torch.ones(self._xyz.shape[0], dtype=torch.bool, device=self._xyz.device)
+            return
+        
+        # 检查 deformation_accum 的形状是否正确 [N, 3]
+        if self._deformation_accum.dim() != 2 or self._deformation_accum.shape[1] != 3:
+            # 如果形状不对，重新初始化
+            self._deformation_accum = torch.zeros((self._xyz.shape[0], 3), device=self._xyz.device)
+            self._deformation_table = torch.ones(self._xyz.shape[0], dtype=torch.bool, device=self._xyz.device)
+            return
+        
+        # 计算每个点在 x, y, z 三个方向上的最大形变量（参考EH-SurGS）
+        # max_deform: [N]，每个点的最大形变量（在 x, y, z 三个方向上的最大值）
+        # EH-SurGS 使用: max_deform = _deformation_accum.max(dim=-1).values / 100
+        max_deform = self._deformation_accum.max(dim=-1).values / 100.0
+        
+        # 只有形变量超过阈值的点才需要形变
+        # torch.gt 等同于 > 操作，返回布尔tensor
+        self._deformation_table = torch.gt(max_deform, threshold)
+        
+        # 优化：如果形变点比例太低（<5%），说明阈值可能太高，临时降低阈值让更多点参与
+        num_deform_points = self._deformation_table.sum().item()
+        total_points = self._deformation_table.shape[0]
+        if total_points > 0:
+            deform_ratio = num_deform_points / total_points
+            # 如果形变点比例低于5%，且形变累积量最大值大于0，则使用更宽松的阈值
+            if deform_ratio < 0.05 and max_deform.max().item() > 0:
+                # 使用更宽松的阈值：原阈值的1/10，但至少保证有20%的点参与形变
+                relaxed_threshold = threshold * 0.1
+                relaxed_deform_table = torch.gt(max_deform, relaxed_threshold)
+                relaxed_num = relaxed_deform_table.sum().item()
+                relaxed_ratio = relaxed_num / total_points
+                
+                # 如果放宽后能达到至少20%的点，则使用放宽后的结果
+                if relaxed_ratio >= 0.20:
+                    self._deformation_table = relaxed_deform_table
+                    num_deform_points = relaxed_num
+                    deform_ratio = relaxed_ratio
+                    # 使用颜色输出警告信息
+                    from utils.logging_utils import Log, format_percentage
+                    Log(f"动态点比例过低 ({format_percentage(deform_ratio, 2)} < 5%)，已自动放宽阈值 "
+                        f"({relaxed_threshold:.6f} → {relaxed_ratio*100:.1f}%)", 
+                        tag="WARNING")
+        
+        # 输出直观的统计信息
+        if total_points > 0:
+            # 只在某些条件下输出（避免输出过多）
+            if not hasattr(self, '_deform_table_update_count'):
+                self._deform_table_update_count = 0
+            self._deform_table_update_count += 1
+            # 每100次迭代或前5次输出一次
+            if self._deform_table_update_count <= 5 or self._deform_table_update_count % 100 == 0:
+                from utils.logging_utils import Log, format_percentage
+                from rich import print as rprint
+                # 计算静态点比例
+                static_ratio = 1.0 - deform_ratio
+                # 使用颜色标记动态点和静态点比例
+                dynamic_pct = format_percentage(deform_ratio, 1)
+                static_pct = format_percentage(static_ratio, 1)
+                Log(f"动态点: {dynamic_pct} ({num_deform_points:,}/{total_points:,}) | "
+                    f"静态点: {static_pct}", 
+                    tag="Deform")
 
     @property
     def get_features(self):
@@ -629,6 +821,23 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        
+        # ========== 初始化形变表相关参数（参考EH-SurGS）==========
+        # 如果 deformation_table 还没有初始化，或者大小不匹配，则初始化为全 True（所有点都需要形变）
+        num_points = self.get_xyz.shape[0]
+        if self._deformation_table.numel() == 0 or self._deformation_table.shape[0] != num_points:
+            # 初始化为全 True：所有点都需要形变（训练初期）
+            self._deformation_table = torch.ones(num_points, dtype=torch.bool, device="cuda")
+        
+        # 如果 deformation_accum 还没有初始化，或者大小不匹配，则初始化为全零
+        # 形状为 [N, 3]，存储每个点在 x, y, z 三个方向上的累积形变量
+        if self._deformation_accum.numel() == 0 or self._deformation_accum.shape[0] != num_points:
+            # 初始化为全零：累积形变量从零开始
+            # 形状 [N, 3] 与 EH-SurGS 一致，存储 x, y, z 三个方向的累积形变量
+            self._deformation_accum = torch.zeros((num_points, 3), device="cuda")
+        elif self._deformation_accum.dim() == 1 or self._deformation_accum.shape[1] != 3:
+            # 如果形状不对（例如是 [N] 而不是 [N, 3]），重新初始化为 [N, 3]
+            self._deformation_accum = torch.zeros((num_points, 3), device="cuda")
 
         l = [
             {
@@ -766,7 +975,8 @@ class GaussianModel:
                 coefs_valid = True
             else:
                 # 如果形状不匹配，跳过coefs（避免保存错误）
-                print(f"Warning: coefs shape {coefs_numpy.shape[0]} doesn't match xyz shape {xyz.shape[0]}, skipping coefs in PLY save")
+                from utils.logging_utils import Log
+                Log(f"保存PLY时跳过形变系数（形状不匹配）", tag="WARNING")
 
         # 构建属性列表（根据coefs是否有效）
         attributes_list = ["x", "y", "z", "nx", "ny", "nz"]
@@ -1052,12 +1262,14 @@ class GaussianModel:
 
             # Debug: 检查coefs的处理
             if name == "coefs":
-                print(f"[DEBUG] _prune_optimizer - coefs: shape={p.shape}, N={N}, is_per_point={is_per_point}, mask.sum()={mask.sum().item()}")
+                # 移除详细的shape debug信息
+                pass  # 已清理：shape信息对用户没有直观价值
                 # 如果coefs的大小不匹配，需要重新初始化
                 if not is_per_point and p.ndim >= 1:
                     # _coefs 应该是 per-point 参数，但大小不匹配
                     # 需要重新初始化以匹配当前点数
-                    print(f"[WARNING] _coefs大小不匹配，需要重新初始化: p.shape[0]={p.shape[0]}, N={N}")
+                    from utils.logging_utils import Log
+                    Log(f"形变系数大小不匹配，已重新初始化（点数变化: {p.shape[0]} → {N}）", tag="WARNING")
                     # 这里不处理，让后续代码处理
 
             if not is_per_point:
@@ -1119,7 +1331,8 @@ class GaussianModel:
             # 如果coefs没有被_prune_optimizer处理（因为大小不匹配），需要重新初始化
             num_points_after_prune = valid_points_mask.sum().item()
             if num_points_after_prune > 0:
-                print(f"[WARNING] _coefs未被_prune_optimizer处理，重新初始化: 当前点数={num_points_after_prune}")
+                from utils.logging_utils import Log
+                Log(f"形变系数未被优化器处理，已重新初始化（当前点数: {num_points_after_prune:,}）", tag="WARNING")
                 # 重新初始化_coefs以匹配当前点数
                 # 使用小的随机初始化，而不是全0，这样更容易学习
                 weight_coefs = torch.randn((num_points_after_prune, self.ch_num, self.K_time), device="cuda") * 0.01
@@ -1160,6 +1373,46 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
+        
+        # ========== 更新形变表相关参数（参考EH-SurGS）==========
+        # 删除被prune的点的 deformation_table 和 deformation_accum
+        if hasattr(self, '_deformation_table') and self._deformation_table.numel() > 0:
+            # 确保 valid_points_mask 的长度与 deformation_table 匹配
+            if self._deformation_table.shape[0] == valid_points_mask.shape[0]:
+                self._deformation_table = self._deformation_table[valid_points_mask]
+            elif self._deformation_table.shape[0] == self._xyz.shape[0]:
+                # 如果点数匹配，使用新的点数
+                num_valid = valid_points_mask.sum().item()
+                if num_valid > 0:
+                    self._deformation_table = self._deformation_table[valid_points_mask]
+                else:
+                    self._deformation_table = torch.empty(0, dtype=torch.bool, device="cuda")
+            else:
+                # 如果不匹配，重新初始化
+                num_valid = valid_points_mask.sum().item()
+                if num_valid > 0:
+                    self._deformation_table = torch.ones(num_valid, dtype=torch.bool, device="cuda")
+                else:
+                    self._deformation_table = torch.empty(0, dtype=torch.bool, device="cuda")
+        
+        if hasattr(self, '_deformation_accum') and self._deformation_accum.numel() > 0:
+            # 确保 valid_points_mask 的长度与 deformation_accum 匹配
+            if self._deformation_accum.shape[0] == valid_points_mask.shape[0]:
+                self._deformation_accum = self._deformation_accum[valid_points_mask]
+            elif self._deformation_accum.shape[0] == self._xyz.shape[0]:
+                # 如果点数匹配，使用新的点数
+                num_valid = valid_points_mask.sum().item()
+                if num_valid > 0:
+                    self._deformation_accum = self._deformation_accum[valid_points_mask]
+                else:
+                    self._deformation_accum = torch.empty(0, device="cuda")
+            else:
+                # 如果不匹配，重新初始化
+                num_valid = valid_points_mask.sum().item()
+                if num_valid > 0:
+                    self._deformation_accum = torch.zeros((num_valid, 3), device="cuda")
+                else:
+                    self._deformation_accum = torch.empty(0, device="cuda")
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -1232,6 +1485,7 @@ class GaussianModel:
         new_rotation,
         new_kf_ids=None,
         new_n_obs=None,
+        new_deformation_table=None,
     ):
         """
         当系统创建新的高斯点时（比如从图像中提取新点，或者分裂/克隆现有点），
@@ -1293,6 +1547,64 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        # ========== 处理新点的形变表相关参数（参考EH-SurGS）==========
+        # 为新点初始化 deformation_table 和 deformation_accum
+        # 新点的 deformation_table 继承自原点的状态（如果是从原点和分裂/克隆的）
+        # 如果是全新点（从图像提取），初始化为 True（需要形变）
+        if hasattr(self, '_deformation_table'):
+            # 检查当前 deformation_table 是否存在
+            if self._deformation_table.numel() > 0:
+                # 如果原有点的 deformation_table 存在，需要扩展它
+                old_num_points = self._deformation_table.shape[0]
+                new_num_points = self.get_xyz.shape[0]
+                if new_num_points > old_num_points:
+                    # 有新点添加，为它们初始化 deformation_table
+                    # 如果提供了 new_deformation_table（从原点分裂/克隆），则使用它
+                    # 否则初始化为 True（需要形变），参考EH-SurGS的策略
+                    if new_deformation_table is not None:
+                        # 使用传入的 deformation_table（继承自原点）
+                        self._deformation_table = torch.cat([self._deformation_table, new_deformation_table], dim=0)
+                    else:
+                        # 新点初始化为 True（需要形变）
+                        new_deform_table = torch.ones(new_num_points - old_num_points, 
+                                                       dtype=torch.bool, 
+                                                       device=self._deformation_table.device)
+                        self._deformation_table = torch.cat([self._deformation_table, new_deform_table], dim=0)
+                elif new_num_points < old_num_points:
+                    # 点数减少（可能被prune了），需要调整
+                    self._deformation_table = self._deformation_table[:new_num_points]
+            else:
+                # 如果 deformation_table 还未初始化，初始化为全 True
+                if new_deformation_table is not None:
+                    # 使用传入的 deformation_table
+                    self._deformation_table = new_deformation_table.clone()
+                else:
+                    # 初始化为全 True
+                    self._deformation_table = torch.ones(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+        
+        # 为新点初始化 deformation_accum（累积形变量）
+        if hasattr(self, '_deformation_accum'):
+            # 检查当前 deformation_accum 是否存在
+            if self._deformation_accum.numel() > 0:
+                # 如果原有点的 deformation_accum 存在，需要扩展它
+                old_num_points = self._deformation_accum.shape[0]
+                new_num_points = self.get_xyz.shape[0]
+                if new_num_points > old_num_points:
+                    # 有新点添加，为它们初始化 deformation_accum
+                    # 新点初始化为全零（累积形变量从零开始）
+                    # 形状为 [M, 3]，存储 x, y, z 三个方向的累积形变量
+                    new_deformation_accum = torch.zeros((new_num_points - old_num_points, 3), 
+                                                       device=self._deformation_accum.device,
+                                                       dtype=self._deformation_accum.dtype)
+                    self._deformation_accum = torch.cat([self._deformation_accum, new_deformation_accum], dim=0)
+                elif new_num_points < old_num_points:
+                    # 点数减少（可能被prune了），需要调整
+                    self._deformation_accum = self._deformation_accum[:new_num_points]
+            else:
+                # 如果 deformation_accum 还未初始化，初始化为全零
+                # 形状为 [N, 3]，存储 x, y, z 三个方向的累积形变量
+                self._deformation_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
 
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
@@ -1329,6 +1641,11 @@ class GaussianModel:
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()].repeat(N)
         new_n_obs = self.n_obs[selected_pts_mask.cpu()].repeat(N)
+        
+        # 新点的 deformation_table 继承自原点的状态（参考EH-SurGS）
+        new_deformation_table = None
+        if hasattr(self, '_deformation_table') and self._deformation_table.numel() > 0:
+            new_deformation_table = self._deformation_table[selected_pts_mask].repeat(N)
 
         self.densification_postfix(
             new_xyz,
@@ -1339,6 +1656,7 @@ class GaussianModel:
             new_rotation,
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
+            new_deformation_table=new_deformation_table,
         )
 
         # 构建prune_filter：标记要删除的点
@@ -1386,6 +1704,12 @@ class GaussianModel:
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()]
         new_n_obs = self.n_obs[selected_pts_mask.cpu()]
+        
+        # 新点的 deformation_table 继承自原点的状态（参考EH-SurGS）
+        new_deformation_table = None
+        if hasattr(self, '_deformation_table') and self._deformation_table.numel() > 0:
+            new_deformation_table = self._deformation_table[selected_pts_mask]
+        
         self.densification_postfix(
             new_xyz,
             new_features_dc,
@@ -1395,6 +1719,7 @@ class GaussianModel:
             new_rotation,
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
+            new_deformation_table=new_deformation_table,
         )
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
