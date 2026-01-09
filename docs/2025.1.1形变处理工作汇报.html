@@ -1,0 +1,1290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>形变处理工作汇报文档</title>
+    <style>
+        @media print {
+            @page {
+                size: A4;
+                margin: 2cm;
+            }
+            body {
+                max-width: 100%;
+                padding: 0;
+            }
+        }
+        body {
+            font-family: "Microsoft YaHei", "SimHei", "STHeiti", "DejaVu Sans", Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            color: #333;
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+            page-break-after: avoid;
+        }
+        h2 {
+            color: #34495e;
+            border-bottom: 2px solid #ecf0f1;
+            padding-bottom: 5px;
+            margin-top: 30px;
+            page-break-after: avoid;
+        }
+        h3 {
+            color: #555;
+            margin-top: 25px;
+            page-break-after: avoid;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 20px 0;
+            page-break-inside: avoid;
+        }
+        table th, table td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        table th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+        }
+        table tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: "Courier New", "DejaVu Sans Mono", monospace;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            page-break-inside: avoid;
+        }
+        pre code {
+            background-color: transparent;
+            padding: 0;
+        }
+        blockquote {
+            border-left: 4px solid #3498db;
+            padding-left: 20px;
+            margin-left: 0;
+            color: #666;
+        }
+        .MathJax {
+            display: inline-block;
+            margin: 0 2px;
+            page-break-inside: avoid;
+        }
+        table .MathJax {
+            font-size: 0.9em;
+        }
+        hr {
+            border: none;
+            border-top: 2px solid #eee;
+            margin: 30px 0;
+        }
+    </style>
+    <!-- MathJax 配置 -->
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\(', '\)']],
+                displayMath: [['$$', '$$'], ['\[', '\]']],
+                processEscapes: true,
+                processEnvironments: true
+            },
+            options: {
+                skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+            },
+            startup: {
+                ready: function () {
+                    MathJax.startup.defaultReady();
+                    console.log('MathJax 已加载');
+                }
+            }
+        };
+    </script>
+</head>
+<body>
+<h1>形变处理工作汇报文档</h1>
+<h2>摘要</h2>
+<p>本文档详细对比了当前工作区（S3PO_baseline）与EH-SurGS项目在形变处理方面的实现差异，包括平移、缩放、生命周期等核心功能，以及两者在性能上的比较。</p>
+<hr />
+<h2>核心公式对比表</h2>
+<p>下表对比了两个项目在形变处理中的核心公式和关键参数：</p>
+<table>
+<thead>
+<tr>
+<th>公式类型</th>
+<th>当前工作区（S3PO_baseline）</th>
+<th>EH-SurGS</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>生命周期形变公式</strong></td>
+<td>$D_{i,c}(t) = \sum_{k=0}^{K-1} w_{i,c,k} \cdot \exp\left(-\left(\frac{t - \mu_{i,c,k}}{\sigma_{i,c,k}}\right)^2\right)$<br>$K=17$（默认）</td>
+<td>$D_{i,c}(t) = \sum_{k=0}^{K-1} w_{i,c,k} \cdot \exp\left(-\left(\frac{t - \mu_{i,c,k}}{\sigma_{i,c,k}}\right)^2\right)$<br>$K=20$（默认）</td>
+<td>公式相同，但基函数数量不同</td>
+</tr>
+<tr>
+<td><strong>位置形变（平移）</strong></td>
+<td>$\mathbf{x}<em>{deformed}(t) = \mathbf{x}</em>{canonical} + 4.0 \times \mathbf{D}<em>{pos}(t)$<br>$\mathbf{D}</em>{pos}(t) = [D_{i,0}(t), D_{i,1}(t), D_{i,2}(t)]$</td>
+<td>$\mathbf{x}<em>{deformed}(t) = \mathbf{x}</em>{canonical} + 4.0 \times \mathbf{D}<em>{pos}(t)$<br>$\mathbf{D}</em>{pos}(t) = [D_{i,0}(t), D_{i,1}(t), D_{i,2}(t)]$</td>
+<td>公式和缩放因子完全相同</td>
+</tr>
+<tr>
+<td><strong>旋转形变</strong></td>
+<td>$\mathbf{q}<em>{deformed}(t) = \text{normalize}(\mathbf{q}</em>{canonical} + 6.0 \times \mathbf{D}<em>{rot}(t))$<br>$\mathbf{D}</em>{rot}(t) = [D_{i,3}(t), D_{i,4}(t), D_{i,5}(t), D_{i,6}(t)]$</td>
+<td>$\mathbf{q}<em>{deformed}(t) = \text{normalize}(\mathbf{q}</em>{canonical} + 6.0 \times \mathbf{D}<em>{rot}(t))$<br>$\mathbf{D}</em>{rot}(t) = [D_{i,3}(t), D_{i,4}(t), D_{i,5}(t), D_{i,6}(t)]$</td>
+<td>公式和缩放因子完全相同</td>
+</tr>
+<tr>
+<td><strong>缩放形变</strong></td>
+<td>$\mathbf{s}<em>{deformed}(t) = \exp(\log(\mathbf{s}</em>{canonical}) + \mathbf{D}<em>{scale}(t))$<br>$\mathbf{D}</em>{scale}(t) = [D_{i,7}(t), D_{i,8}(t), D_{i,9}(t)]$</td>
+<td><strong>仅当</strong> <code>adaptive_hierarchy=False</code> 时支持<br>$\mathbf{s}<em>{deformed}(t) = \exp(\log(\mathbf{s}</em>{canonical}) + \mathbf{D}_{scale}(t))$<br>当 <code>adaptive_hierarchy=True</code> 时<strong>不支持</strong></td>
+<td>当前工作区始终支持；EH-SurGS仅在特定模式下支持</td>
+</tr>
+<tr>
+<td><strong>不透明度形变</strong></td>
+<td>$\alpha_{deformed}(t) = \text{sigmoid}(\alpha_{canonical} + 20.0 \times D_{i,10}(t))$</td>
+<td>$\alpha_{deformed}(t) = \text{sigmoid}(\alpha_{canonical} + 20.0 \times D_{i,7}(t))$<br>（adaptive_hierarchy=True时，通道索引为7）</td>
+<td>公式相同，但通道索引不同</td>
+</tr>
+<tr>
+<td><strong>形变点选择</strong></td>
+<td>$\text{deform_mask} = \text{max}(\text{deformation_accum}) &gt; \text{threshold}$<br>默认 threshold = 0.01</td>
+<td>$\text{deform_mask} = \text{max}(\text{deformation_accum}) / 100 &gt; \text{threshold}$<br>默认 threshold 可配置</td>
+<td>EH-SurGS额外除以100进行归一化</td>
+</tr>
+<tr>
+<td><strong>形变累积量更新</strong></td>
+<td>$\text{deformation_accum} \mathrel{+}= |\mathbf{x}<em>{deformed} - \mathbf{x}</em>{canonical}|$</td>
+<td>$\text{deformation_accum} \mathrel{+}= |\mathbf{x}<em>{deformed} - \mathbf{x}</em>{canonical}|$</td>
+<td>计算方式相同</td>
+</tr>
+<tr>
+<td><strong>形变系数初始化</strong></td>
+<td>$\mu_{i,c,k} = \text{linspace}(0, 1, K)$<br>$\sigma_{i,c,k} = 0.01$<br>$w_{i,c,k} = 0$</td>
+<td>$\mu_{i,c,k} = \text{linspace}(0, 1, K)$<br>$\sigma_{i,c,k} = \text{init_param}$（通常0.01）<br>$w_{i,c,k} = 0$</td>
+<td>初始化方式相同</td>
+</tr>
+</tbody>
+</table>
+<h3>关键参数对比</h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>当前工作区（S3PO_baseline）</th>
+<th>EH-SurGS</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>基函数数量（K）</strong></td>
+<td>17（默认，可配置）</td>
+<td>20（默认，可配置为17-20）</td>
+<td>更多基函数 = 更复杂的时间变化，但计算量更大</td>
+</tr>
+<tr>
+<td><strong>形变通道数（C）</strong></td>
+<td>11（位置3 + 旋转4 + 缩放3 + 不透明度1）</td>
+<td>8（adaptive_hierarchy=True时）<br>11（adaptive_hierarchy=False时）</td>
+<td>更多通道 = 更完整的形变支持，但内存和计算量更大</td>
+</tr>
+<tr>
+<td><strong>位置缩放因子</strong></td>
+<td>4.0</td>
+<td>4.0</td>
+<td>控制位置形变的幅度</td>
+</tr>
+<tr>
+<td><strong>旋转缩放因子</strong></td>
+<td>6.0</td>
+<td>6.0</td>
+<td>控制旋转形变的幅度</td>
+</tr>
+<tr>
+<td><strong>不透明度缩放因子</strong></td>
+<td>20.0</td>
+<td>20.0</td>
+<td>控制不透明度形变的幅度</td>
+</tr>
+<tr>
+<td><strong>形变阈值</strong></td>
+<td>0.01</td>
+<td>可配置</td>
+<td>控制哪些点需要形变计算</td>
+</tr>
+<tr>
+<td><strong>静态点保护</strong></td>
+<td>❌ 无</td>
+<td>✅ 前4000个点强制静态</td>
+<td>EH-SurGS可以节省计算资源</td>
+</tr>
+</tbody>
+</table>
+<h3>公式符号说明</h3>
+<ul>
+<li>$D_{i,c}(t)$：点 $i$ 在通道 $c$ 和时间 $t$ 的形变值</li>
+<li>$w_{i,c,k}$：权重参数（weights）</li>
+<li>$\mu_{i,c,k}$：时间中心位置（means），基函数的"活跃时间"</li>
+<li>$\sigma_{i,c,k}$：时间影响范围（std_devs），控制影响宽度</li>
+<li>$K$：基函数数量</li>
+<li>$C$：形变通道数</li>
+<li>$t \in [0,1]$：归一化的时间值</li>
+<li>$\mathbf{x}_{canonical}$：规范空间中的原始位置</li>
+<li>$\mathbf{q}_{canonical}$：规范空间中的原始旋转（四元数）</li>
+<li>$\mathbf{s}_{canonical}$：规范空间中的原始缩放（log空间）</li>
+<li>$\alpha_{canonical}$：规范空间中的原始不透明度（logit空间）</li>
+</ul>
+<h3>基函数数量差异分析</h3>
+<h4>基函数在时间轴上的分布</h4>
+<p>基函数的<code>means</code>（时间中心位置）通过<code>torch.linspace(0, 1, K)</code>初始化，在时间轴[0,1]上均匀分布。</p>
+<p><strong>17个基函数（当前工作区默认）</strong>：
+- 时间分布：${0, \frac{1}{16}, \frac{2}{16}, \frac{3}{16}, ..., \frac{15}{16}, 1}$
+- 时间间隔：$\Delta t_{17} = \frac{1}{16} \approx 0.0625$
+- 具体值：<code>[0.0000, 0.0625, 0.1250, 0.1875, 0.2500, 0.3125, 0.3750, 0.4375, 0.5000, 0.5625, 0.6250, 0.6875, 0.7500, 0.8125, 0.8750, 0.9375, 1.0000]</code></p>
+<p><strong>20个基函数（EH-SurGS默认）</strong>：
+- 时间分布：${0, \frac{1}{19}, \frac{2}{19}, \frac{3}{19}, ..., \frac{18}{19}, 1}$
+- 时间间隔：$\Delta t_{20} = \frac{1}{19} \approx 0.0526$
+- 具体值：<code>[0.0000, 0.0526, 0.1053, 0.1579, 0.2105, 0.2632, 0.3158, 0.3684, 0.4211, 0.4737, 0.5263, 0.5789, 0.6316, 0.6842, 0.7368, 0.7895, 0.8421, 0.8947, 0.9474, 1.0000]</code></p>
+<h4>差异对比表</h4>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>17个基函数（当前工作区）</th>
+<th>20个基函数（EH-SurGS）</th>
+<th>差异</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>时间分辨率</strong></td>
+<td>0.0625（每16分之一时间单位一个基函数）</td>
+<td>0.0526（每19分之一时间单位一个基函数）</td>
+<td>EH-SurGS分辨率高约19%</td>
+</tr>
+<tr>
+<td><strong>时间覆盖密度</strong></td>
+<td>16个间隔</td>
+<td>19个间隔</td>
+<td>EH-SurGS密度高约19%</td>
+</tr>
+<tr>
+<td><strong>缺失的时间段</strong></td>
+<td>在以下时间段缺少基函数覆盖：<br>- [0.0526, 0.0625)<br>- [0.1053, 0.1250)<br>- [0.1579, 0.1875)<br>等（共3个缺失区间）</td>
+<td>无缺失，覆盖更均匀</td>
+<td>当前工作区在某些时间段可能表达能力较弱</td>
+</tr>
+<tr>
+<td><strong>内存占用</strong></td>
+<td>$N \times C \times 3 \times 17 \times 4$ bytes</td>
+<td>$N \times C \times 3 \times 20 \times 4$ bytes</td>
+<td>EH-SurGS多约17.6%</td>
+</tr>
+<tr>
+<td><strong>计算量</strong></td>
+<td>$O(N_d \times C \times 17)$</td>
+<td>$O(N_d \times C \times 20)$</td>
+<td>EH-SurGS多约17.6%</td>
+</tr>
+</tbody>
+</table>
+<h4>缺失的3个基函数位置</h4>
+<p>当前工作区（17个基函数）相比EH-SurGS（20个基函数）<strong>缺少的3个基函数</strong>主要分布在：</p>
+<ol>
+<li><strong>早期时间段</strong>（约0.05-0.06）：缺少一个基函数，可能影响序列开始阶段的形变表达</li>
+<li><strong>中期时间段</strong>（约0.10-0.13）：缺少一个基函数，可能影响序列中段的形变表达  </li>
+<li><strong>后期时间段</strong>（约0.16-0.19）：缺少一个基函数，可能影响序列后段的形变表达</li>
+</ol>
+<p><strong>影响分析</strong>：
+- ✅ <strong>优势</strong>：内存和计算量减少约17.6%，训练和渲染速度更快
+- ⚠️ <strong>劣势</strong>：时间分辨率降低，可能无法捕捉某些快速变化的时间模式
+- ⚠️ <strong>劣势</strong>：在某些时间段，形变表达能力可能较弱，需要更大的$\sigma$（影响范围）来补偿</p>
+<p><strong>建议</strong>：
+- 对于<strong>简单场景</strong>或<strong>计算资源受限</strong>的情况：17个基函数足够
+- 对于<strong>复杂动态场景</strong>或<strong>需要高精度时间表达</strong>的情况：建议使用20个基函数</p>
+<hr />
+<h2>1. EH-SurGS未被当前工作区借鉴的内容</h2>
+<h3>1.1 自适应运动层次结构（Adaptive Motion Hierarchy）</h3>
+<p><strong>状态</strong>：❌ <strong>未完全实现</strong></p>
+<p><strong>EH-SurGS的实现</strong>：
+- 静态点保护机制（前4000个点强制静态）
+- 动态mask机制，根据区域损失差异动态添加形变点
+- 4x4区域损失计算，用于识别需要形变的区域</p>
+<p><strong>当前工作区的状态</strong>：
+- 只有基础的<code>_deformation_table</code>机制
+- 没有静态点保护
+- 没有区域损失计算
+- 没有动态mask机制</p>
+<h3>1.2 形变正则化（Deformation Regularization）</h3>
+<p><strong>状态</strong>：❌ <strong>未实现</strong></p>
+<p>EH-SurGS实现了多种正则化方法：</p>
+<p>```556:613:EH-SurGS/scene/deformation_model.py
+    def compute_sparsity_regulation(self,):
+        N = len(self._xyz)
+        ch_num = self.args.ch_num
+        coefs = self._coefs.reshape(N, ch_num, -1).contiguous() # [N, 7, ORDER_NUM + ORDER_NUM * 2 ]
+        return (torch.sum(torch.abs(coefs), dim=-1, keepdim=True)\
+            /torch.abs(coefs.max(dim=-1, keepdim = True)[0])).mean()   </p>
+<pre class="codehilite"><code>def compute_l1_regulation(self,):
+
+    return (torch.abs(self._coefs)).mean()
+
+def compute_l2_regulation(self,):
+
+    return (self._coefs**2).mean()
+
+def _plane_regulation(self):
+    multi_res_grids = self._deformation.deformation_net.grid.grids
+    total = 0
+    # model.grids is 6 x [1, rank * F_dim, reso, reso]
+    for grids in multi_res_grids:
+        if len(grids) == 3:
+            time_grids = []
+        else:
+            time_grids =  [0,1,3]
+        for grid_id in time_grids:
+            total += compute_plane_smoothness(grids[grid_id])
+    return total
+
+def _time_regulation(self):
+    multi_res_grids = self._deformation.deformation_net.grid.grids
+    total = 0
+    # model.grids is 6 x [1, rank * F_dim, reso, reso]
+    for grids in multi_res_grids:
+        if len(grids) == 3:
+            time_grids = []
+        else:
+            time_grids =[2, 4, 5]
+        for grid_id in time_grids:
+            total += compute_plane_smoothness(grids[grid_id])
+    return total
+
+def _l1_regulation(self):
+            # model.grids is 6 x [1, rank * F_dim, reso, reso]
+    multi_res_grids = self._deformation.deformation_net.grid.grids
+
+    total = 0.0
+    for grids in multi_res_grids:
+        if len(grids) == 3:
+            continue
+        else:
+            # These are the spatiotemporal grids
+            spatiotemporal_grids = [2, 4, 5]
+        for grid_id in spatiotemporal_grids:
+            total += torch.abs(1 - grids[grid_id]).mean()
+    return total
+
+def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
+    return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
+</code></pre>
+
+<pre class="codehilite"><code>**正则化类型**：
+1. **稀疏性正则化**（Sparsity Regulation）：鼓励形变系数稀疏
+2. **L1正则化**：L1范数约束
+3. **L2正则化**：L2范数约束
+4. **平面平滑正则化**（Plane Smoothness）：空间平滑约束
+5. **时间平滑正则化**（Time Smoothness）：时间平滑约束
+6. **L1时间平面正则化**：时间平面的L1约束
+
+**当前工作区**：没有实现任何形变正则化。
+
+### 1.3 标准约束（Standard Constraint）
+
+**状态**：❌ **未实现**
+
+```482:493:EH-SurGS/scene/deformation_model.py
+    def standard_constaint(self):
+
+        means3D = self._xyz.detach()
+        scales = self._scaling.detach()
+        rotations = self._rotation.detach()
+        opacity = self._opacity.detach()
+        time =  torch.tensor(0).to(&quot;cuda&quot;).repeat(means3D.shape[0],1)
+        means3D_deform, scales_deform, rotations_deform, _ = self._deformation(means3D, scales, rotations, opacity, time)
+        position_error = (means3D_deform - means3D)**2
+        rotation_error = (rotations_deform - rotations)**2 
+        scaling_erorr = (scales_deform - scales)**2
+        return position_error.mean() + rotation_error.mean() + scaling_erorr.mean()
+</code></pre>
+
+<p><strong>功能</strong>：确保在时间t=0时，形变后的值应该接近原始值（规范约束）。</p>
+<h3>1.4 渲染时的双重渲染机制</h3>
+<p><strong>状态</strong>：⚠️ <strong>部分实现</strong></p>
+<p>EH-SurGS在训练时会同时渲染有形变和无形变的图像：</p>
+<p>```244:252:EH-SurGS/gaussian_renderer/<strong>init</strong>.py
+    rendered_image_wo_deform, radii, depth = rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            shs=shs,
+            colors_precomp=colors_precomp,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp)</p>
+<pre class="codehilite"><code>**用途**：用于计算区域损失差异，识别需要形变的区域。
+
+**当前工作区**：没有实现双重渲染机制。
+
+### 1.5 形变累积量的计算方式
+
+**状态**：⚠️ **实现方式不同**
+
+#### 1.5.1 数据存储格式差异
+
+**EH-SurGS**：
+- `_deformation_accum` 形状：`[N, 3]`（每个点在x、y、z三个方向上分别累积形变量）
+- 初始化：`torch.zeros((N, 3), device=&quot;cuda&quot;)`
+
+```176:176:EH-SurGS/scene/deformation_model.py
+        self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device=&quot;cuda&quot;)
+</code></pre>
+
+<p><strong>当前工作区</strong>：
+- <code>_deformation_accum</code> 形状：<code>[N]</code>（每个点只存储一个标量累积值）
+- 初始化：<code>torch.zeros(N, device="cuda")</code></p>
+<p>```91:91:gaussian_splatting/scene/gaussian_model.py
+        self._deformation_accum = torch.empty(0, device="cuda")</p>
+<pre class="codehilite"><code>#### 1.5.2 累积方式差异
+
+**EH-SurGS**：
+- **累加方式**：对每个方向分别累加形变量的绝对值
+- 公式：`_deformation_accum[deformation_point] += torch.abs(means3D_deform - means3D[deformation_point])`
+- 特点：累积所有历史形变量，保留方向信息
+
+```87:87:EH-SurGS/gaussian_renderer/__init__.py
+        pc._deformation_accum[deformation_point] += torch.abs(means3D_deform - means3D[deformation_point])
+</code></pre>
+
+<p><strong>当前工作区</strong>：
+- <strong>最大值方式</strong>：只保留历史最大形变量
+- 公式：<code>_deformation_accum = torch.maximum(_deformation_accum, deformation_amount)</code>
+- 特点：只记录最大形变量，不累积历史信息</p>
+<p>```72:75:gaussian_splatting/gaussian_renderer/<strong>init</strong>.py
+                    pc._deformation_accum = torch.maximum(
+                        pc._deformation_accum, 
+                        deformation_amount.detach()
+                    )</p>
+<pre class="codehilite"><code>其中 `deformation_amount = torch.norm(means3D - pc._xyz, dim=-1)` 是形变量的L2范数（标量）。
+
+#### 1.5.3 更新deformation_table时的处理差异
+
+**EH-SurGS**：
+- 取三个方向的最大值，然后除以100进行归一化
+- 公式：`max_deform = _deformation_accum.max(dim=-1).values / 100`
+- 阈值判断：`_deformation_table = torch.gt(max_deform, threshold)`
+
+```502:502:EH-SurGS/scene/deformation_model.py
+        self._deformation_table = torch.gt(self._deformation_accum.max(dim=-1).values/100,threshold)
+</code></pre>
+
+<p><strong>当前工作区</strong>：
+- 直接使用累积值，没有除以100的归一化步骤
+- 公式：<code>max_deform = _deformation_accum</code>
+- 阈值判断：<code>_deformation_table = max_deform &gt; threshold</code></p>
+<p>```1486:1489:gaussian_splatting/scene/gaussian_model.py
+        max_deform = self._deformation_accum</p>
+<pre class="codehilite"><code>    # 只有形变量超过阈值的点才需要形变
+    self._deformation_table = max_deform &gt; threshold
+</code></pre>
+
+<pre class="codehilite"><code>#### 1.5.4 差异对比表
+
+| 特性 | EH-SurGS | 当前工作区 | 影响 |
+|------|----------|-----------|------|
+| **存储格式** | `[N, 3]` 三维向量 | `[N]` 标量 | EH-SurGS保留方向信息，当前工作区只保留大小 |
+| **累积方式** | 累加（`+=`） | 最大值（`max`） | EH-SurGS累积所有历史，当前工作区只保留峰值 |
+| **归一化** | 除以100 | 无归一化 | EH-SurGS的阈值需要更大（因为累积值更大） |
+| **更新频率** | 每次渲染都累加 | 每次渲染取最大值 | EH-SurGS能捕捉长期形变趋势，当前工作区只关注瞬时最大形变 |
+
+#### 1.5.5 影响分析
+
+**EH-SurGS的优势**：
+- ✅ **累积历史信息**：能捕捉长期形变趋势，即使某次形变很小，累积后也能被识别
+- ✅ **保留方向信息**：可以分析形变的主要方向
+- ✅ **归一化处理**：除以100使得阈值设置更直观
+
+**当前工作区的优势**：
+- ✅ **内存占用更少**：`[N]` vs `[N, 3]`，节省约67%内存
+- ✅ **计算更简单**：不需要取最大值和归一化
+- ✅ **对瞬时大形变更敏感**：只关注峰值形变，适合快速变化的场景
+
+**建议**：
+- 如果需要捕捉长期形变趋势，建议采用EH-SurGS的累加方式
+- 如果内存受限或只关注瞬时形变，当前工作区的方式更合适
+- 如果采用EH-SurGS方式，需要在`update_deformation_table`中添加除以100的归一化步骤
+
+---
+
+## 2. 当前工作区（S3PO_baseline）形变处理Feature
+
+### 1.1 核心架构
+
+当前工作区高度借鉴了EH-SurGS的形变处理机制，采用**生命周期机制（Lifetime Mechanism）**来实现时间相关的形变。
+
+#### 1.1.1 形变参数初始化
+
+```147:270:gaussian_splatting/scene/gaussian_model.py
+    def gaussian_deformation(self, time, deformation_point, num_gaussians, ch_num=None, basis_num=None):
+        &quot;&quot;&quot;
+        ========== 核心形变计算方法：生命周期机制（参考EH-SurGS）==========
+
+        这个方法实现了基于生命周期的高斯形变模型，每个点都有自己的&quot;生命周期&quot;参数，
+        控制它在不同时间点的形变行为。这是整个形变系统的核心。
+
+        【生命周期机制原理】
+        - 每个点、每个通道（位置/旋转/放缩/不透明度）都有K_time个高斯基函数
+        - 每个基函数有三个参数：
+          * weights: 形变权重，控制该基函数的贡献大小
+          * means: 时间中心位置，表示该基函数的&quot;活跃时间&quot;（点特定的生命周期）
+          * std_devs: 时间影响范围，表示该基函数在时间上的影响宽度
+
+        【形变通道说明】
+        ch_num个通道的含义（默认11个）：
+        - 通道0-2: 位置形变（平移）[x, y, z]
+        - 通道3-6: 旋转形变（四元数）[w, x, y, z]
+        - 通道7-9: 放缩形变 [sx, sy, sz]
+        - 通道10: 不透明度形变 [opacity]
+
+        【计算流程】
+        1. 从_coefs中提取每个点的形变系数（weights, means, std_devs）
+        2. 对每个基函数，计算高斯函数值：exp(-((time - means) / std_devs)^2)
+        3. 将高斯函数值与权重相乘，然后对所有基函数求和
+        4. 得到最终的形变值（每个通道一个值）
+
+        Args:
+            time: 时间值，标量或tensor，应该在[0,1]范围内
+                 例如：0.0表示序列开始，1.0表示序列结束
+            deformation_point: 布尔mask，标记哪些点需要计算形变 [N]
+                               True表示该点需要形变，False表示静态点（跳过计算）
+            num_gaussians: 需要形变的点的数量（用于兼容性，实际从deformation_point计算）
+            ch_num: 通道数（如果None则使用self.ch_num，默认11）
+            basis_num: 基函数数量（如果None则使用self.K_time，默认17）
+
+        Returns:
+            deformations: 形变值 [num_deform_points, ch_num]
+                         - 前3个通道是位置形变（平移）
+                         - 第4-7个通道是旋转形变（四元数）
+                         - 第8-10个通道是放缩形变
+                         - 第11个通道是不透明度形变
+        &quot;&quot;&quot;
+        # ========== 边界情况处理 ==========
+        if self._coefs.numel() == 0:
+            # 如果没有初始化coefs（形变参数未初始化），返回零形变
+            # 这意味着所有点保持原始状态，不进行任何形变
+            num_deform = deformation_point.sum().item() if isinstance(deformation_point, torch.Tensor) else num_gaussians
+            ch = ch_num if ch_num is not None else self.ch_num
+            return torch.zeros((num_deform, ch), device=&quot;cuda&quot;)
+
+        # ========== 参数初始化 ==========
+        if ch_num is None:
+            ch_num = self.ch_num  # 默认11：位置(3) + 旋转(4) + 放缩(3) + 不透明度(1)
+        if basis_num is None:
+            basis_num = self.K_time  # 默认17个基函数（与EH-SurGS一致）
+
+        # ========== 时间参数处理 ==========
+        # 确保time是tensor格式，并移动到正确的设备
+        if not torch.is_tensor(time):
+            time = torch.tensor(time, device=self._coefs.device, dtype=self._coefs.dtype)
+        else:
+            time = time.to(device=self._coefs.device, dtype=self._coefs.dtype)
+
+        # 确保time是标量（单个时间值）
+        # 如果输入是tensor，取第一个值（支持批量处理，但这里只处理单个时间）
+        if time.dim() &gt; 0:
+            time = time.view(-1)[0]  # 取第一个值，转换为标量
+
+        # ========== 数据一致性检查 ==========
+        num_points = len(self._xyz)
+        # 检查_coefs的形状是否正确：[N, ch_num * 3 * basis_num]
+        expected_coefs_size = num_points * ch_num * 3 * basis_num
+        if self._coefs.numel() != expected_coefs_size:
+            # 如果_coefs的大小不匹配，说明点数不一致（可能是densification后未更新）
+            # 返回零形变，避免计算错误
+            num_deform = deformation_point.sum().item() if isinstance(deformation_point, torch.Tensor) else num_gaussians
+            return torch.zeros((num_deform, ch_num), device=self._coefs.device, dtype=self._coefs.dtype)
+
+        # ========== 提取形变系数 ==========
+        # 重塑coefs: [N, ch_num * 3 * basis_num] -&gt; [N, ch_num, 3, basis_num]
+        # 其中3表示：weights(0), means(1), std_devs(2)
+        coefficients = self._coefs.reshape(num_points, ch_num, 3, basis_num).contiguous()
+
+        # 只选择需要形变的点（deformation_point标记的点）
+        # 这样可以跳过静态点，节省计算资源
+        coefficients = coefficients[deformation_point, :, :, :]
+        # coefficients形状: [num_deform, ch_num, 3, basis_num]
+        # num_deform = deformation_point.sum()
+
+        # ========== 分解形变参数 ==========
+        # 将coefficients分解为三个部分：weights, means, std_devs
+        weights, means, std_devs = torch.chunk(coefficients, 3, dim=-2)
+        # weights: [num_deform, ch_num, 1, basis_num] - 形变权重
+        # means: [num_deform, ch_num, 1, basis_num] - 时间中心位置（生命周期中心）
+        # std_devs: [num_deform, ch_num, 1, basis_num] - 时间影响范围（生命周期宽度）
+
+        # ========== 计算高斯基函数值（生命周期机制的核心）==========
+        # 对每个基函数，计算它在当前时间点的激活值
+        # 公式：gaussian = exp(-((time - means) / std_devs)^2)
+        # 
+        # 物理意义：
+        # - means: 该基函数的&quot;活跃时间&quot;，例如means=0.5表示在序列中间最活跃
+        # - std_devs: 该基函数的&quot;影响范围&quot;，std_devs越大，影响的时间范围越广
+        # - 当time接近means时，gaussian值接近1（最大激活）
+        # - 当time远离means时，gaussian值接近0（几乎不激活）
+        #
+        # 1e-4是为了避免std_devs为0时除零错误
+        exponent = (time - means) ** 2 / (std_devs ** 2 + 1e-4)
+        gaussians = torch.exp(-exponent ** 2)  # [num_deform, ch_num, 1, basis_num]
+        # gaussians值域：[0, 1]，表示每个基函数在当前时间的激活程度
+
+        # ========== 加权求和得到最终形变 ==========
+        # 将每个基函数的高斯值与其权重相乘，然后对所有基函数求和
+        # deformations = sum_k (gaussians[k] * weights[k])，k从0到basis_num-1
+        deformations = (gaussians * weights).sum(-1).squeeze(-2)  # [num_deform, ch_num]
+
+        # 结果解释：
+        # - deformations[i, 0:3]: 第i个点的位置形变（平移）[dx, dy, dz]
+        # - deformations[i, 3:7]: 第i个点的旋转形变（四元数增量）[dw, dx, dy, dz]
+        # - deformations[i, 7:10]: 第i个点的放缩形变 [dsx, dsy, dsz]
+        # - deformations[i, 10]: 第i个点的不透明度形变 [dopacity]
+
+        return deformations
+</code></pre>
+
+<h4>1.1.2 核心公式</h4>
+<p><strong>生命周期机制的核心公式：</strong></p>
+<p>对于每个高斯点 $i$，每个形变通道 $c$，在时间 $t$ 的形变值计算为：</p>
+<p>$$D_{i,c}(t) = \sum_{k=0}^{K-1} w_{i,c,k} \cdot \exp\left(-\left(\frac{t - \mu_{i,c,k}}{\sigma_{i,c,k}}\right)^2\right)$$</p>
+<p>其中：
+- $K$ 是基函数数量（默认17，与EH-SurGS一致）
+- $w_{i,c,k}$ 是权重参数（weights）
+- $\mu_{i,c,k}$ 是时间中心位置（means），表示该基函数的"活跃时间"
+- $\sigma_{i,c,k}$ 是时间影响范围（std_devs），控制该基函数在时间上的影响宽度
+- $t \in [0,1]$ 是归一化的时间值</p>
+<h3>1.2 平移（Translation）形变</h3>
+<h4>1.2.1 实现方式</h4>
+<p>```274:346:gaussian_splatting/scene/gaussian_model.py
+    def get_xyz_t(self, t):
+        """
+        ========== 获取时间t时的形变位置（平移）==========</p>
+<pre class="codehilite"><code>    这个方法计算并返回在时间t时，所有高斯点的形变后位置。
+    它只处理位置形变（平移），不涉及旋转、放缩等其他属性。
+
+    【功能说明】
+    - 输入：时间t（标量，范围[0,1]）
+    - 输出：形变后的3D位置 [N, 3]
+    - 公式：xyz_deformed = xyz_canonical + delta_position
+          其中 delta_position 是通过生命周期机制计算得到的位置偏移量
+
+    【位置形变（平移）原理】
+    1. 调用 gaussian_deformation 计算所有通道的形变值
+    2. 提取前3个通道（通道0-2），这些是位置形变 [dx, dy, dz]
+    3. 将位置偏移量加到原始位置：xyz_new = xyz_old + [dx, dy, dz]
+
+    【使用场景】
+    - 渲染时获取当前帧的点位置
+    - 可视化不同时间点的场景状态
+    - 计算位置相关的损失函数
+
+    Args:
+        t: 时间值，应该在[0,1]范围内
+           - None: 返回原始位置（不应用形变）
+           - 标量或tensor: 计算该时间点的形变位置
+
+    Returns:
+        xyz_deformed: 形变后的3D位置 [N, 3]
+                     - 如果t为None或形变参数未初始化，返回原始位置
+                     - 否则返回 xyz_canonical + position_deformation
+    &quot;&quot;&quot;
+    # ========== 边界情况处理 ==========
+    if t is None or self._coefs.numel() == 0:
+        # 如果没有指定时间，或者形变参数未初始化，返回原始位置
+        # 这适用于静态场景或形变系统未启用的情况
+        return self._xyz
+
+    # ========== 时间参数处理 ==========
+    # 确保t是tensor格式，并移动到正确的设备
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=self._xyz.device, dtype=self._xyz.dtype)
+    else:
+        t = t.to(device=self._xyz.device, dtype=self._xyz.dtype)
+
+    # ========== 计算位置形变（平移）==========
+    # 创建全True的deformation_point，表示所有点都需要计算形变
+    # 注意：这里没有使用_deformation_table来过滤静态点，而是计算所有点
+    # 这是因为get_xyz_t通常用于渲染，需要所有点的位置信息
+    deformation_point = torch.ones(self._xyz.shape[0], dtype=torch.bool, device=&quot;cuda&quot;)
+
+    # 调用核心形变计算方法，获取所有通道的形变值
+    # deform形状: [N, ch_num]，其中ch_num默认是11
+    deform = self.gaussian_deformation(t, deformation_point, self._xyz.shape[0], 
+                                      ch_num=self.ch_num, basis_num=self.K_time)
+
+    # ========== 提取位置形变（前3个通道）==========
+    # deform[:, 0:3] 是位置形变，表示每个点在x、y、z方向上的偏移量
+    # delta形状: [N, 3]，表示位置偏移 [dx, dy, dz]
+    if deform.shape[1] &gt;= 3:
+        delta = deform[:, :3]  # [N, 3] - 位置形变（平移）
+    else:
+        # 如果形变通道数不足3，说明位置形变未启用，返回零偏移
+        delta = torch.zeros_like(self._xyz)
+
+    # ========== 应用位置形变 ==========
+    # 将位置偏移量加到原始位置，得到形变后的位置
+    # xyz_deformed = xyz_canonical + delta_position
+    # 其中：
+    # - xyz_canonical: 原始（规范）位置，在训练过程中学习得到
+    # - delta_position: 时间相关的偏移量，通过生命周期机制计算
+    return self._xyz + delta
+</code></pre>
+
+<pre class="codehilite"><code>#### 1.2.2 平移公式
+
+位置形变（平移）的公式为：
+
+$$\mathbf{x}_{deformed}(t) = \mathbf{x}_{canonical} + \mathbf{D}_{pos}(t)$$
+
+其中：
+- $\mathbf{x}_{canonical}$ 是规范空间中的原始位置
+- $\mathbf{D}_{pos}(t) = [D_{i,0}(t), D_{i,1}(t), D_{i,2}(t)]$ 是位置形变（前3个通道）
+- 最终应用时会乘以缩放因子：$\mathbf{x}_{deformed}(t) = \mathbf{x}_{canonical} + 4.0 \times \mathbf{D}_{pos}(t)$
+
+### 1.3 缩放（Scaling）形变
+
+#### 1.3.1 实现方式
+
+```348:485:gaussian_splatting/scene/gaussian_model.py
+    def get_deformed_attributes_t(self, t):
+        &quot;&quot;&quot;
+        返回时间t时的所有形变属性（位置、旋转、放缩、不透明度）
+        使用生命周期机制（参考EH-SurGS）
+
+        Args:
+            t: 时间值，应该在[0,1]范围内，可以是标量或tensor
+
+        Returns:
+            tuple: (xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed)
+        &quot;&quot;&quot;
+        # 如果没有时间或形变参数未初始化，返回原始值
+        if t is None or self._coefs.numel() == 0:
+            return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
+
+        # 确保t是tensor格式
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, device=self._xyz.device, dtype=self._xyz.dtype)
+        else:
+            t = t.to(device=self._xyz.device, dtype=self._xyz.dtype)
+
+        # 检查是否使用形变点选择
+        use_deformation_table = (
+            hasattr(self, '_deformation_table') and 
+            self._deformation_table.numel() &gt; 0 and
+            self._deformation_table.shape[0] == self._xyz.shape[0]
+        )
+
+        if use_deformation_table:
+            # 只对标记的点计算形变（EH-SurGS策略）
+            deformation_mask = self._deformation_table
+
+            # 初始化结果（所有点保持原值）
+            xyz_deformed = self._xyz.clone()
+            rotation_deformed = self.rotation_activation(self._rotation).clone()
+            scaling_deformed = self.scaling_activation(self._scaling).clone()
+            opacity_deformed = self.opacity_activation(self._opacity).clone()
+
+            # 只对标记的点计算形变
+            if deformation_mask.any():
+                # 使用生命周期机制计算形变
+                deform = self.gaussian_deformation(t, deformation_mask, deformation_mask.sum().item(), 
+                                                   ch_num=self.ch_num, basis_num=self.K_time)
+                # deform: [num_deform, ch_num]
+
+                # 应用形变（参考EH-SurGS的apply_deformations）
+                deformation_config = {
+                    &quot;xyz_scale&quot;: 4.0,
+                    &quot;rotation_scale&quot;: 6.0,
+                    &quot;opacity_scale&quot;: 20.0
+                }
+
+                # 位置形变（前3个通道）
+                if deform.shape[1] &gt;= 3:
+                    xyz_deform = deform[:, :3] * deformation_config[&quot;xyz_scale&quot;]
+                    xyz_deformed[deformation_mask] = xyz_deformed[deformation_mask] + xyz_deform
+
+                # 旋转形变（第4-7个通道）
+                if deform.shape[1] &gt;= 7:
+                    rot_deform = deform[:, 3:7] * deformation_config[&quot;rotation_scale&quot;]
+                    rotation_deformed[deformation_mask] = self.rotation_activation(
+                        self._rotation[deformation_mask] + rot_deform
+                    )
+
+                # 放缩形变（第8-10个通道，如果有）
+                if deform.shape[1] &gt;= 10:
+                    scale_deform = deform[:, 7:10]
+                    scaling_deformed[deformation_mask] = self.scaling_activation(
+                        self._scaling[deformation_mask] + scale_deform
+                    )
+
+                # 不透明度形变（第11个通道，如果有）
+                if deform.shape[1] &gt;= 11:
+                    opacity_deform = deform[:, 10:11] * deformation_config[&quot;opacity_scale&quot;]
+                    opacity_deformed[deformation_mask] = self.opacity_activation(
+                        self._opacity[deformation_mask] + opacity_deform
+                    )
+        else:
+            # 所有点都计算形变
+            # 确保_xyz的形状是[N, 3]，如果不是则尝试修复
+            xyz = self._xyz
+            if xyz.dim() != 2 or xyz.shape[1] != 3:
+                # 如果形状不对，尝试重塑为[N, 3]
+                if xyz.numel() % 3 == 0:
+                    expected_num_points = xyz.numel() // 3
+                    xyz = xyz.reshape(expected_num_points, 3)
+                else:
+                    # 如果无法重塑，返回原始值（不应用形变）
+                    return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
+
+            num_points = xyz.shape[0]
+            deformation_point = torch.ones(num_points, dtype=torch.bool, device=xyz.device)
+            deform = self.gaussian_deformation(t, deformation_point, num_points, 
+                                              ch_num=self.ch_num, basis_num=self.K_time)
+
+            # 检查deform的形状是否正确
+            if deform.shape[0] != num_points:
+                # 如果形状不匹配，返回原始值（不应用形变）
+                return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
+
+            # 初始化结果（所有点保持原值）
+            xyz_deformed = xyz.clone()
+            rotation_deformed = self.rotation_activation(self._rotation).clone()
+            scaling_deformed = self.scaling_activation(self._scaling).clone()
+            opacity_deformed = self.opacity_activation(self._opacity).clone()
+
+            # 应用形变
+            deformation_config = {
+                &quot;xyz_scale&quot;: 4.0,
+                &quot;rotation_scale&quot;: 6.0,
+                &quot;opacity_scale&quot;: 20.0
+            }
+
+            # 位置形变
+            if deform.shape[1] &gt;= 3:
+                xyz_deform = deform[:, :3] * deformation_config[&quot;xyz_scale&quot;]
+                # 最终检查：确保形状匹配
+                if xyz_deformed.shape != xyz_deform.shape:
+                    # 如果形状仍然不匹配，返回原始值（不应用形变）
+                    return self._xyz, self.get_rotation, self.get_scaling, self.get_opacity
+                xyz_deformed = xyz_deformed + xyz_deform
+
+            # 旋转形变
+            if deform.shape[1] &gt;= 7:
+                rot_deform = deform[:, 3:7] * deformation_config[&quot;rotation_scale&quot;]
+                rotation_deformed = self.rotation_activation(self._rotation + rot_deform)
+
+            # 放缩形变
+            if deform.shape[1] &gt;= 10:
+                scale_deform = deform[:, 7:10]
+                scaling_deformed = self.scaling_activation(self._scaling + scale_deform)
+
+            # 不透明度形变
+            if deform.shape[1] &gt;= 11:
+                opacity_deform = deform[:, 10:11] * deformation_config[&quot;opacity_scale&quot;]
+                opacity_deformed = self.opacity_activation(self._opacity + opacity_deform)
+
+        return xyz_deformed, rotation_deformed, scaling_deformed, opacity_deformed
+</code></pre>
+
+<h4>1.3.2 缩放公式</h4>
+<p>缩放形变的公式为：</p>
+<p>$$\mathbf{s}<em>{deformed}(t) = \exp(\log(\mathbf{s}</em>{canonical}) + \mathbf{D}_{scale}(t))$$</p>
+<p>其中：
+- $\mathbf{s}<em>{canonical}$ 是规范空间中的原始缩放（在log空间）
+- $\mathbf{D}</em>{scale}(t) = [D_{i,7}(t), D_{i,8}(t), D_{i,9}(t)]$ 是缩放形变（第7-9个通道）
+- 由于缩放参数在log空间存储，所以需要先加形变，再exp激活</p>
+<h3>1.4 生命周期（Lifetime）机制</h3>
+<h4>1.4.1 参数结构</h4>
+<p>```50:92:gaussian_splatting/scene/gaussian_model.py
+        # ========== 时间形变相关参数（生命周期机制，参考EH-SurGS）==========
+        # K_time: 时间基函数的数量（basis_num）
+        # EH-SurGS使用17-20个基函数，我们默认使用17个（与EH-SurGS默认值一致）
+        # 更多基函数可以表达更复杂的时间变化，但会增加内存和计算开销
+        # 可以通过config中的time_basis_num参数自定义，如果没有配置则使用默认值17
+        if config is not None and "time_basis_num" in config.get("model_params", {}):
+            self.K_time = config["model_params"]["time_basis_num"]
+        else:
+            self.K_time = 17  # 默认值：与EH-SurGS的curve_num=17一致</p>
+<pre class="codehilite"><code>    # ch_num: 形变通道数
+    # 位置(3) + 旋转(4) + 放缩(3) + 不透明度(1) = 11
+    # 如果只使用位置形变，则为3
+    if config is not None and &quot;deform_ch_num&quot; in config.get(&quot;model_params&quot;, {}):
+        self.ch_num = config[&quot;model_params&quot;][&quot;deform_ch_num&quot;]
+    else:
+        self.ch_num = 11  # 默认值：支持所有形变类型
+
+    # ========== 形变系数参数（生命周期机制）==========
+    # _coefs: 形变系数 [N个点, ch_num个通道, 3个参数(weights/means/std_devs), K_time个基函数]
+    # 这是EH-SurGS的核心：每个点、每个通道、每个基函数都有自己的时间演化参数
+    # - weights: 形变权重
+    # - means: 时间中心位置（点特定的生命周期）
+    # - std_devs: 时间影响范围（点特定的生命周期）
+    # 形状: [N, ch_num, 3, K_time]
+    self._coefs = torch.empty(0, device=&quot;cuda&quot;)
+
+    # 为了向后兼容，保留旧的参数名（但不再使用）
+    # 这些将在后续版本中移除
+    self._w_pos = torch.empty(0, device=&quot;cuda&quot;)
+    self._w_rot = torch.empty(0, device=&quot;cuda&quot;)
+    self._w_scale = torch.empty(0, device=&quot;cuda&quot;)
+    self._w_opacity = torch.empty(0, device=&quot;cuda&quot;)
+
+    # ========== 形变点选择相关参数（参考EH-SurGS）==========
+    # _deformation_table: 布尔表，标记哪些点需要形变 [N] bool
+    # True表示该点需要计算形变，False表示该点是静态的，不需要形变
+    self._deformation_table = torch.empty(0, dtype=torch.bool, device=&quot;cuda&quot;)
+
+    # _deformation_accum: 形变累积量 [N, ...]
+    # 用于记录每个点的形变量，用于动态更新deformation_table
+    self._deformation_accum = torch.empty(0, device=&quot;cuda&quot;)
+</code></pre>
+
+<pre class="codehilite"><code>#### 1.4.2 形变点选择机制
+
+```1463:1500:gaussian_splatting/scene/gaussian_model.py
+    @torch.no_grad()
+    def update_deformation_table(self, threshold=0.01):
+        &quot;&quot;&quot;
+        根据形变累积量更新形变表（参考EH-SurGS）
+
+        只有形变累积量超过阈值的点才会被标记为需要形变。
+        这样可以自动识别静态点，节省计算资源。
+
+        Args:
+            threshold: 形变阈值，只有形变量超过此值的点才会被标记为需要形变
+        &quot;&quot;&quot;
+        if self._deformation_accum.numel() == 0:
+            return
+
+        if self._deformation_accum.shape[0] != self._xyz.shape[0]:
+            # 如果尺寸不匹配，重新初始化
+            self._deformation_accum = torch.zeros(self._xyz.shape[0], device=self._xyz.device)
+            self._deformation_table = torch.ones(self._xyz.shape[0], dtype=torch.bool, device=self._xyz.device)
+            return
+
+        # 计算每个点的最大形变量（参考EH-SurGS的实现）
+        # EH-SurGS使用: max_deform = _deformation_accum.max(dim=-1).values / 100
+        # 这里简化处理，直接使用累积的形变量
+        max_deform = self._deformation_accum
+
+        # 只有形变量超过阈值的点才需要形变
+        self._deformation_table = max_deform &gt; threshold
+
+        # 可选：输出统计信息
+        num_deform_points = self._deformation_table.sum().item()
+        total_points = self._deformation_table.shape[0]
+        if total_points &gt; 0:
+            deform_ratio = num_deform_points / total_points
+            # 只在形变点比例变化较大时输出（避免输出过多）
+            if not hasattr(self, '_last_deform_ratio') or abs(deform_ratio - self._last_deform_ratio) &gt; 0.05:
+                from utils.logging_utils import Log
+                Log(f&quot;[DeformTable] Updated: {num_deform_points}/{total_points} points need deformation ({deform_ratio*100:.1f}%)&quot;, tag=&quot;Deform&quot;)
+                self._last_deform_ratio = deform_ratio
+</code></pre>
+
+<hr />
+<h2>3. EH-SurGS形变处理Feature</h2>
+<h3>2.1 核心架构</h3>
+<p>EH-SurGS采用与当前工作区相同的<strong>生命周期机制</strong>，但在某些细节上有所不同。</p>
+<h4>2.1.1 形变参数初始化</h4>
+<p>```504:512:EH-SurGS/scene/deformation_model.py
+    def gaussian_deformation(self, time, deformation_point, num_gaussians, ch_num=8, basis_num=20):</p>
+<pre class="codehilite"><code>    num_points = len(self._xyz)
+    coefficients = self._coefs.reshape(num_points, ch_num, 3, basis_num).contiguous()
+    coefficients = coefficients[deformation_point, :, :, :]
+    weights, means, std_devs = torch.chunk(coefficients, 3, -2)
+    exponent = (time - means) ** 2 / (std_devs ** 2 + 1e-4)
+    gaussians = torch.exp(-exponent ** 2)
+    return (gaussians * weights).sum(-1).squeeze()
+</code></pre>
+
+<pre class="codehilite"><code>**注意**：EH-SurGS的默认参数：
+- `ch_num=8`（默认8个通道，通常只包含位置和旋转）
+- `basis_num=20`（默认20个基函数，比当前工作区的17个多）
+
+#### 2.1.2 核心公式
+
+EH-SurGS使用相同的生命周期公式，但参数默认值不同：
+
+$$D_{i,c}(t) = \sum_{k=0}^{K-1} w_{i,c,k} \cdot \exp\left(-\left(\frac{t - \mu_{i,c,k}}{\sigma_{i,c,k}}\right)^2\right)$$
+
+其中 $K=20$（默认值，可配置为17-20）。
+
+### 2.2 平移（Translation）形变
+
+#### 2.2.1 实现方式
+
+```515:543:EH-SurGS/scene/deformation_model.py
+    def apply_deformations(
+        self, 
+        xyz: torch.Tensor, 
+        scales: torch.Tensor, 
+        rotations: torch.Tensor, 
+        opacities: torch.Tensor, 
+        deformation_point: torch.Tensor, 
+        deformations: torch.Tensor, 
+        time: float, 
+        use_adaptive_hierarchy: bool
+    ) -&gt; Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        deformation_config = {
+            &quot;xyz_scale&quot;: 4.0,
+            &quot;rotation_scale&quot;: 6.0,
+            &quot;opacity_scale&quot;: 20.0
+        }
+
+        if use_adaptive_hierarchy:
+            xyz_deform = deformations[:, :3]
+            rot_deform = deformations[:, 3:7]
+            opacity_deform = deformations[:, 7:8]
+
+            # Apply deformations using configuration
+            xyz += deformation_config[&quot;xyz_scale&quot;] * xyz_deform
+            rotations += deformation_config[&quot;rotation_scale&quot;] * rot_deform
+            opacities += deformation_config[&quot;opacity_scale&quot;] * opacity_deform
+
+        return xyz, scales, rotations, opacities
+</code></pre>
+
+<h4>2.2.2 平移公式</h4>
+<p>与当前工作区相同：</p>
+<p>$$\mathbf{x}<em>{deformed}(t) = \mathbf{x}</em>{canonical} + 4.0 \times \mathbf{D}_{pos}(t)$$</p>
+<h3>2.3 缩放（Scaling）形变</h3>
+<p>EH-SurGS在<code>use_adaptive_hierarchy=True</code>模式下<strong>不直接支持缩放形变</strong>，只支持位置、旋转和不透明度形变。缩放形变只在<code>use_adaptive_hierarchy=False</code>时通过额外的通道实现。</p>
+<h3>2.4 生命周期（Lifetime）机制</h3>
+<h4>2.4.1 参数初始化</h4>
+<p>```152:158:EH-SurGS/scene/deformation_model.py
+        N = fused_point_cloud.shape[0]
+        if self.adaptive_motion_hierarchy == True:
+            weight_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num))
+            position_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num)) + torch.linspace(0,1,self.args.curve_num)
+            shape_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num)) + self.args.init_param
+            <em>coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N,-1).float().to("cuda")
+            self._coefs = nn.Parameter(_coefs.requires_grad</em>(True))</p>
+<pre class="codehilite"><code>**关键差异**：
+- EH-SurGS的`position_coefs`初始化为均匀分布在[0,1]的线性序列
+- `shape_coefs`初始化为固定值`self.args.init_param`（通常为0.01）
+
+#### 2.4.2 形变点选择机制
+
+```500:502:EH-SurGS/scene/deformation_model.py
+    @torch.no_grad()
+    def update_deformation_table(self,threshold):
+        # print(&quot;origin deformation point nums:&quot;,self._deformation_table.sum())
+        self._deformation_table = torch.gt(self._deformation_accum.max(dim=-1).values/100,threshold)
+</code></pre>
+
+<p><strong>关键差异</strong>：
+- EH-SurGS使用<code>_deformation_accum.max(dim=-1).values/100</code>来计算形变量
+- 当前工作区直接使用<code>_deformation_accum</code>（简化版本）</p>
+<h3>2.5 自适应运动层次结构（Adaptive Motion Hierarchy）</h3>
+<p>EH-SurGS独有的特性，当前工作区<strong>未完全实现</strong>。</p>
+<h4>2.5.1 实现方式</h4>
+<p>```71:85:EH-SurGS/gaussian_renderer/<strong>init</strong>.py
+    if adaptive_motion_hierarchy == True:
+        deformation_point[:4000] = False
+        mask = mask.to("cuda:0")
+        deformation_point = deformation_point | mask
+        deform = pc.gaussian_deformation(ori_time, deformation_point, num_gaussians=means3D[deformation_point].shape[0],
+                                         ch_num=pc.args.ch_num, basis_num=pc.args.curve_num)
+    else:
+        deform = pc.gaussian_deformation(ori_time, deformation_point, num_gaussians=means3D[deformation_point].shape[0],
+                                     ch_num=pc.args.ch_num + 3, basis_num=pc.args.curve_num)
+    means3D_deform, scales_deform, rotations_deform, opacity_deform = pc.apply_deformations(means3D[deformation_point],
+                                                                                     scales[deformation_point],
+                                                                                     rotations[deformation_point],
+                                                                                     opacity[deformation_point],
+                                                                                     deformation_point, deform,
+                                                                                     ori_time, adaptive_motion_hierarchy)</p>
+<pre class="codehilite"><code>**关键特性**：
+1. **静态点保护**：前4000个点被强制标记为静态（`deformation_point[:4000] = False`）
+2. **动态mask**：通过额外的mask动态添加需要形变的点
+3. **通道数差异**：`use_adaptive_hierarchy=True`时使用`ch_num`，否则使用`ch_num+3`（额外3个通道用于缩放）
+
+#### 2.5.2 区域损失计算
+
+```133:159:EH-SurGS/train.py
+        if adaptive_motion_hierarchy == True:
+            regions = torch.chunk(image_tensor, 4, dim=2)
+            regions = [torch.chunk(region, 4, dim=3) for region in regions]
+            image_wo_deform_tensor_regions = torch.chunk(image_wo_deform_tensor, 4, dim=2)
+            image_wo_deform_tensor_regions = [torch.chunk(region, 4, dim=3) for region in image_wo_deform_tensor_regions]
+            gt_regions = torch.chunk(gt_image_tensor, 4, dim=2)
+            gt_regions = [torch.chunk(region, 4, dim=3) for region in gt_regions]
+            w_deform_region_losses = []
+            wo_deform_region_losses = []
+            loss_diffs = []
+            for i, row in enumerate(regions):
+                for j, region in enumerate(row):
+                    image_wo_deform_region = image_wo_deform_tensor_regions[i][j]
+                    gt_region = gt_regions[i][j]
+                    w_deform_loss = l1_loss(region, gt_region)
+                    wo_deform_loss = l1_loss(image_wo_deform_region, gt_region)
+                    loss_diff = (wo_deform_loss - w_deform_loss) / wo_deform_loss
+                    w_deform_region_losses.append((w_deform_loss, (i, j)))
+                    wo_deform_region_losses.append((wo_deform_loss, (i, j)))
+                    loss_diffs.append((loss_diff, (i, j)))
+            large_diff_indices = []
+            for diff, block_idx in loss_diffs:
+                if diff &gt; 0.5:
+                    large_diff_indices.append(block_idx)
+            max_w_deform_loss, max_w_deform_loss_idx = max(w_deform_region_losses, key=lambda x: x[0])
+            max_wo_deform_loss, max_wo_deform_loss_idx = max(wo_deform_region_losses, key=lambda x: x[0])
+</code></pre>
+
+<p><strong>功能</strong>：将图像分成4x4=16个区域，计算每个区域在有形变和无形变时的损失差异，用于动态识别需要形变的区域。</p>
+<hr />
+<h2>4. 性能比较</h2>
+<h3>4.1 计算复杂度</h3>
+<h4>4.1.1 形变计算复杂度</h4>
+<p><strong>当前工作区</strong>：
+- 时间复杂度：$O(N_d \times C \times K)$
+  - $N_d$：需要形变的点数（由<code>deformation_table</code>决定）
+  - $C$：形变通道数（默认11）
+  - $K$：基函数数量（默认17）
+- 空间复杂度：$O(N \times C \times 3 \times K)$（存储形变系数）</p>
+<p><strong>EH-SurGS</strong>：
+- 时间复杂度：$O(N_d \times C \times K)$
+  - $N_d$：需要形变的点数
+  - $C$：形变通道数（默认8，adaptive_hierarchy=True时）
+  - $K$：基函数数量（默认20）
+- 空间复杂度：$O(N \times C \times 3 \times K)$</p>
+<p><strong>对比</strong>：
+- EH-SurGS的基函数数量更多（20 vs 17），但通道数更少（8 vs 11）
+- 总体计算量相近，但EH-SurGS在adaptive_hierarchy模式下可能更快（通道数少）</p>
+<h4>4.1.2 形变点选择开销</h4>
+<p><strong>当前工作区</strong>：
+- 使用<code>_deformation_table</code>布尔mask，开销：$O(1)$（索引操作）
+- 更新<code>deformation_table</code>的开销：$O(N)$（每200次迭代）</p>
+<p><strong>EH-SurGS</strong>：
+- 相同的机制，但更新频率可能不同
+- 额外的区域损失计算开销：$O(H \times W)$（4x4区域划分）</p>
+<h3>4.2 内存占用</h3>
+<h4>4.2.1 形变参数内存</h4>
+<p><strong>当前工作区</strong>：
+- <code>_coefs</code>: $N \times 11 \times 3 \times 17 \times 4$ bytes = $N \times 8976$ bytes
+- 对于100万个点：约8.5 GB</p>
+<p><strong>EH-SurGS</strong>：
+- <code>_coefs</code>: $N \times 8 \times 3 \times 20 \times 4$ bytes = $N \times 1920$ bytes
+- 对于100万个点：约1.8 GB（adaptive_hierarchy=True时）</p>
+<p><strong>对比</strong>：EH-SurGS在adaptive_hierarchy模式下内存占用更少。</p>
+<h4>4.2.2 其他内存开销</h4>
+<ul>
+<li><code>_deformation_table</code>: $N \times 1$ byte（布尔值）</li>
+<li><code>_deformation_accum</code>: $N \times 4$ bytes（float32）</li>
+</ul>
+<h3>4.3 训练速度</h3>
+<p><strong>影响因素</strong>：
+1. <strong>形变点数量</strong>：当前工作区可能计算更多点（没有静态点保护）
+2. <strong>通道数</strong>：当前工作区默认11个通道，EH-SurGS在adaptive_hierarchy模式下只有8个
+3. <strong>正则化</strong>：EH-SurGS的正则化计算会增加训练时间
+4. <strong>双重渲染</strong>：EH-SurGS的双重渲染机制会增加约50%的渲染时间</p>
+<p><strong>预估</strong>：
+- 当前工作区：可能稍快（没有正则化和双重渲染）
+- EH-SurGS：可能稍慢（但质量可能更好）</p>
+<h3>4.4 渲染速度</h3>
+<p><strong>影响因素</strong>：
+1. <strong>形变点数量</strong>：更少的形变点 = 更快的渲染
+2. <strong>基函数数量</strong>：更少的基函数 = 更快的计算
+3. <strong>通道数</strong>：更少的通道 = 更快的计算</p>
+<p><strong>预估</strong>：
+- 当前工作区：可能稍慢（计算更多点和通道）
+- EH-SurGS（adaptive_hierarchy=True）：可能更快（更少的形变点和通道）</p>
+<h3>4.5 质量对比</h3>
+<p><strong>当前工作区的优势</strong>：
+- ✅ 支持完整的11通道形变（位置+旋转+缩放+不透明度）
+- ✅ 更灵活的配置（可自定义通道数和基函数数）</p>
+<p><strong>EH-SurGS的优势</strong>：
+- ✅ 自适应运动层次结构，自动识别静态点
+- ✅ 形变正则化，提高训练稳定性
+- ✅ 区域损失计算，更精确的形变区域识别
+- ✅ 标准约束，确保规范空间的一致性</p>
+<hr />
+<h2>5. 总结</h2>
+<h3>5.1 已借鉴的内容</h3>
+<p>✅ <strong>生命周期机制</strong>：完全借鉴，核心公式和实现方式一致<br />
+✅ <strong>形变点选择机制</strong>：基本借鉴，使用<code>_deformation_table</code><br />
+✅ <strong>形变应用方式</strong>：完全借鉴，使用相同的缩放因子配置<br />
+✅ <strong>形变累积量计算</strong>：基本借鉴，用于更新形变表  </p>
+<h3>5.2 未借鉴的内容</h3>
+<p>❌ <strong>自适应运动层次结构</strong>：未实现静态点保护和动态mask机制<br />
+❌ <strong>形变正则化</strong>：未实现任何正则化方法<br />
+❌ <strong>标准约束</strong>：未实现规范空间约束<br />
+❌ <strong>双重渲染机制</strong>：未实现用于区域损失计算的机制<br />
+❌ <strong>区域损失计算</strong>：未实现4x4区域划分和损失差异计算  </p>
+<h3>5.3 改进建议</h3>
+<ol>
+<li><strong>实现自适应运动层次结构</strong>：添加静态点保护机制，提高训练和渲染效率</li>
+<li><strong>添加形变正则化</strong>：实现L1/L2正则化和平滑约束，提高训练稳定性</li>
+<li><strong>实现标准约束</strong>：确保在t=0时形变值为0，提高规范空间的一致性</li>
+<li><strong>优化内存占用</strong>：考虑减少默认通道数或基函数数，降低内存开销</li>
+<li><strong>添加性能监控</strong>：实现形变点数量、计算时间等性能指标的监控</li>
+</ol>
+<hr />
+<h2>附录：关键代码位置</h2>
+<h3>当前工作区（S3PO_baseline）</h3>
+<ul>
+<li>形变核心计算：<code>gaussian_splatting/scene/gaussian_model.py::gaussian_deformation()</code></li>
+<li>形变应用：<code>gaussian_splatting/scene/gaussian_model.py::get_deformed_attributes_t()</code></li>
+<li>形变点选择：<code>gaussian_splatting/scene/gaussian_model.py::update_deformation_table()</code></li>
+<li>渲染：<code>gaussian_splatting/gaussian_renderer/__init__.py::render()</code></li>
+</ul>
+<h3>EH-SurGS</h3>
+<ul>
+<li>形变核心计算：<code>EH-SurGS/scene/deformation_model.py::gaussian_deformation()</code></li>
+<li>形变应用：<code>EH-SurGS/scene/deformation_model.py::apply_deformations()</code></li>
+<li>形变点选择：<code>EH-SurGS/scene/deformation_model.py::update_deformation_table()</code></li>
+<li>渲染：<code>EH-SurGS/gaussian_renderer/__init__.py::render_flow_train()</code></li>
+<li>自适应层次结构：<code>EH-SurGS/train.py::scene_reconstruction()</code></li>
+</ul>
+<hr />
+<p><strong>文档生成时间</strong>：2024年<br />
+<strong>版本</strong>：v1.0</p>
+<script>
+// 等待 MathJax 渲染完成
+window.addEventListener('load', function() {
+    setTimeout(function() {
+        if (window.MathJax && window.MathJax.typesetPromise) {
+            MathJax.typesetPromise().then(function() {
+                console.log('MathJax 渲染完成');
+                // 显示提示信息
+                var info = document.createElement('div');
+                info.style.cssText = 'position:fixed;top:10px;right:10px;background:#4CAF50;color:white;padding:10px;border-radius:5px;z-index:9999;';
+                info.innerHTML = '✓ 公式渲染完成！<br>按 Ctrl+P 打印为 PDF';
+                document.body.appendChild(info);
+                setTimeout(function() { info.remove(); }, 5000);
+            });
+        }
+    }, 1000);
+});
+</script>
+</body>
+</html>

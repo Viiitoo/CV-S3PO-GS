@@ -1,0 +1,3 @@
+[submodule "EH-SurGS"]
+	path = EH-SurGS
+	url = https://github.com/IRMVLab/EH-SurGS.git
