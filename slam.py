@@ -114,8 +114,13 @@ class SLAM:
             gui_process.start()
             time.sleep(5)
 
-        backend_process.start()        
-        self.frontend.run()
+        backend_process.start()
+        try:
+            self.frontend.run()
+        except Exception as e:
+            print(f"[Frontend] 异常: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
         backend_queue.put(["pause"])    
 
         end.record()

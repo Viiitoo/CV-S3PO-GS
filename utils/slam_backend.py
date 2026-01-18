@@ -493,6 +493,16 @@ class BackEnd(mp.Process):
         torch.cuda.set_device(0)  # CUDA_VISIBLE_DEVICES 已经限制了可见设备，所以这里用 0
         torch.cuda.empty_cache()
         
+        try:
+            self._run_loop()
+        except KeyboardInterrupt:
+            print("[Backend] 收到中断信号，正常退出")
+        except Exception as e:
+            print(f"[Backend] 异常退出: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _run_loop(self):
         while True:
             if self.backend_queue.empty():
                 if self.pause:
@@ -548,7 +558,7 @@ class BackEnd(mp.Process):
                     self.theta = data[5]
                     
                     # 输出关键帧信息（使用颜色标记）
-                        num_points = self.gaussians._xyz.shape[0]
+                    num_points = self.gaussians._xyz.shape[0]
                     from utils.logging_utils import format_percentage
                     # 计算动态点比例（如果deformation_table存在）
                     if hasattr(self.gaussians, '_deformation_table') and self.gaussians._deformation_table.numel() > 0:

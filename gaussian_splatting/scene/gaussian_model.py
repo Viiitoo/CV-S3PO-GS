@@ -117,6 +117,27 @@ class GaussianModel:
         self.ply_input = None
 
         self.isotropic = False
+        
+        # ========== 轮廓提取相关参数 ==========
+        # _edge_mask: 边缘点标记 [N] bool
+        # True 表示该点是边缘点，False 表示非边缘点
+        # 用于PnP位姿估计时只使用边缘点，提高鲁棒性
+        self._edge_mask = torch.empty(0, dtype=torch.bool, device="cuda")
+        # _edge_points: 边缘点云 [M, 3] (M <= N)
+        # 存储提取出的边缘点，用于PnP
+        # 注意：现在会累积所有关键帧的边缘点，而不是只保留最后一帧
+        self._edge_points = None  # numpy array, 形状 [M, 3]
+        self._all_edge_points = []  # 用于累积所有关键帧的边缘点
+        # 是否启用轮廓提取
+        self.enable_edge_extraction = False
+        if config is not None and "enable_edge_extraction" in config.get("model_params", {}):
+            self.enable_edge_extraction = config["model_params"]["enable_edge_extraction"]
+        
+        # 输出轮廓提取配置状态
+        if self.enable_edge_extraction:
+            print("[轮廓提取] 已启用 - 将在点云创建时提取边缘点（累积模式）")
+        else:
+            print("[轮廓提取] 未启用 - 如需启用，请在配置文件中设置 model_params.enable_edge_extraction: true")
 
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
@@ -713,9 +734,117 @@ class GaussianModel:
             extrinsic=W2C,
             project_valid_depth_only=True,
         )
+        
+        # 获取下采样前的完整点云
+        original_xyz = np.asarray(pcd_tmp.points)
+        
+        # ========== 轮廓提取：在下采样之前提取边缘点 ==========
+        # 时间点说明：此时点云已经从MASt3R深度图创建完成，但还未下采样
+        # 在下采样前提取边缘点的好处：
+        # 1. 可以使用完整的点云信息，边缘特征更完整
+        # 2. 边缘点提取后再下采样，可以保留更多边缘信息
+        # 3. 点云坐标已经转换到世界坐标系
+        # 
+        # 改进：累积所有关键帧的边缘点，而不是只保留最后一帧
+        edge_mask_original = None
+        edge_points = None
+        if self.enable_edge_extraction:
+            try:
+                from utils.star_edge_extractor import STAREdgeExtractor
+                
+                # 创建提取器（使用单例模式避免重复加载模型）
+                if not hasattr(self, '_edge_extractor'):
+                    # 调整参数以适应点云：
+                    # - kk=26: 使用标准K近邻数量
+                    # - bw=10: 必须保持为10，因为网络期望10维描述符
+                    # - mu=0.15: 稍微增加细化参数，减少噪声
+                    # - max_points=70000: STAR-Edge内部临时下采样（1月14日版本使用此值）
+                    self._edge_extractor = STAREdgeExtractor(
+                        verbose=True,
+                        kk=26,  # K近邻数量
+                        bw=10,  # 必须保持为10（网络期望10维描述符）
+                        sampleNum=40,  # 采样数量 = bw * 4
+                        mu=0.15,  # 细化参数
+                        max_points=70000  # STAR-Edge临时下采样点数（与1月14日版本一致）
+                    )
+                
+                # 在下采样前的完整点云上提取边缘点
+                result = self._edge_extractor.extract_edges(
+                    original_xyz, 
+                    refine=True,
+                    return_details=False
+                )
+                edge_mask_original, edge_points = result
+                
+                # 累积边缘点（关键改进）
+                if edge_points is not None and len(edge_points) > 0:
+                    self._all_edge_points.append(edge_points.copy())
+                    # 合并所有累积的边缘点
+                    self._edge_points = np.vstack(self._all_edge_points)
+                    print(f"[轮廓提取] 累积边缘点: 当前帧 {len(edge_points)} 个, 总计 {len(self._edge_points)} 个")
+                
+            except Exception as e:
+                print(f"[WARNING] 轮廓提取失败: {e}")
+                print(f"[WARNING] 将使用全部点云进行后续处理")
+                import traceback
+                traceback.print_exc()
+                edge_mask_original = None
+                edge_points = None
+        
+        # 下采样点云
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
+        
+        # 在下采样后的点云中找出边缘点（通过最近邻匹配）
+        edge_mask = None
+        if self.enable_edge_extraction and edge_mask_original is not None:
+            try:
+                # 在下采样后的点云中找出哪些点在边缘点附近
+                # 使用距离阈值匹配：如果下采样后的点距离原始边缘点很近，则认为是边缘点
+                if edge_points is not None and len(edge_points) > 0:
+                    from scipy.spatial import cKDTree
+                    # 构建边缘点的KD树
+                    edge_tree = cKDTree(edge_points)
+                    # 为下采样后的每个点找最近的边缘点
+                    distances, indices = edge_tree.query(new_xyz, k=1)
+                    # 计算合理的距离阈值：使用点云密度的估计值
+                    # 估计点云的平均点间距离（通过点云的范围和点数量）
+                    if len(new_xyz) > 1:
+                        # 计算点云的包围盒
+                        xyz_range = new_xyz.max(axis=0) - new_xyz.min(axis=0)
+                        # 估算平均点间距离：使用包围盒体积的立方根除以点数
+                        volume = np.prod(xyz_range)
+                        if volume > 0:
+                            avg_point_distance = np.power(volume / len(new_xyz), 1.0/3.0)
+                        else:
+                            avg_point_distance = np.median(distances)
+                        # 使用平均点间距离的1.5倍作为阈值
+                        threshold = avg_point_distance * 1.5
+                    else:
+                        # 如果点太少，使用中位数距离
+                        threshold = np.median(distances) * 1.5 if len(distances) > 0 else 0.01
+                    edge_mask = distances < threshold
+                    print(f"[轮廓提取] 下采样后边缘点匹配: {edge_mask.sum()}/{len(new_xyz)} 个点被标记为边缘点 (阈值={threshold:.6f})")
+                    
+                    # 存储当前帧的边缘信息（对应下采样后的点云）
+                    self._edge_mask = torch.from_numpy(edge_mask).bool().cuda()
+                else:
+                    # 如果没有边缘点，则全部标记为False
+                    edge_mask = np.zeros(len(new_xyz), dtype=bool)
+                    self._edge_mask = torch.from_numpy(edge_mask).bool().cuda()
+            except Exception as e:
+                print(f"[WARNING] 下采样后边缘点匹配失败: {e}")
+                import traceback
+                traceback.print_exc()
+                # 如果匹配失败，使用空mask
+                edge_mask = np.zeros(len(new_xyz), dtype=bool)
+                self._edge_mask = torch.from_numpy(edge_mask).bool().cuda()
+        elif self.enable_edge_extraction:
+            # 如果启用了边缘提取但没有提取到边缘点，创建空mask
+            edge_mask = np.zeros(len(new_xyz), dtype=bool)
+            self._edge_mask = torch.from_numpy(edge_mask).bool().cuda()
+        
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
         )

@@ -27,6 +27,7 @@ from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.image_utils import psnr
 from gaussian_splatting.utils.loss_utils import ssim
 from gaussian_splatting.utils.system_utils import mkdir_p
+from gaussian_splatting.utils.graphics_utils import getWorld2View2
 from utils.logging_utils import Log
 
 def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
@@ -168,6 +169,103 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
     wandb.log({"frame_idx": latest_frame_idx, "ate": ate})
     return ate
 
+def project_3d_to_2d(points_3d, viewpoint):
+    """
+    将3D点投影到2D图像坐标
+    
+    Args:
+        points_3d: [N, 3] numpy array, 世界坐标系下的3D点
+        viewpoint: Camera对象，包含相机参数
+    
+    Returns:
+        points_2d: [N, 2] numpy array, 图像坐标 (u, v)
+        valid_mask: [N] bool array, 标记哪些点在图像范围内
+    """
+    if points_3d is None or len(points_3d) == 0:
+        return np.array([]), np.array([], dtype=bool)
+    
+    # 转换为torch tensor
+    points_3d_torch = torch.from_numpy(points_3d).float().cuda()
+    
+    # 世界坐标转视图坐标
+    W2C = getWorld2View2(viewpoint.R, viewpoint.T)
+    points_view = (W2C[:3, :3] @ points_3d_torch.T + W2C[:3, 3:4]).T
+    
+    # 检查深度（z > 0）
+    valid_depth = points_view[:, 2] > 0.1
+    
+    # 投影到图像平面
+    fx, fy = viewpoint.fx, viewpoint.fy
+    cx, cy = viewpoint.cx, viewpoint.cy
+    
+    u = (points_view[:, 0] / points_view[:, 2]) * fx + cx
+    v = (points_view[:, 1] / points_view[:, 2]) * fy + cy
+    
+    points_2d = torch.stack([u, v], dim=1).cpu().numpy()
+    
+    # 检查是否在图像范围内
+    valid_range = (
+        (points_2d[:, 0] >= 0) & (points_2d[:, 0] < viewpoint.image_width) &
+        (points_2d[:, 1] >= 0) & (points_2d[:, 1] < viewpoint.image_height)
+    )
+    
+    valid_mask = valid_depth.cpu().numpy() & valid_range
+    
+    return points_2d, valid_mask
+
+def draw_edges_on_image(rgb_image, edge_points_3d, viewpoint, 
+                        edge_color=(0, 255, 0), edge_thickness=2, max_points=10000,
+                        draw_lines=True, line_color=(255, 0, 0), line_thickness=1):
+    """
+    使用STAR-Edge 3D边缘点投影在RGB图像上绘制轮廓
+    
+    将STAR-Edge提取的3D边缘点投影到当前相机位姿的2D图像上，
+    以绿色圆点的方式叠加在渲染的RGB图像上。
+    
+    Args:
+        rgb_image: [H, W, 3] numpy array, RGB图像 (0-255)
+        edge_points_3d: [N, 3] numpy array, STAR-Edge提取的边缘点3D坐标
+        viewpoint: Camera对象
+        edge_color: tuple, 轮廓颜色 (R, G, B)，默认绿色
+        edge_thickness: int, 轮廓点大小
+        max_points: int, 最大显示点数
+        draw_lines: bool, 是否连接相邻边缘点形成轮廓线
+        line_color: tuple, 轮廓线颜色 (R, G, B)，默认红色
+        line_thickness: int, 轮廓线粗细
+    
+    Returns:
+        rgb_with_edges: [H, W, 3] numpy array, 带轮廓的RGB图像
+    """
+    if edge_points_3d is None or len(edge_points_3d) == 0:
+        return rgb_image.copy()
+    
+    # 投影3D点到2D
+    points_2d, valid_mask = project_3d_to_2d(edge_points_3d, viewpoint)
+    
+    if not valid_mask.any():
+        return rgb_image.copy()
+    
+    # 创建图像副本
+    rgb_with_edges = rgb_image.copy()
+    
+    # 只绘制有效的点
+    valid_points_2d = points_2d[valid_mask].astype(np.int32)
+    
+    # 如果点数太多，随机采样
+    if len(valid_points_2d) > max_points:
+        indices = np.random.choice(len(valid_points_2d), max_points, replace=False)
+        valid_points_2d = valid_points_2d[indices]
+    
+    # 绘制点（使用更鲜艳的颜色和稍大的点）
+    for point in valid_points_2d:
+        u, v = int(point[0]), int(point[1])
+        if 0 <= u < rgb_with_edges.shape[1] and 0 <= v < rgb_with_edges.shape[0]:
+            # 绘制带边框的点，使其更明显
+            cv2.circle(rgb_with_edges, (u, v), edge_thickness + 1, (0, 0, 0), -1)  # 黑色边框
+            cv2.circle(rgb_with_edges, (u, v), edge_thickness, edge_color, -1)  # 绿色填充
+    
+    return rgb_with_edges
+
 def eval_rendering(
     frames,
     gaussians,
@@ -199,6 +297,11 @@ def eval_rendering(
     depth_dir1 = os.path.join(save_dir, "render_depth_npy")
     if not os.path.exists(depth_dir1):
         os.makedirs(depth_dir1)
+    
+    # 添加轮廓RGB输出目录
+    render_rgb_with_edges_dir = os.path.join(save_dir, "render_rgb_with_edges")
+    if not os.path.exists(render_rgb_with_edges_dir):
+        os.makedirs(render_rgb_with_edges_dir)
     
     for idx in range(0, end_idx, interval):
         if idx in kf_indices:
@@ -294,6 +397,38 @@ def eval_rendering(
         save_path = os.path.join(render_dir, f"{idx}_pred.png")
         #pred_image.save(save_path, dpi=(300, 300))
         
+        # ========== 保存带轮廓信息的RGB图像 ==========
+        # 使用STAR-Edge 3D边缘点投影方法
+        # 将3D边缘点投影到当前相机位姿的2D图像上
+        try:
+            # 获取边缘点
+            edge_points_3d = None
+            if hasattr(gaussians, '_edge_points') and gaussians._edge_points is not None:
+                edge_points_3d = gaussians._edge_points
+            
+            if edge_points_3d is not None and len(edge_points_3d) > 0:
+                rgb_with_edges = draw_edges_on_image(
+                    pred,  # 渲染的RGB图像
+                    edge_points_3d,  # STAR-Edge提取的3D边缘点
+                    frame,  # 当前视角
+                    edge_color=(0, 255, 0),  # 绿色轮廓 (RGB格式)
+                    edge_thickness=2,  # 边缘点大小
+                    max_points=10000  # 最大显示点数
+                )
+            else:
+                # 如果没有边缘点，使用原始图像
+                rgb_with_edges = pred.copy()
+            
+            # 保存带轮廓的RGB图像
+            rgb_with_edges_image = Image.fromarray(rgb_with_edges)
+            save_path = os.path.join(render_rgb_with_edges_dir, f"{idx}_rgb_with_edges.png")
+            rgb_with_edges_image.save(save_path)
+        except Exception as e:
+            Log(f"Warning: Failed to draw edges on image {idx}: {e}", tag="Eval")
+            # 如果绘制失败，保存原始RGB图像
+            pred_image = Image.fromarray(pred)
+            save_path = os.path.join(render_rgb_with_edges_dir, f"{idx}_rgb_with_edges.png")
+            pred_image.save(save_path)
 
     output = dict()
     # Check if we have any successful renderings

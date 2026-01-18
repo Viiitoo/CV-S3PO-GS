@@ -172,6 +172,14 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     objectPoints = objectPoints.astype(np.float32)
     imagePoints = matches_im2.astype(np.float32)
 
+    # ========== 轮廓点用于PnP（已暂时禁用）==========
+    # 注意：轮廓提取功能仍然可用，提取的边缘点存储在 gaussians._edge_points 中
+    # 如果需要使用轮廓点进行PnP，可以取消下面的注释并实现匹配逻辑
+    # if hasattr(gaussians, 'enable_edge_extraction') and gaussians.enable_edge_extraction:
+    #     if hasattr(gaussians, '_edge_points') and gaussians._edge_points is not None:
+    #         # 使用轮廓点进行PnP的逻辑
+    #         pass
+
     # Skip PnP if there are not enough points
     if len(objectPoints) < 6 or len(imagePoints) < 6:
         print("Warning: Not enough points to perform PnP estimation.")
