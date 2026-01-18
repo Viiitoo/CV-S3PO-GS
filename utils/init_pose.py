@@ -19,9 +19,22 @@ import matplotlib.pyplot as plt
 
 from gaussian_splatting.gaussian_renderer import render_with_custom_resolution
 
+# 导入边缘提取模块
+from utils.edge_extraction import EdgeExtractor, create_edge_extractor
+
 import torchvision.transforms as tvf
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 ImgNorm = tvf.Compose([tvf.ToTensor(), tvf.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
+# 全局边缘提取器实例（延迟初始化）
+_edge_extractor = None
+
+def get_edge_extractor(config=None):
+    """获取或创建边缘提取器实例"""
+    global _edge_extractor
+    if _edge_extractor is None:
+        _edge_extractor = create_edge_extractor(config)
+    return _edge_extractor
 
 def _resize_pil_image(img, long_edge_size):
     S = max(img.size)
@@ -120,7 +133,27 @@ def depth_to_3d1(depth_map, K):
     return points_3d
 
 # Estimate relative pose and return rendered depth
-def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_params, background):
+def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_params, background, 
+             use_edge_enhancement=True, edge_config=None):
+    """
+    估计相对位姿，支持边缘增强匹配
+    
+    Args:
+        img1: 第一张图像 (关键帧)
+        img2: 第二张图像 (当前帧)
+        model: MASt3R模型
+        dist_coeffs: 畸变系数
+        viewpoint: 相机视点信息
+        gaussians: 高斯模型
+        pipeline_params: 渲染管线参数
+        background: 背景颜色
+        use_edge_enhancement: 是否使用边缘增强匹配（默认True）
+        edge_config: 边缘提取配置（可选）
+        
+    Returns:
+        pose_w2c: 相机位姿矩阵 (4x4)
+        render_depth: 渲染深度图
+    """
     device = 'cuda'
     schedule = 'cosine'
     lr = 0.01
@@ -171,14 +204,48 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     objectPoints = pts3d[matches_im1[:, 1].astype(int), matches_im1[:, 0].astype(int), :]
     objectPoints = objectPoints.astype(np.float32)
     imagePoints = matches_im2.astype(np.float32)
-
-    # ========== 轮廓点用于PnP（已暂时禁用）==========
-    # 注意：轮廓提取功能仍然可用，提取的边缘点存储在 gaussians._edge_points 中
-    # 如果需要使用轮廓点进行PnP，可以取消下面的注释并实现匹配逻辑
-    # if hasattr(gaussians, 'enable_edge_extraction') and gaussians.enable_edge_extraction:
-    #     if hasattr(gaussians, '_edge_points') and gaussians._edge_points is not None:
-    #         # 使用轮廓点进行PnP的逻辑
-    #         pass
+    
+    # ========== 边缘增强匹配 ==========
+    # 使用边缘特征对匹配点进行加权，提升边缘区域匹配的权重
+    edge_weights = None
+    if use_edge_enhancement and gaussians is not None and hasattr(gaussians, 'get_xyz'):
+        try:
+            edge_extractor = get_edge_extractor(edge_config)
+            
+            # 从高斯模型提取边缘mask
+            edge_mask, edge_pts_2d, edge_pts_3d = edge_extractor.process_frame(
+                gaussians, viewpoint, K=K_new, dist_coeffs=dist_coeffs
+            )
+            
+            if edge_mask is not None and len(matches_im1) > 0:
+                # 调整edge_mask大小以匹配缩放后的图像尺寸
+                if edge_mask.shape != (H1, W1):
+                    edge_mask = cv2.resize(edge_mask, (W1, H1), interpolation=cv2.INTER_LINEAR)
+                
+                # 计算匹配点的边缘权重
+                edge_weights = np.ones(len(matches_im1), dtype=np.float32)
+                for i, (p1, p2) in enumerate(zip(matches_im1, matches_im2)):
+                    x1, y1 = int(round(p1[0])), int(round(p1[1]))
+                    if 0 <= x1 < W1 and 0 <= y1 < H1:
+                        edge_score = edge_mask[y1, x1]
+                        # 边缘区域的匹配点获得更高权重（最高2倍）
+                        edge_weights[i] = 1.0 + edge_score
+                
+                # 根据权重筛选高置信度匹配点
+                # 保留权重高于平均值的匹配点，或者保留所有匹配点的前80%
+                if len(edge_weights) > 10:
+                    weight_threshold = np.percentile(edge_weights, 20)  # 保留80%的点
+                    high_weight_mask = edge_weights >= weight_threshold
+                    
+                    # 确保保留足够的匹配点
+                    if high_weight_mask.sum() >= 10:
+                        objectPoints = objectPoints[high_weight_mask]
+                        imagePoints = imagePoints[high_weight_mask]
+                        edge_weights = edge_weights[high_weight_mask]
+                        
+        except Exception as e:
+            # 如果边缘增强失败，静默继续使用原始匹配
+            pass
 
     # Skip PnP if there are not enough points
     if len(objectPoints) < 6 or len(imagePoints) < 6:

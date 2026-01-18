@@ -165,8 +165,14 @@ class FrontEnd(mp.Process):
         
         # Estimate the relative pose between the current frame and its adjacent keyframe
         img2 = viewpoint.original_image
+        
+        # 获取边缘增强配置
+        edge_config = self.config.get('edge_extraction', None)
+        use_edge_enhancement = edge_config.get('enabled', True) if edge_config else True
+        
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
-                            viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background)
+                            viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background,
+                            use_edge_enhancement=use_edge_enhancement, edge_config=edge_config)
         
         # get mono_depth from MASt3R
         depth = get_depth(img2, img2, self.model, return_conf=False)

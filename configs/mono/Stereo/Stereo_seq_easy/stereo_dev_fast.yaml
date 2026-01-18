@@ -1,0 +1,52 @@
+inherit_from: "configs/mono/Stereo/Stereo_seq_easy/base_config.yaml"
+
+# ========== 开发测试专用配置 ==========
+# 目的：快速验证代码修改，不追求渲染质量
+# 预计运行时间：约 2-5 分钟（取决于GPU）
+# 使用方法：python slam.py configs/mono/Stereo/Stereo_seq_easy/stereo_dev_fast.yaml
+
+Dataset:
+  begin: 0      # 从头开始（重要！保证初始化质量）
+  end: 30       # 只处理前30帧（快速测试）
+  dataset_path: "datasets/StereoMIS/stereo_seq_easy/stereo_seq_easy/train"
+  pcd_downsample: 512        # 更激进的下采样（原256）
+  pcd_downsample_init: 256   # 初始化也更激进（原128）
+  Calibration:
+    fx: 516.95
+    fy: 516.86
+    cx: 302.29
+    cy: 241.49
+    k1: -0.00020782629144378
+    k2: 0.000180254035512917
+    p1: 0.0
+    p2: 0.0
+    k3: 9.6945594123099e-05
+    width: 640
+    height: 480
+    depth_scale: 1000.0
+    distorted: False
+
+# ========== 训练参数优化（速度优先）==========
+Training:
+  init_itr_num: 500          # 减少初始化迭代（原1050）
+  tracking_itr_num: 50       # 减少跟踪迭代（原100）
+  mapping_itr_num: 100       # 减少建图迭代（原220）
+  mapping_itr_nosingle: 10   # 减少单帧映射迭代（原30）
+  kf_interval: 3             # 更频繁的关键帧（原5）
+  window_size: 4             # 更小的窗口（原8）
+  gaussian_update_every: 100 # 更频繁更新（原150）
+  alpha: 0.98
+
+opt_params:
+  iterations: 15000           # 减少总迭代（原30000）
+  densify_until_iter: 10000   # 更早停止密集化（原22000）
+  position_lr_init: 0.0016
+  position_lr_final: 0.00016
+  init_lr: 6
+
+# ========== 结果设置 ==========
+Results:
+  eval_rendering: true       # 保留评估（确认代码正确）
+  save_results: true
+  color_refinement: false    # 关闭颜色细化（节省时间）
+

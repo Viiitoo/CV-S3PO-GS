@@ -1,0 +1,51 @@
+inherit_from: "configs/mono/Stereo/Stereo_seq_easy/base_config.yaml"
+
+# ========== 开发测试配置（中等速度）==========
+# 目的：在合理时间内获得较好的渲染质量，用于功能验证
+# 预计运行时间：约 5-10 分钟
+# 使用方法：python slam.py configs/mono/Stereo/Stereo_seq_easy/stereo_dev_medium.yaml
+
+Dataset:
+  begin: 0      # 从头开始
+  end: 60       # 处理60帧（比fast多，但比full少）
+  dataset_path: "datasets/StereoMIS/stereo_seq_easy/stereo_seq_easy/train"
+  pcd_downsample: 256        # 保持原设置
+  pcd_downsample_init: 128   # 保持原设置
+  Calibration:
+    fx: 516.95
+    fy: 516.86
+    cx: 302.29
+    cy: 241.49
+    k1: -0.00020782629144378
+    k2: 0.000180254035512917
+    p1: 0.0
+    p2: 0.0
+    k3: 9.6945594123099e-05
+    width: 640
+    height: 480
+    depth_scale: 1000.0
+    distorted: False
+
+# ========== 训练参数（速度和质量平衡）==========
+Training:
+  init_itr_num: 700          # 中等初始化迭代（原1050）
+  tracking_itr_num: 70       # 中等跟踪迭代（原100）
+  mapping_itr_num: 150       # 中等建图迭代（原220）
+  mapping_itr_nosingle: 20   # 中等单帧映射迭代（原30）
+  kf_interval: 4             # 适中的关键帧间隔
+  window_size: 6             # 中等窗口大小
+  alpha: 0.98
+
+opt_params:
+  iterations: 20000           # 中等总迭代（原30000）
+  densify_until_iter: 15000   # 中等密集化终止点
+  position_lr_init: 0.0016
+  position_lr_final: 0.00016
+  init_lr: 6
+
+# ========== 结果设置 ==========
+Results:
+  eval_rendering: true
+  save_results: true
+  color_refinement: true     # 保留颜色细化
+

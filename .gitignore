@@ -44,3 +44,4 @@ results/
 # croco/
 submodules/**/third_party/**/doc/
 submodules/**/third_party/**/docs/
+STAR-Edge/
