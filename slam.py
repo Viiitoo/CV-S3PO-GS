@@ -278,11 +278,18 @@ if __name__ == "__main__":
         config["Results"]["color_refinement"] = True
 
     if config["Results"]["save_results"]:
-        mkdir_p(config["Results"]["save_dir"])
+        # Ensure base save_dir is just "results", not a full path
+        base_save_dir = config["Results"]["save_dir"]
+        if base_save_dir != "results" and "/" in base_save_dir:
+            # If save_dir contains a path, extract just "results" as base
+            base_save_dir = "results"
+            config["Results"]["save_dir"] = base_save_dir
+        
+        mkdir_p(base_save_dir)
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")   
         path = config["Dataset"]["dataset_path"].split("/")
         save_dir = os.path.join(
-            config["Results"]["save_dir"], path[-3] + "_" + path[-2], current_datetime
+            base_save_dir, path[-3] + "_" + path[-2], current_datetime
         )
         tmp = args.config
         tmp = tmp.split(".")[0]

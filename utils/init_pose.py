@@ -18,23 +18,183 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from gaussian_splatting.gaussian_renderer import render_with_custom_resolution
-
-# 导入边缘提取模块
-from utils.edge_extraction import EdgeExtractor, create_edge_extractor
+from utils.edge_extraction import EdgeExtractor
 
 import torchvision.transforms as tvf
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 ImgNorm = tvf.Compose([tvf.ToTensor(), tvf.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-# 全局边缘提取器实例（延迟初始化）
-_edge_extractor = None
+def _to_uint8_rgb(img):
+    """Convert torch(1x3xHxW / 3xHxW) or numpy(HWC/CHW) to uint8 HWC RGB."""
+    if isinstance(img, torch.Tensor):
+        x = img.detach().cpu()
+        if x.ndim == 4:
+            x = x[0]
+        if x.dtype.is_floating_point:
+            x = (x * 0.5 + 0.5).clamp(0, 1)
+            x = (x * 255.0).to(torch.uint8)
+        x = x.permute(1, 2, 0).contiguous().numpy()
+        return x
+    arr = img
+    if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[2] != 3:
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255)
+        if arr.max() <= 1.0:
+            arr = arr * 255.0
+        arr = arr.astype(np.uint8)
+    return arr
 
-def get_edge_extractor(config=None):
-    """获取或创建边缘提取器实例"""
-    global _edge_extractor
-    if _edge_extractor is None:
-        _edge_extractor = create_edge_extractor(config)
-    return _edge_extractor
+def _save_rgb_edge_pnp_viz(viz_dir,
+                           tag,
+                           rgb1_u8, rgb2_u8,
+                           edge1, edge2,
+                           matches1, matches2,
+                           weights=None,
+                           inliers=None,
+                           max_matches=300):
+    os.makedirs(viz_dir, exist_ok=True)
+
+    # edge masks
+    e1 = (np.clip(edge1, 0, 1) * 255).astype(np.uint8)
+    e2 = (np.clip(edge2, 0, 1) * 255).astype(np.uint8)
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge1.png"), e1)
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge2.png"), e2)
+
+    # overlays
+    ov1 = rgb1_u8.copy()
+    ov2 = rgb2_u8.copy()
+    ov1[..., 2] = np.maximum(ov1[..., 2], e1)  # red channel
+    ov2[..., 2] = np.maximum(ov2[..., 2], e2)
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_overlay1.png"), cv2.cvtColor(ov1, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_overlay2.png"), cv2.cvtColor(ov2, cv2.COLOR_RGB2BGR))
+
+    # weighted matches visualization
+    H1, W1 = rgb1_u8.shape[:2]
+    H2, W2 = rgb2_u8.shape[:2]
+    canvas_h = max(H1, H2)
+    canvas_w = W1 + W2
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    canvas[:H1, :W1] = rgb1_u8
+    canvas[:H2, W1:W1+W2] = rgb2_u8
+
+    N = len(matches1)
+    if N == 0:
+        cv2.imwrite(os.path.join(viz_dir, f"{tag}_matches.png"), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+        return
+
+    # subsample matches for drawing
+    if N > max_matches:
+        idx = np.random.choice(N, size=max_matches, replace=False)
+    else:
+        idx = np.arange(N)
+
+    inlier_set = set(inliers.reshape(-1).tolist()) if inliers is not None else None
+
+    if weights is None:
+        w = np.ones(N, dtype=np.float32)
+    else:
+        w = np.asarray(weights, dtype=np.float32).reshape(-1)
+        w = (w - w.min()) / (w.max() - w.min() + 1e-6)  # 0-1 for color mapping
+
+    for i in idx:
+        p1 = matches1[i]
+        p2 = matches2[i].copy()
+        p2[0] += W1
+        x1, y1 = int(round(p1[0])), int(round(p1[1]))
+        x2, y2 = int(round(p2[0])), int(round(p2[1]))
+        x1 = np.clip(x1, 0, W1 - 1)
+        y1 = np.clip(y1, 0, H1 - 1)
+        x2 = np.clip(x2, W1, W1 + W2 - 1)
+        y2 = np.clip(y2, 0, H2 - 1)
+
+        # color by weight: low=blue, high=yellow/red
+        ww = float(w[i])
+        color = (int(255 * (1 - ww)), int(255 * ww), int(255 * ww))  # RGB-ish
+        thickness = 1 + int(2 * ww)
+
+        if inlier_set is not None and i in inlier_set:
+            # highlight inliers: green
+            color = (0, 255, 0)
+            thickness = max(thickness, 2)
+
+        cv2.line(canvas, (x1, y1), (x2, y2), color=color, thickness=thickness, lineType=cv2.LINE_AA)
+
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_matches.png"), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+
+
+def _weighted_ransac_pnp(objectPoints: np.ndarray,
+                         imagePoints: np.ndarray,
+                         K: np.ndarray,
+                         dist_coeffs: np.ndarray,
+                         weights: np.ndarray,
+                         iterationsCount: int = 100,
+                         reprojectionError: float = 5.0,
+                         min_sample: int = 6,
+                         seed: int = 0):
+    """
+    加权RANSAC-PnP（偏置采样 + 加权inlier评分）。
+
+    OpenCV 的 solvePnPRansac 不支持 per-point 权重，这里用：
+    - 采样：按 weights 概率抽样最小集
+    - 评分：用 inliers 的 weight 之和作为 score（同时也能返回 inlier mask）
+    """
+    N = len(objectPoints)
+    if N < min_sample:
+        return False, None, None, None
+
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    w = np.clip(w, 1e-6, None)
+    p = w / w.sum()
+
+    rng = np.random.default_rng(seed)
+
+    best_score = -1.0
+    best_rvec, best_tvec = None, None
+    best_inliers = None
+
+    # 用 EPNP 做 minimal set 更稳（SQPNP 也可，但对极小样本偶尔不稳定）
+    for _ in range(iterationsCount):
+        try:
+            idx = rng.choice(N, size=min_sample, replace=False, p=p)
+        except ValueError:
+            idx = rng.choice(N, size=min_sample, replace=False)
+
+        ok, rvec, tvec = cv2.solvePnP(
+            objectPoints[idx], imagePoints[idx], K, dist_coeffs,
+            flags=cv2.SOLVEPNP_EPNP
+        )
+        if not ok:
+            continue
+
+        proj, _ = cv2.projectPoints(objectPoints, rvec, tvec, K, dist_coeffs)
+        proj = proj.reshape(-1, 2)
+        err = np.linalg.norm(proj - imagePoints, axis=1)
+        inlier_mask = err < reprojectionError
+        if inlier_mask.sum() < min_sample:
+            continue
+
+        score = float(w[inlier_mask].sum())
+        if score > best_score:
+            best_score = score
+            best_rvec, best_tvec = rvec, tvec
+            best_inliers = np.flatnonzero(inlier_mask).astype(np.int32)
+
+    if best_inliers is None:
+        return False, None, None, None
+
+    # 用所有inliers做一次迭代PnP精修
+    ok, rvec, tvec = cv2.solvePnP(
+        objectPoints[best_inliers], imagePoints[best_inliers],
+        K, dist_coeffs,
+        rvec=best_rvec, tvec=best_tvec, useExtrinsicGuess=True,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    if not ok:
+        # 退回最优解（通常也能用）
+        rvec, tvec = best_rvec, best_tvec
+        ok = True
+    return ok, rvec, tvec, best_inliers
 
 def _resize_pil_image(img, long_edge_size):
     S = max(img.size)
@@ -133,27 +293,8 @@ def depth_to_3d1(depth_map, K):
     return points_3d
 
 # Estimate relative pose and return rendered depth
-def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_params, background, 
-             use_edge_enhancement=True, edge_config=None):
-    """
-    估计相对位姿，支持边缘增强匹配
-    
-    Args:
-        img1: 第一张图像 (关键帧)
-        img2: 第二张图像 (当前帧)
-        model: MASt3R模型
-        dist_coeffs: 畸变系数
-        viewpoint: 相机视点信息
-        gaussians: 高斯模型
-        pipeline_params: 渲染管线参数
-        background: 背景颜色
-        use_edge_enhancement: 是否使用边缘增强匹配（默认True）
-        edge_config: 边缘提取配置（可选）
-        
-    Returns:
-        pose_w2c: 相机位姿矩阵 (4x4)
-        render_depth: 渲染深度图
-    """
+def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_params, background,
+             rgb_edge_pnp=None):
     device = 'cuda'
     schedule = 'cosine'
     lr = 0.01
@@ -204,48 +345,66 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     objectPoints = pts3d[matches_im1[:, 1].astype(int), matches_im1[:, 0].astype(int), :]
     objectPoints = objectPoints.astype(np.float32)
     imagePoints = matches_im2.astype(np.float32)
-    
-    # ========== 边缘增强匹配 ==========
-    # 使用边缘特征对匹配点进行加权，提升边缘区域匹配的权重
-    edge_weights = None
-    if use_edge_enhancement and gaussians is not None and hasattr(gaussians, 'get_xyz'):
+
+    # ---------- RGB(+可选深度) 轮廓加权 ----------
+    weights = None
+    cfg = rgb_edge_pnp or {}
+    viz_cfg = cfg.get("viz", {}) if isinstance(cfg, dict) else {}
+    viz_enabled = bool(viz_cfg.get("enabled", False))
+    viz_every = int(viz_cfg.get("viz_every", 1))
+    viz_dir = viz_cfg.get("dir", None)
+    tag = viz_cfg.get("tag", None)
+    if cfg.get("enabled", False):
         try:
-            edge_extractor = get_edge_extractor(edge_config)
-            
-            # 从高斯模型提取边缘mask
-            edge_mask, edge_pts_2d, edge_pts_3d = edge_extractor.process_frame(
-                gaussians, viewpoint, K=K_new, dist_coeffs=dist_coeffs
+            extractor = EdgeExtractor()
+
+            # matches 的坐标系对应 view['img'] 的分辨率（H1,W1）
+            rgb1 = view1["img"]  # 1x3xH1xW1, normalized
+            rgb2 = view2["img"]
+
+            use_depth = bool(cfg.get("use_depth", False))
+            depth_np = render_depth.detach().cpu().numpy()
+
+            edge_mask1 = extractor.extract_edges_from_rgb_and_depth(
+                rgb1,
+                depth_map=depth_np if use_depth else None,
+                rgb_method=cfg.get("rgb_method", "canny"),
+                depth_method=cfg.get("depth_method", "combined"),
+                fuse=cfg.get("fuse", "max"),
+                rgb_weight=float(cfg.get("rgb_weight", 1.0)),
+                depth_weight=float(cfg.get("depth_weight", 1.0)),
+                canny_low=int(cfg.get("canny_low", 50)),
+                canny_high=int(cfg.get("canny_high", 150)),
+                dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
+                blur_ksize=int(cfg.get("blur_ksize", 3)),
             )
-            
-            if edge_mask is not None and len(matches_im1) > 0:
-                # 调整edge_mask大小以匹配缩放后的图像尺寸
-                if edge_mask.shape != (H1, W1):
-                    edge_mask = cv2.resize(edge_mask, (W1, H1), interpolation=cv2.INTER_LINEAR)
-                
-                # 计算匹配点的边缘权重
-                edge_weights = np.ones(len(matches_im1), dtype=np.float32)
-                for i, (p1, p2) in enumerate(zip(matches_im1, matches_im2)):
-                    x1, y1 = int(round(p1[0])), int(round(p1[1]))
-                    if 0 <= x1 < W1 and 0 <= y1 < H1:
-                        edge_score = edge_mask[y1, x1]
-                        # 边缘区域的匹配点获得更高权重（最高2倍）
-                        edge_weights[i] = 1.0 + edge_score
-                
-                # 根据权重筛选高置信度匹配点
-                # 保留权重高于平均值的匹配点，或者保留所有匹配点的前80%
-                if len(edge_weights) > 10:
-                    weight_threshold = np.percentile(edge_weights, 20)  # 保留80%的点
-                    high_weight_mask = edge_weights >= weight_threshold
-                    
-                    # 确保保留足够的匹配点
-                    if high_weight_mask.sum() >= 10:
-                        objectPoints = objectPoints[high_weight_mask]
-                        imagePoints = imagePoints[high_weight_mask]
-                        edge_weights = edge_weights[high_weight_mask]
-                        
+            edge_mask2 = extractor.extract_edges_from_rgb_and_depth(
+                rgb2,
+                depth_map=depth_np if use_depth else None,
+                rgb_method=cfg.get("rgb_method", "canny"),
+                depth_method=cfg.get("depth_method", "combined"),
+                fuse=cfg.get("fuse", "max"),
+                rgb_weight=float(cfg.get("rgb_weight", 1.0)),
+                depth_weight=float(cfg.get("depth_weight", 1.0)),
+                canny_low=int(cfg.get("canny_low", 50)),
+                canny_high=int(cfg.get("canny_high", 150)),
+                dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
+                blur_ksize=int(cfg.get("blur_ksize", 3)),
+            )
+
+            weights, _ = extractor.enhance_matches_with_edges(
+                matches_im1.astype(np.float32),
+                matches_im2.astype(np.float32),
+                edge_mask1.astype(np.float32),
+                edge_mask2.astype(np.float32),
+                weight=float(cfg.get("edge_weight", 2.0)),
+            )
         except Exception as e:
-            # 如果边缘增强失败，静默继续使用原始匹配
-            pass
+            # 轮廓增强失败时自动回退（不影响主流程）
+            weights = None
+            edge_mask1, edge_mask2 = None, None
+    else:
+        edge_mask1, edge_mask2 = None, None
 
     # Skip PnP if there are not enough points
     if len(objectPoints) < 6 or len(imagePoints) < 6:
@@ -253,9 +412,60 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
         print("Number of points:", len(objectPoints))
         success = False
     else:
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(
-            objectPoints, imagePoints, K_new, dist_coeffs, iterationsCount=100, reprojectionError=5, flags=cv2.SOLVEPNP_SQPNP
-        )
+        if weights is None:
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                objectPoints, imagePoints, K_new, dist_coeffs,
+                iterationsCount=int(cfg.get("iterations", 100)),
+                reprojectionError=float(cfg.get("reproj_error", 5.0)),
+                flags=cv2.SOLVEPNP_SQPNP
+            )
+        else:
+            success, rvec, tvec, inliers = _weighted_ransac_pnp(
+                objectPoints, imagePoints, K_new, dist_coeffs,
+                weights=weights,
+                iterationsCount=int(cfg.get("iterations", 100)),
+                reprojectionError=float(cfg.get("reproj_error", 5.0)),
+                min_sample=int(cfg.get("min_sample", 6)),
+                seed=int(cfg.get("seed", 0)),
+            )
+
+    # ---------- 可视化输出 ----------
+    try:
+        if viz_enabled and viz_dir is not None and tag is not None and (int(viz_cfg.get("frame_idx", 0)) % viz_every == 0):
+            if edge_mask1 is None or edge_mask2 is None:
+                # 若未启用加权，但要求可视化，则至少做RGB边缘
+                extractor = EdgeExtractor()
+                rgb1 = view1["img"]
+                rgb2 = view2["img"]
+                edge_mask1 = extractor.extract_edges_from_rgb(rgb1,
+                                                             method=cfg.get("rgb_method", "canny"),
+                                                             canny_low=int(cfg.get("canny_low", 50)),
+                                                             canny_high=int(cfg.get("canny_high", 150)),
+                                                             dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
+                                                             blur_ksize=int(cfg.get("blur_ksize", 3)))
+                edge_mask2 = extractor.extract_edges_from_rgb(rgb2,
+                                                             method=cfg.get("rgb_method", "canny"),
+                                                             canny_low=int(cfg.get("canny_low", 50)),
+                                                             canny_high=int(cfg.get("canny_high", 150)),
+                                                             dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
+                                                             blur_ksize=int(cfg.get("blur_ksize", 3)))
+            rgb1_u8 = _to_uint8_rgb(view1["img"])
+            rgb2_u8 = _to_uint8_rgb(view2["img"])
+            _save_rgb_edge_pnp_viz(
+                viz_dir=viz_dir,
+                tag=tag,
+                rgb1_u8=rgb1_u8,
+                rgb2_u8=rgb2_u8,
+                edge1=edge_mask1,
+                edge2=edge_mask2,
+                matches1=matches_im1.astype(np.float32),
+                matches2=matches_im2.astype(np.float32),
+                weights=weights,
+                inliers=inliers if success else None,
+                max_matches=int(viz_cfg.get("max_matches", 300)),
+            )
+    except Exception:
+        pass
     
     if success:
         R, _ = cv2.Rodrigues(rvec)

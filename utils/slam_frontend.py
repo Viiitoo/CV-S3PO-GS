@@ -165,14 +165,21 @@ class FrontEnd(mp.Process):
         
         # Estimate the relative pose between the current frame and its adjacent keyframe
         img2 = viewpoint.original_image
-        
-        # 获取边缘增强配置
-        edge_config = self.config.get('edge_extraction', None)
-        use_edge_enhancement = edge_config.get('enabled', True) if edge_config else True
-        
+        rgb_edge_pnp_cfg = self.config.get("rgb_edge_pnp", None)
+        if isinstance(rgb_edge_pnp_cfg, dict):
+            # 为可视化补充运行期信息（不污染原config引用）
+            _cfg = dict(rgb_edge_pnp_cfg)
+            viz = dict(_cfg.get("viz", {}))
+            if viz.get("enabled", False):
+                viz_dir = os.path.join(self.save_dir, "viz_rgb_edge_pnp")
+                viz["dir"] = viz_dir
+                viz["frame_idx"] = int(cur_frame_idx)
+                viz["tag"] = "f{:06d}_kf{:06d}".format(int(cur_frame_idx), int(last_keyframe_idx))
+            _cfg["viz"] = viz
+            rgb_edge_pnp_cfg = _cfg
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
                             viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background,
-                            use_edge_enhancement=use_edge_enhancement, edge_config=edge_config)
+                            rgb_edge_pnp=rgb_edge_pnp_cfg)
         
         # get mono_depth from MASt3R
         depth = get_depth(img2, img2, self.model, return_conf=False)
