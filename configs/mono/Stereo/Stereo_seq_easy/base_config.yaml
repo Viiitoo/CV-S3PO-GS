@@ -16,7 +16,7 @@ Dataset:
   adaptive_pointsize: true
   begin: 0
   dataset_path: datasets/StereoMIS/stereo_seq_easy/stereo_seq_easy/train
-  depth_loss: false
+  depth_loss: true
   pcd_downsample: 256
   pcd_downsample_init: 128
   point_size: 0.003
@@ -69,7 +69,7 @@ Training:
   window_size: 8
 config_file_path: configs/mono/Stereo/Stereo_seq_easy/stereo_full.yaml
 depth:
-  error_threshold: 0.1
+  error_threshold: 0.08
   final_error_threshold: 0.15
   mean_threshold: 0.3
   min_accurate_pixels_ratio: 0.01
@@ -114,9 +114,9 @@ rgb_edge_pnp:
   edge_weight: 2.0
   enabled: true
   fuse: max
-  iterations: 100
-  min_sample: 6
-  reproj_error: 5.0
+  iterations: 200
+  min_sample: 4
+  reproj_error: 8.0
   rgb_method: canny
   rgb_weight: 1.0
   seed: 0

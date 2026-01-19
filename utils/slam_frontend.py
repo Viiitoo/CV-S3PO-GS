@@ -297,7 +297,8 @@ class FrontEnd(mp.Process):
         intersection = torch.logical_and(
             cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
         ).count_nonzero()
-        point_ratio_2 = intersection / union
+        # Avoid division-by-zero if both visibility masks are empty.
+        point_ratio_2 = intersection / (union + 1e-6)
 
         rel = pose_CW @ torch.linalg.inv(last_kf_CW)
 
@@ -314,10 +315,10 @@ class FrontEnd(mp.Process):
         
         # rotation_check = dist_total > kf_translation * self.median_depth
         # rotation_check2 = dist_total > kf_min_translation * self.median_depth
-        return True
-        return (rot_equiv > alpha * self.median_depth) or dist_check or (point_ratio_2 < kf_overlap and dist_check2)
-
-        return (point_ratio_2 < kf_overlap and dist_check2) or dist_check     # Small co-visibility or large camera motion
+        # Keyframe if we have enough motion (translation or rotation), or low co-visibility with minimum motion.
+        return (rot_equiv > alpha * self.median_depth) or dist_check or (
+            (point_ratio_2 < kf_overlap) and dist_check2
+        )
     
     # Add current frame to the window and remove the least important keyframe based on overlap ratio to keep window size within limit
     def add_to_window(
