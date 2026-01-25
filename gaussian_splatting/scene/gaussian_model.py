@@ -724,6 +724,30 @@ class GaussianModel:
         )
         self.ply_input = pcd
 
+        # 如果是初始化，保存初始化的ply文件
+        if init:
+            try:
+                # 从config中获取保存路径
+                save_dir = None
+                if self.config is not None and "Results" in self.config:
+                    save_dir = self.config["Results"].get("save_dir", None)
+                
+                if save_dir is not None:
+                    # 创建保存目录
+                    init_ply_dir = os.path.join(save_dir, "init_ply")
+                    mkdir_p(init_ply_dir)
+                    
+                    # 使用Open3D保存点云
+                    o3d_pcd = o3d.geometry.PointCloud()
+                    o3d_pcd.points = o3d.utility.Vector3dVector(new_xyz)
+                    o3d_pcd.colors = o3d.utility.Vector3dVector(new_rgb)
+                    
+                    ply_path = os.path.join(init_ply_dir, "initialized_point_cloud.ply")
+                    o3d.io.write_point_cloud(ply_path, o3d_pcd)
+                    print(f"[初始化] 已保存初始化的PLY文件: {ply_path} (点数: {len(new_xyz)})")
+            except Exception as e:
+                print(f"[WARNING] 保存初始化PLY文件失败: {e}")
+
         fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()     
         fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())   
         features = (

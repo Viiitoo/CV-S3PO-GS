@@ -200,6 +200,14 @@ def eval_rendering(
     if not os.path.exists(depth_dir1):
         os.makedirs(depth_dir1)
     
+    # 创建保存ply文件的目录
+    ply_dir = os.path.join(save_dir, "render_ply")
+    if not os.path.exists(ply_dir):
+        os.makedirs(ply_dir)
+    
+    # 标记是否已保存ply文件（评估时模型不会改变，只需保存一次）
+    ply_saved = False
+    
     for idx in range(0, end_idx, interval):
         if idx in kf_indices:
             continue
@@ -215,6 +223,16 @@ def eval_rendering(
             # Skip this frame if rendering failed
             saved_frame_idx.pop()  # Remove the idx we just added
             continue
+        
+        # 保存渲染所使用的ply文件（只需保存一次，因为评估时模型不会改变）
+        if not ply_saved and hasattr(gaussians, 'save_ply'):
+            try:
+                ply_path = os.path.join(ply_dir, f"point_cloud_{iteration}.ply")
+                gaussians.save_ply(ply_path)
+                Log(f"已保存渲染使用的PLY文件: {ply_path}", tag="Eval")
+                ply_saved = True
+            except Exception as e:
+                Log(f"保存PLY文件失败: {e}", tag="Eval")
         
         rendering = render_pkg["render"]
         

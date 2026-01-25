@@ -419,6 +419,22 @@ class BackEnd(mp.Process):
                         # 只保留关键信息，如动态点比例等（在update_deformation_table中输出）
                         pass
                 
+                pcd_save_interval = self.config["Results"].get("pcd_save_interval", 1000) 
+            
+                if self.save_dir and self.iteration_count_global % pcd_save_interval == 0:
+                    # 构造保存路径
+                    pcd_path = os.path.join(self.save_dir, "point_clouds", f"iteration_{self.iteration_count_global}.ply")
+                    os.makedirs(os.path.dirname(pcd_path), exist_ok=True)
+                    
+                    # 调用 GaussianModel 的 save_ply 方法
+                    if hasattr(self.gaussians, 'save_ply'):
+                        self.gaussians.save_ply(pcd_path)
+                        Log(f"已保存点云 | 迭代: [cyan]{self.iteration_count_global}[/cyan] | 路径: {pcd_path}", tag="IO")
+                    else:
+                        Log("错误: self.gaussians 对象没有 save_ply 方法", tag="Error")
+
+
+
                 # 保存checkpoint（参考EH-SurGS的方式）
                 if self.save_dir and len(self.checkpoint_iterations) > 0:
                     if self.iteration_count_global in self.checkpoint_iterations:
