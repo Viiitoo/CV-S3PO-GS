@@ -17,9 +17,10 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 from utils.init_pose import get_pose, get_depth
 from utils.depth_utils import process_depth
-from utils.flow_utils import init_optical_flow_model, compute_optical_flow
-from utils.warp_utils import calculate_camera_flow
-from utils.flow_viz import save_flow_visualization
+# 延迟导入光流相关模块，避免在未启用光流时也需要yacs依赖
+# from utils.flow_utils import init_optical_flow_model, compute_optical_flow
+# from utils.warp_utils import calculate_camera_flow
+# from utils.flow_viz import save_flow_visualization
 
 class FrontEnd(mp.Process):
     def __init__(self, config, model, save_dir=None):
@@ -89,17 +90,25 @@ class FrontEnd(mp.Process):
         self.flow_visualization = self.config.get("Training", {}).get("flow_visualization", False)
         self.use_gt_pose = self.config.get("Training", {}).get("use_gt_pose", False)
         
-        # 初始化光流模型
+        # 初始化光流模型（延迟导入，避免未启用光流时也需要yacs依赖）
         if self.use_optical_flow or self.use_camera_flow:
-            flow_config = self.config.get("Flow", {})
-            model_path = flow_config.get("model_path", "./gmflow/checkpoints/gmflow_sintel-0c07dcb3.pth")
             try:
+                from utils.flow_utils import init_optical_flow_model
+                flow_config = self.config.get("Flow", {})
+                model_path = flow_config.get("model_path", "./gmflow/checkpoints/gmflow_sintel-0c07dcb3.pth")
                 self.flownet = init_optical_flow_model(model_path)
                 Log("光流模型初始化成功", tag="Flow")
+            except ImportError as e:
+                Log(f"光流模块导入失败: {e}", tag="Flow")
+                Log("提示: 如果不需要光流功能，请在配置文件中设置 use_optical_flow: False 和 use_camera_flow: False", tag="Flow")
+                self.use_optical_flow = False
+                self.use_camera_flow = False
+                self.flownet = None
             except Exception as e:
                 Log(f"光流模型初始化失败: {e}", tag="Flow")
                 self.use_optical_flow = False
                 self.use_camera_flow = False
+                self.flownet = None
         
         # 创建光流可视化目录
         if self.flow_visualization:
@@ -221,28 +230,38 @@ class FrontEnd(mp.Process):
         
         # 计算光流（如果启用）
         if (self.use_optical_flow or self.use_camera_flow) and self.flownet is not None:
-            # 获取当前帧和下一帧图像
-            gt_image = viewpoint.original_image.cuda()  # (C, H, W), 范围 [0, 1]
-            
-            # 获取下一帧（如果存在）
-            next_frame_idx = cur_frame_idx + 1
-            if next_frame_idx < len(self.dataset):
-                # 从dataset加载下一帧图像
-                next_gt_color, _, _, _ = self.dataset[next_frame_idx]
-                next_gt_image = next_gt_color.cuda()  # (C, H, W), 范围 [0, 1]
+            try:
+                from utils.flow_utils import compute_optical_flow
+                from utils.warp_utils import calculate_camera_flow
+                from utils.flow_viz import save_flow_visualization
                 
-                # 计算optical flow
-                if self.use_optical_flow:
-                    if cur_frame_idx < len(self.flow_2d_gt_list):
-                        # 使用缓存的光流
-                        flow_2d_gt = self.flow_2d_gt_list[cur_frame_idx]
-                    else:
-                        # 计算新的光流
-                        flow_2d_gt = compute_optical_flow(gt_image, next_gt_image, self.flownet)
-                        self.flow_2d_gt_list.append(flow_2d_gt)
+                # 获取当前帧和下一帧图像
+                gt_image = viewpoint.original_image.cuda()  # (C, H, W), 范围 [0, 1]
+                
+                # 获取下一帧（如果存在）
+                next_frame_idx = cur_frame_idx + 1
+                flow_2d_gt = None  # 初始化为None，确保变量存在
+                camera_flow = None
+                motion_flow = None
+                
+                if next_frame_idx < len(self.dataset):
+                    # 从dataset加载下一帧图像
+                    next_gt_color, _, _, _ = self.dataset[next_frame_idx]
+                    next_gt_image = next_gt_color.cuda()  # (C, H, W), 范围 [0, 1]
+                    
+                    # 计算optical flow
+                    if self.use_optical_flow:
+                        if cur_frame_idx < len(self.flow_2d_gt_list):
+                            # 使用缓存的光流
+                            flow_2d_gt = self.flow_2d_gt_list[cur_frame_idx]
+                        else:
+                            # 计算新的光流
+                            flow_2d_gt = compute_optical_flow(gt_image, next_gt_image, self.flownet)
+                            self.flow_2d_gt_list.append(flow_2d_gt)
                 
                 # 计算camera flow（使用Mast3r预测的深度）
-                if self.use_camera_flow:
+                # 注意：camera flow也需要下一帧存在
+                if self.use_camera_flow and next_frame_idx < len(self.dataset):
                     # 获取下一帧的相机对象（如果存在）
                     if next_frame_idx in self.cameras:
                         viewpoint_next = self.cameras[next_frame_idx]
@@ -285,30 +304,44 @@ class FrontEnd(mp.Process):
                     else:
                         camera_flow = calculate_camera_flow(mono_depth_tensor, viewpoint, viewpoint_next)
                     
-                    # 计算motion flow
-                    if self.use_optical_flow:
+                    # 计算motion flow（需要optical flow和camera flow都存在）
+                    if self.use_optical_flow and flow_2d_gt is not None and camera_flow is not None:
                         motion_flow = flow_2d_gt - camera_flow
                     
-                    # 保存可视化
-                    if self.flow_visualization:
-                        if self.use_optical_flow:
+                    # 保存可视化（只有当下一帧存在时才保存）
+                    if self.flow_visualization and next_frame_idx < len(self.dataset):
+                        if self.use_optical_flow and flow_2d_gt is not None:
                             save_flow_visualization(
                                 flow_2d_gt,
                                 os.path.join(self.flow_viz_dir, f"optical_flow_{cur_frame_idx:06d}.png"),
                                 f"Optical Flow Frame {cur_frame_idx}"
                             )
-                        if self.use_camera_flow:
+                        if self.use_camera_flow and camera_flow is not None:
                             save_flow_visualization(
                                 camera_flow,
                                 os.path.join(self.flow_viz_dir, f"camera_flow_{cur_frame_idx:06d}.png"),
                                 f"Camera Flow Frame {cur_frame_idx}"
                             )
-                        if self.use_optical_flow and self.use_camera_flow:
+                        if self.use_optical_flow and self.use_camera_flow and motion_flow is not None:
                             save_flow_visualization(
                                 motion_flow,
                                 os.path.join(self.flow_viz_dir, f"motion_flow_{cur_frame_idx:06d}.png"),
                                 f"Motion Flow Frame {cur_frame_idx}"
                             )
+                else:
+                    # 最后一帧：没有下一帧，无法计算光流
+                    if self.flow_visualization:
+                        Log(f"帧 {cur_frame_idx} 是最后一帧，无法计算光流（需要下一帧）", tag="Flow")
+            except ImportError as e:
+                # 如果导入失败，说明光流相关模块不可用
+                Log(f"光流计算失败（模块导入错误）: {e}", tag="Flow")
+                pass
+            except Exception as e:
+                # 其他错误也记录但不中断程序
+                import traceback
+                Log(f"光流计算失败: {e}", tag="Flow")
+                Log(f"详细错误: {traceback.format_exc()}", tag="Flow")
+                pass
         
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)

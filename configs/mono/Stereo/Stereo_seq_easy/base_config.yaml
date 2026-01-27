@@ -33,6 +33,10 @@ Results:
   use_gui: false
   use_wandb: false
 Training:
+  use_optical_flow: True
+  use_camera_flow: True
+  flow_visualization: True
+  use_gt_pose: True  # 使用真值位姿计算camera flow
   a_invalid: 1.1
   a_valid: 0.1
   alpha: 0.98
