@@ -47,6 +47,10 @@ Training:
   prune_num: 1
   single_thread: False
   spherical_harmonics: False
+  use_gt_pose: False  # 使用真值位姿模式（用于测试光流功能）
+  use_optical_flow: False  # 启用optical flow计算
+  use_camera_flow: False  # 启用camera flow计算
+  flow_visualization: False  # 是否保存光流可视化图像
 
   mapping_itr_nosingle: 10
   a_invalid: 0.5
@@ -94,3 +98,7 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
+
+Flow:
+  model_path: "./gmflow/checkpoints/gmflow_sintel-0c07dcb3.pth"
+  model_type: "gmflow"  # 可选: gmflow, raft, flowformer

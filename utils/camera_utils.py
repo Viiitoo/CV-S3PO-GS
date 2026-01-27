@@ -110,6 +110,30 @@ class Camera(nn.Module):
     def camera_center(self):
         return self.world_view_transform.inverse()[3, :3]
 
+    @property
+    def extrinsic(self):
+        """
+        获取4x4外参矩阵（world to camera）
+        从R和T构建
+        """
+        T_matrix = torch.eye(4, device=self.device)
+        T_matrix[:3, :3] = self.R
+        T_matrix[:3, 3] = self.T
+        return T_matrix
+
+    @property
+    def intrinsic(self):
+        """
+        获取4x4内参矩阵
+        从fx, fy, cx, cy构建
+        """
+        K = torch.eye(4, device=self.device)
+        K[0, 0] = self.fx
+        K[1, 1] = self.fy
+        K[0, 2] = self.cx
+        K[1, 2] = self.cy
+        return K
+
     def update_RT(self, R, t):
         self.R = R.to(device=self.device)
         self.T = t.to(device=self.device)

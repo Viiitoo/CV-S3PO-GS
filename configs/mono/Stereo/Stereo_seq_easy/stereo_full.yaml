@@ -27,5 +27,15 @@ opt_params:
 Training:
     alpha: 0.98
     mapping_itr_nosingle: 30
+    # 光流相关配置（可选，默认从base_config继承）
+    use_gt_pose: True  # 使用真值位姿模式（用于测试光流功能）
+    # use_optical_flow: False  # 启用optical flow计算
+    # use_camera_flow: False  # 启用camera flow计算
+    # flow_visualization: False  # 是否保存光流可视化图像
+
+# Flow配置（可选，默认从base_config继承）
+# Flow:
+#   model_path: "./gmflow/checkpoints/gmflow_sintel-0c07dcb3.pth"
+#   model_type: "gmflow"  # 可选: gmflow, raft, flowformer
 
 

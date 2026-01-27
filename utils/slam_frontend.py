@@ -17,6 +17,9 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 from utils.init_pose import get_pose, get_depth
 from utils.depth_utils import process_depth
+from utils.flow_utils import init_optical_flow_model, compute_optical_flow
+from utils.warp_utils import calculate_camera_flow
+from utils.flow_viz import save_flow_visualization
 
 class FrontEnd(mp.Process):
     def __init__(self, config, model, save_dir=None):
@@ -56,6 +59,14 @@ class FrontEnd(mp.Process):
         
         self.model = model  # MASt3R Model
         self.theta = 0
+        
+        # 光流相关初始化
+        self.flownet = None
+        self.flow_2d_gt_list = []  # 缓存光流结果
+        self.use_optical_flow = False
+        self.use_camera_flow = False
+        self.flow_visualization = False
+        self.use_gt_pose = False
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -70,7 +81,30 @@ class FrontEnd(mp.Process):
         self.plot_dir = os.path.join(self.save_dir, "plot")
         
         if self.save_results:
-            os.makedirs(self.plot_dir, exist_ok=True)       
+            os.makedirs(self.plot_dir, exist_ok=True)
+        
+        # 读取光流相关配置
+        self.use_optical_flow = self.config.get("Training", {}).get("use_optical_flow", False)
+        self.use_camera_flow = self.config.get("Training", {}).get("use_camera_flow", False)
+        self.flow_visualization = self.config.get("Training", {}).get("flow_visualization", False)
+        self.use_gt_pose = self.config.get("Training", {}).get("use_gt_pose", False)
+        
+        # 初始化光流模型
+        if self.use_optical_flow or self.use_camera_flow:
+            flow_config = self.config.get("Flow", {})
+            model_path = flow_config.get("model_path", "./gmflow/checkpoints/gmflow_sintel-0c07dcb3.pth")
+            try:
+                self.flownet = init_optical_flow_model(model_path)
+                Log("光流模型初始化成功", tag="Flow")
+            except Exception as e:
+                Log(f"光流模型初始化失败: {e}", tag="Flow")
+                self.use_optical_flow = False
+                self.use_camera_flow = False
+        
+        # 创建光流可视化目录
+        if self.flow_visualization:
+            self.flow_viz_dir = os.path.join(self.save_dir, "flow_viz")
+            os.makedirs(self.flow_viz_dir, exist_ok=True)       
     
     # Add a new keyframe. Create valid pixel mask using RGB boundary threshold from config, then generate initial depth map
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
@@ -184,6 +218,97 @@ class FrontEnd(mp.Process):
         # get mono_depth from MASt3R
         depth = get_depth(img2, img2, self.model, return_conf=False)
         viewpoint.mono_depth = depth
+        
+        # 计算光流（如果启用）
+        if (self.use_optical_flow or self.use_camera_flow) and self.flownet is not None:
+            # 获取当前帧和下一帧图像
+            gt_image = viewpoint.original_image.cuda()  # (C, H, W), 范围 [0, 1]
+            
+            # 获取下一帧（如果存在）
+            next_frame_idx = cur_frame_idx + 1
+            if next_frame_idx < len(self.dataset):
+                # 从dataset加载下一帧图像
+                next_gt_color, _, _, _ = self.dataset[next_frame_idx]
+                next_gt_image = next_gt_color.cuda()  # (C, H, W), 范围 [0, 1]
+                
+                # 计算optical flow
+                if self.use_optical_flow:
+                    if cur_frame_idx < len(self.flow_2d_gt_list):
+                        # 使用缓存的光流
+                        flow_2d_gt = self.flow_2d_gt_list[cur_frame_idx]
+                    else:
+                        # 计算新的光流
+                        flow_2d_gt = compute_optical_flow(gt_image, next_gt_image, self.flownet)
+                        self.flow_2d_gt_list.append(flow_2d_gt)
+                
+                # 计算camera flow（使用Mast3r预测的深度）
+                if self.use_camera_flow:
+                    # 获取下一帧的相机对象（如果存在）
+                    if next_frame_idx in self.cameras:
+                        viewpoint_next = self.cameras[next_frame_idx]
+                    else:
+                        # 创建临时相机对象用于计算camera flow
+                        # 使用当前帧的位姿作为初始估计（实际应该使用下一帧的位姿）
+                        viewpoint_next = Camera.init_from_dataset(self.dataset, next_frame_idx, 
+                                                                  viewpoint.projection_matrix)
+                        # 如果使用真值位姿，使用真值
+                        if self.use_gt_pose:
+                            viewpoint_next.update_RT(viewpoint_next.R_gt, viewpoint_next.T_gt)
+                    
+                    # 准备深度数据：使用Mast3r预测的深度
+                    mono_depth_tensor = torch.from_numpy(viewpoint.mono_depth).float().cuda()
+                    # calculate_camera_flow期望输入为 (B) (1) H W 格式
+                    if len(mono_depth_tensor.shape) == 2:
+                        mono_depth_tensor = mono_depth_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                    
+                    # 如果使用真值位姿，创建临时相机对象使用真值位姿
+                    if self.use_gt_pose:
+                        cam1_gt = Camera(
+                            viewpoint.uid, viewpoint.original_image, viewpoint.depth, 
+                            viewpoint.mono_depth, torch.eye(4, device=viewpoint.device),
+                            viewpoint.projection_matrix, viewpoint.fx, viewpoint.fy,
+                            viewpoint.cx, viewpoint.cy, viewpoint.FoVx, viewpoint.FoVy,
+                            viewpoint.image_height, viewpoint.image_width, device=viewpoint.device
+                        )
+                        cam1_gt.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+                        
+                        cam2_gt = Camera(
+                            viewpoint_next.uid, viewpoint_next.original_image, viewpoint_next.depth,
+                            viewpoint_next.mono_depth, torch.eye(4, device=viewpoint_next.device),
+                            viewpoint_next.projection_matrix, viewpoint_next.fx, viewpoint_next.fy,
+                            viewpoint_next.cx, viewpoint_next.cy, viewpoint_next.FoVx, viewpoint_next.FoVy,
+                            viewpoint_next.image_height, viewpoint_next.image_width, device=viewpoint_next.device
+                        )
+                        cam2_gt.update_RT(viewpoint_next.R_gt, viewpoint_next.T_gt)
+                        
+                        camera_flow = calculate_camera_flow(mono_depth_tensor, cam1_gt, cam2_gt)
+                    else:
+                        camera_flow = calculate_camera_flow(mono_depth_tensor, viewpoint, viewpoint_next)
+                    
+                    # 计算motion flow
+                    if self.use_optical_flow:
+                        motion_flow = flow_2d_gt - camera_flow
+                    
+                    # 保存可视化
+                    if self.flow_visualization:
+                        if self.use_optical_flow:
+                            save_flow_visualization(
+                                flow_2d_gt,
+                                os.path.join(self.flow_viz_dir, f"optical_flow_{cur_frame_idx:06d}.png"),
+                                f"Optical Flow Frame {cur_frame_idx}"
+                            )
+                        if self.use_camera_flow:
+                            save_flow_visualization(
+                                camera_flow,
+                                os.path.join(self.flow_viz_dir, f"camera_flow_{cur_frame_idx:06d}.png"),
+                                f"Camera Flow Frame {cur_frame_idx}"
+                            )
+                        if self.use_optical_flow and self.use_camera_flow:
+                            save_flow_visualization(
+                                motion_flow,
+                                os.path.join(self.flow_viz_dir, f"motion_flow_{cur_frame_idx:06d}.png"),
+                                f"Motion Flow Frame {cur_frame_idx}"
+                            )
         
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)
