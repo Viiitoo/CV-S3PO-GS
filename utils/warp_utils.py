@@ -91,3 +91,31 @@ def calculate_camera_flow(depth1, cam1, cam2):
     camera_flow = pixel_coords - ori_coords  # B 2 H W
     return camera_flow[0]  # 2 H W
 
+
+def warping_gs_flow(depth_gt, gs_flow, camera_pose, next_camera_pose):
+    """
+    将GS Flow对齐到Motion Flow的坐标系（考虑相机运动）
+    
+    参考MotionGS的实现，通过反投影和重投影来对齐坐标系
+    
+    Args:
+        depth_gt: 当前帧深度图，形状为 (B) (1) H W
+        gs_flow: GS Flow，形状为 (2, H, W)
+        camera_pose: 当前帧相机对象，需要有intrinsic和extrinsic属性
+        next_camera_pose: 下一帧相机对象，需要有intrinsic和extrinsic属性
+    
+    Returns:
+        aligned_gs_flow: 对齐后的GS Flow，形状为 (2, H, W)
+    """
+    H, W = depth_gt.shape[-2:]  # depth1: (B) (1) H W
+    backprojdepth = BackprojectDepth(1, H, W).cuda()
+    project3d = Project3D(1, H, W).cuda()
+    inv_K1 = torch.linalg.inv(camera_pose.intrinsic.cuda())[None]  # B 4 4
+    K2 = next_camera_pose.intrinsic.cuda()[None]  # B 4 4
+    T12 = torch.matmul(torch.linalg.inv(next_camera_pose.extrinsic.cuda()), 
+                     camera_pose.extrinsic.cuda())[None]  # B 4 4
+    points_3d = backprojdepth(depth_gt, inv_K1)  # B 4 HW
+    pixel_coords_norm, _ = project3d(points_3d, K2, T12)  # B H W 2
+    gs_flow = F.grid_sample(gs_flow.unsqueeze(0), pixel_coords_norm, padding_mode="border", align_corners=True)  # B 2 H W
+    return gs_flow.squeeze(0)  # 2 H W
+

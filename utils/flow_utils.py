@@ -141,3 +141,123 @@ def compute_optical_flow(img1, img2, flownet):
     
     return flow  # (2, H, W)
 
+
+def calculate_gs_flow(gs_per_pixel=None, weight_per_gs_pixel=None, next_conic_2D=None, 
+                     conic_2D_inv=None, proj_2D=None, next_proj_2D=None, x_mu=None,
+                     depth1=None, depth2=None, cam1=None, cam2=None):
+    """
+    计算GS Flow（高斯点的2D光流）
+    
+    支持两种模式：
+    1. 完整模式（需要proj_2D、conic_2D等中间信息）：使用MotionGS的精确方法
+    2. 简化模式（使用深度和相机参数）：通过深度图计算像素对应关系
+    
+    Args:
+        # 完整模式参数（如果render函数返回这些信息）
+        gs_per_pixel: 每个像素的高斯索引，形状为 (K, H, W)
+        weight_per_gs_pixel: 每个像素的高斯权重，形状为 (K, H, W)
+        next_conic_2D: 下一帧的2D协方差矩阵，形状为 (K, 3)
+        conic_2D_inv: 当前帧的2D协方差逆矩阵，形状为 (K, 3)
+        proj_2D: 当前帧的2D投影位置，形状为 (K, 2)
+        next_proj_2D: 下一帧的2D投影位置，形状为 (K, 2)
+        x_mu: 像素坐标，形状为 (K, H, W, 2)
+        
+        # 简化模式参数
+        depth1: 当前帧深度图，形状为 (1, H, W) 或 (H, W)
+        depth2: 下一帧深度图（可选，当前未使用）
+        cam1: 当前帧相机对象，需要有intrinsic和extrinsic属性
+        cam2: 下一帧相机对象，需要有intrinsic和extrinsic属性
+    
+    Returns:
+        gs_flow: GS Flow张量，形状为 (2, H, W)
+    """
+    # 如果提供了完整模式的参数，使用精确方法
+    if (gs_per_pixel is not None and weight_per_gs_pixel is not None and 
+        next_conic_2D is not None and conic_2D_inv is not None and
+        proj_2D is not None and next_proj_2D is not None and x_mu is not None):
+        return _calculate_gs_flow_full(gs_per_pixel, weight_per_gs_pixel, next_conic_2D,
+                                       conic_2D_inv, proj_2D, next_proj_2D, x_mu)
+    
+    # 否则使用简化模式（基于深度）
+    elif depth1 is not None and cam1 is not None and cam2 is not None:
+        return _calculate_gs_flow_simplified(depth1, cam1, cam2)
+    
+    else:
+        raise ValueError("calculate_gs_flow需要提供完整模式或简化模式的参数")
+
+
+def _calculate_gs_flow_full(gs_per_pixel, weight_per_gs_pixel, next_conic_2D, 
+                            conic_2D_inv, proj_2D, next_proj_2D, x_mu):
+    """
+    完整模式的GS Flow计算（参考MotionGS）
+    """
+    conic_2D_inv = conic_2D_inv.detach()  # K 3
+    
+    gs_per_pixel = gs_per_pixel.long()  # K H W
+    
+    # 计算协方差矩阵的乘积
+    conv_conv = torch.zeros([conic_2D_inv.shape[0], 2, 2], device=conic_2D_inv.device)  # K 2 2
+    conv_conv[:, 0, 0] = next_conic_2D[:, 0] * conic_2D_inv[:, 0] + next_conic_2D[:, 1] * conic_2D_inv[:, 1]
+    conv_conv[:, 0, 1] = next_conic_2D[:, 0] * conic_2D_inv[:, 1] + next_conic_2D[:, 1] * conic_2D_inv[:, 2]
+    conv_conv[:, 1, 0] = next_conic_2D[:, 1] * conic_2D_inv[:, 0] + next_conic_2D[:, 2] * conic_2D_inv[:, 1]
+    conv_conv[:, 1, 1] = next_conic_2D[:, 1] * conic_2D_inv[:, 1] + next_conic_2D[:, 2] * conic_2D_inv[:, 2]
+    
+    # 计算各向异性GS Flow
+    conv_multi = (conv_conv[gs_per_pixel] @ x_mu.permute(0,2,3,1).unsqueeze(-1).detach()).squeeze()  # K H W 2
+    flow_per_pixel = (conv_multi + next_proj_2D[gs_per_pixel] - proj_2D[gs_per_pixel].detach() - 
+                     x_mu.permute(0,2,3,1).detach())  # K H W 2
+    
+    # 加权平均
+    weight_per_gs_pixel = weight_per_gs_pixel / (weight_per_gs_pixel.sum(dim=0, keepdim=True) + 1e-7)  # K H W
+    flow_gs = torch.einsum("khw, khwa -> ahw", [weight_per_gs_pixel.detach(), flow_per_pixel])  # 2 H W
+    
+    return flow_gs
+
+
+def _calculate_gs_flow_simplified(depth1, cam1, cam2):
+    """
+    简化版本的GS Flow计算函数
+    通过渲染两帧的深度图，计算像素对应关系来近似GS Flow
+    
+    注意：这是简化版本，因为当前render函数不返回proj_2D、conic_2D等中间信息。
+    如需更精确的GS Flow，需要修改render函数使用MotionGS的rasterization版本。
+    
+    Args:
+        depth1: 当前帧深度图，形状为 (1, H, W) 或 (H, W)
+        cam1: 当前帧相机对象，需要有intrinsic和extrinsic属性
+        cam2: 下一帧相机对象，需要有intrinsic和extrinsic属性
+    
+    Returns:
+        gs_flow: GS Flow张量，形状为 (2, H, W)
+    """
+    from utils.warp_utils import BackprojectDepth, Project3D
+    
+    # 确保深度图格式正确
+    if depth1.dim() == 2:
+        depth1 = depth1.unsqueeze(0)  # (1, H, W)
+    
+    H, W = depth1.shape[-2:]
+    
+    # 使用BackprojectDepth和Project3D计算像素对应关系
+    backprojdepth = BackprojectDepth(1, H, W).cuda()
+    project3d = Project3D(1, H, W).cuda()
+    
+    # 反投影当前帧深度到3D点
+    inv_K1 = torch.linalg.inv(cam1.intrinsic.cuda())[None]  # B 4 4
+    points_3d = backprojdepth(depth1, inv_K1)  # B 4 HW
+    
+    # 投影3D点到下一帧
+    K2 = cam2.intrinsic.cuda()[None]  # B 4 4
+    T12 = torch.matmul(torch.linalg.inv(cam2.extrinsic.cuda()), 
+                     cam1.extrinsic.cuda())[None]  # B 4 4
+    _, pixel_coords = project3d(points_3d, K2, T12)  # B H W 2
+    
+    # 计算原始像素坐标
+    pixel_coords = pixel_coords.permute(0, 3, 1, 2)  # B 2 H W
+    ori_coords = backprojdepth.pix_coords.view(1, 3, H, W)[:, :2]  # B 2 H W
+    
+    # GS Flow = 下一帧投影位置 - 当前帧原始位置
+    gs_flow = pixel_coords - ori_coords  # B 2 H W
+    
+    return gs_flow[0]  # 2 H W
+

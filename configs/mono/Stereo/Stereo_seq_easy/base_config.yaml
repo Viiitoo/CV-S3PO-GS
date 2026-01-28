@@ -37,6 +37,8 @@ Training:
   use_camera_flow: True
   flow_visualization: True
   use_gt_pose: True  # 使用真值位姿计算camera flow
+  flow_loss_weight: 0.5  # flow loss权重，参考MotionGS
+  flow_warm_up: 1000  # 在warm_up之后才开始计算flow loss
   a_invalid: 1.1
   a_valid: 0.1
   alpha: 0.98

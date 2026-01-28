@@ -64,6 +64,7 @@ class FrontEnd(mp.Process):
         # 光流相关初始化
         self.flownet = None
         self.flow_2d_gt_list = []  # 缓存光流结果
+        self.motion_flow_dict = {}  # 存储每个关键帧的motion_flow {frame_idx: motion_flow}
         self.use_optical_flow = False
         self.use_camera_flow = False
         self.flow_visualization = False
@@ -307,6 +308,8 @@ class FrontEnd(mp.Process):
                     # 计算motion flow（需要optical flow和camera flow都存在）
                     if self.use_optical_flow and flow_2d_gt is not None and camera_flow is not None:
                         motion_flow = flow_2d_gt - camera_flow
+                        # 存储motion_flow以便传递给后端
+                        self.motion_flow_dict[cur_frame_idx] = motion_flow
                     
                     # 保存可视化（只有当下一帧存在时才保存）
                     if self.flow_visualization and next_frame_idx < len(self.dataset):
@@ -542,7 +545,119 @@ class FrontEnd(mp.Process):
     
     # Request to add a new keyframe and push related info into the backend queue
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap):
-        msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap, self.theta]
+        # 【修复】计算从当前关键帧到下一个关键帧的motion flow
+        # 方法1：从kf_indices中找到下一个关键帧（如果已经创建）
+        # 方法2：如果下一个关键帧还没创建，使用关键帧间隔估算下一个关键帧
+        motion_flow = None
+        
+        # 首先尝试从kf_indices中找到下一个关键帧
+        next_kf_idx = None
+        for candidate_idx in sorted(self.kf_indices):
+            if candidate_idx > cur_frame_idx:
+                next_kf_idx = candidate_idx
+                break
+        
+        # 如果没找到，使用关键帧间隔估算下一个关键帧
+        if next_kf_idx is None:
+            # 估算下一个关键帧：当前关键帧 + 关键帧间隔
+            estimated_next_kf_idx = cur_frame_idx + self.kf_interval
+            if estimated_next_kf_idx < len(self.dataset):
+                next_kf_idx = estimated_next_kf_idx
+                Log(f"下一个关键帧还未创建，使用估算值: {next_kf_idx}", tag="Flow")
+        
+        # 如果找到了下一个关键帧（无论是已创建的还是估算的），且启用了光流计算，就计算关键帧之间的flow
+        if (next_kf_idx is not None and 
+            (self.use_optical_flow or self.use_camera_flow) and 
+            self.flownet is not None and
+            next_kf_idx < len(self.dataset)):
+            try:
+                from utils.flow_utils import compute_optical_flow
+                from utils.warp_utils import calculate_camera_flow
+                
+                # 获取当前关键帧和下一个关键帧的图像
+                gt_image = viewpoint.original_image.cuda()  # (C, H, W), 范围 [0, 1]
+                
+                # 从dataset加载下一个关键帧图像
+                next_gt_color, _, _, _ = self.dataset[next_kf_idx]
+                next_gt_image = next_gt_color.cuda()  # (C, H, W), 范围 [0, 1]
+                
+                flow_2d_gt = None
+                camera_flow = None
+                
+                # 计算optical flow（从当前关键帧到下一个关键帧）
+                if self.use_optical_flow:
+                    flow_2d_gt = compute_optical_flow(gt_image, next_gt_image, self.flownet)
+                
+                # 计算camera flow（从当前关键帧到下一个关键帧）
+                if self.use_camera_flow:
+                    # 获取下一个关键帧的相机对象
+                    if next_kf_idx in self.cameras:
+                        viewpoint_next = self.cameras[next_kf_idx]
+                    else:
+                        # 创建临时相机对象
+                        viewpoint_next = Camera.init_from_dataset(
+                            self.dataset, next_kf_idx, viewpoint.projection_matrix
+                        )
+                        # 如果使用真值位姿，使用真值
+                        if self.use_gt_pose:
+                            viewpoint_next.update_RT(viewpoint_next.R_gt, viewpoint_next.T_gt)
+                    
+                    # 准备深度数据：使用Mast3r预测的深度
+                    mono_depth_tensor = torch.from_numpy(viewpoint.mono_depth).float().cuda()
+                    # calculate_camera_flow期望输入为 (B) (1) H W 格式
+                    if len(mono_depth_tensor.shape) == 2:
+                        mono_depth_tensor = mono_depth_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                    
+                    # 如果使用真值位姿，创建临时相机对象使用真值位姿
+                    if self.use_gt_pose:
+                        cam1_gt = Camera(
+                            viewpoint.uid, viewpoint.original_image, viewpoint.depth, 
+                            viewpoint.mono_depth, torch.eye(4, device=viewpoint.device),
+                            viewpoint.projection_matrix, viewpoint.fx, viewpoint.fy,
+                            viewpoint.cx, viewpoint.cy, viewpoint.FoVx, viewpoint.FoVy,
+                            viewpoint.image_height, viewpoint.image_width, device=viewpoint.device
+                        )
+                        cam1_gt.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+                        
+                        cam2_gt = Camera(
+                            viewpoint_next.uid, viewpoint_next.original_image, viewpoint_next.depth,
+                            viewpoint_next.mono_depth, torch.eye(4, device=viewpoint_next.device),
+                            viewpoint_next.projection_matrix, viewpoint_next.fx, viewpoint_next.fy,
+                            viewpoint_next.cx, viewpoint_next.cy, viewpoint_next.FoVx, viewpoint_next.FoVy,
+                            viewpoint_next.image_height, viewpoint_next.image_width, device=viewpoint_next.device
+                        )
+                        cam2_gt.update_RT(viewpoint_next.R_gt, viewpoint_next.T_gt)
+                        
+                        camera_flow = calculate_camera_flow(mono_depth_tensor, cam1_gt, cam2_gt)
+                    else:
+                        camera_flow = calculate_camera_flow(mono_depth_tensor, viewpoint, viewpoint_next)
+                
+                # 计算motion flow（需要optical flow和camera flow都存在）
+                if self.use_optical_flow and flow_2d_gt is not None and camera_flow is not None:
+                    motion_flow = flow_2d_gt - camera_flow
+                    # 存储motion_flow以便后续使用
+                    self.motion_flow_dict[cur_frame_idx] = motion_flow
+                    Log(f"计算关键帧之间的flow: 帧{cur_frame_idx} -> 帧{next_kf_idx}", tag="Flow")
+                elif self.use_optical_flow and flow_2d_gt is not None:
+                    # 如果只有optical flow，也可以使用（但效果可能不如motion flow）
+                    motion_flow = flow_2d_gt
+                    self.motion_flow_dict[cur_frame_idx] = motion_flow
+                    Log(f"计算关键帧之间的optical flow: 帧{cur_frame_idx} -> 帧{next_kf_idx}", tag="Flow")
+                    
+            except Exception as e:
+                # 如果计算失败，记录但不中断程序
+                import traceback
+                Log(f"计算关键帧之间的flow失败: {e}", tag="Flow")
+                Log(f"详细错误: {traceback.format_exc()}", tag="Flow")
+                # 如果计算失败，尝试使用之前存储的相邻帧的flow（如果有）
+                motion_flow = self.motion_flow_dict.get(cur_frame_idx, None)
+        else:
+            # 如果没有下一个关键帧或未启用光流，尝试使用之前存储的flow（如果有）
+            motion_flow = self.motion_flow_dict.get(cur_frame_idx, None)
+            if next_kf_idx is None:
+                Log(f"帧{cur_frame_idx}是最后一个关键帧，无法计算关键帧之间的flow", tag="Flow")
+        
+        msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap, self.theta, motion_flow]
         self.backend_queue.put(msg)
         self.requested_keyframe += 1
     
