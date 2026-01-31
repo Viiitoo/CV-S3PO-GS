@@ -214,11 +214,16 @@ class FrontEnd(mp.Process):
             # 为可视化补充运行期信息（不污染原config引用）
             _cfg = dict(rgb_edge_pnp_cfg)
             viz = dict(_cfg.get("viz", {}))
-            if viz.get("enabled", False):
+            # 如果启用了edge_guided_matching，即使viz.enabled为False，也设置viz_dir和tag（用于轮廓可视化）
+            if viz.get("enabled", False) or _cfg.get("edge_guided_matching", False):
                 viz_dir = os.path.join(self.save_dir, "viz_rgb_edge_pnp")
                 viz["dir"] = viz_dir
                 viz["frame_idx"] = int(cur_frame_idx)
                 viz["tag"] = "f{:06d}_kf{:06d}".format(int(cur_frame_idx), int(last_keyframe_idx))
+                # 如果edge_guided_matching启用但viz.enabled未设置，则启用viz
+                if _cfg.get("edge_guided_matching", False) and not viz.get("enabled", False):
+                    viz["enabled"] = True
+                    print(f"[轮廓可视化] 检测到edge_guided_matching启用，自动启用可视化保存")
             _cfg["viz"] = viz
             rgb_edge_pnp_cfg = _cfg
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 

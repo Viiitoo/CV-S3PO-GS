@@ -131,6 +131,22 @@ rgb_edge_pnp:
   rgb_weight: 1.0
   seed: 0
   use_depth: false
+  
+  # ========== 3D点云轮廓引导匹配（在MASt3R输出的原始点云上提取轮廓）==========
+  edge_guided_matching: true       # 启用3D点云轮廓引导的匹配点筛选/加权
+  edge_match_mode: "weight"       # "filter" 或 "weight" - 筛选模式或加权模式
+  edge_match_ratio: 0.5           # filter模式下的轮廓匹配点保留比例
+  edge_3d_weight: 2.0              # weight模式下轮廓区域的3D匹配点权重倍数
+  
+  # 3D点云轮廓提取参数（用于edge_guided_matching）
+  edge_extraction:
+    method: 'star_edge'           # 'star_edge' - 使用STAR-Edge的LocalSH方法（如果可用，否则回退到fast_curvature）
+    knn_neighbors: 15
+    curvature_threshold: 0.1
+    edge_ratio: 0.1               # 保留的边缘点比例
+    voxel_size: 0.02
+    max_points: 20000
+  
   viz:
     enabled: true
     max_matches: 300
@@ -140,8 +156,9 @@ rgb_edge_pnp:
 # 说明：
 # - 用于在下采样前从原始点云提取轮廓信息
 # - 轮廓区域的点会有更高的保留率，提高重建质量
+# - 使用STAR-Edge的LocalSH方法（如果可用）或快速曲率方法
 edge_extraction:
-  method: 'fast_curvature'          # 'depth_gradient', 'fast_curvature', 'hybrid'
+  method: 'star_edge'                # 'star_edge', 'localsh', 'fast_curvature', 'depth_gradient', 'hybrid'
   
   # 快速曲率方法参数（用于3D点云轮廓提取）
   knn_neighbors: 15                  # KNN邻域大小

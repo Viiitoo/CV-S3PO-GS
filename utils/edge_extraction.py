@@ -19,6 +19,7 @@ import cv2
 import sys
 import os
 import time
+import importlib.util
 from typing import Optional, Tuple, Union
 
 # 尝试导入scipy用于快速KNN
@@ -29,22 +30,53 @@ except ImportError:
     SCIPY_AVAILABLE = False
     print("[EdgeExtraction] scipy不可用，将使用基础方法")
 
-# 尝试导入LocalSH（保持兼容性）
+# 强制使用STAR-Edge的LocalSH（无回退机制）
 LOCALSH_AVAILABLE = False
 LocalSH = None
+LocalSHFeature = None
 
-try:
-    localsh_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
-                                 'STAR-Edge', 'LocalSH', 'build')
-    if os.path.exists(localsh_path):
-        sys.path.insert(0, localsh_path)
-    
-    import LocalSH as _LocalSH
-    LocalSH = _LocalSH
-    LOCALSH_AVAILABLE = True
-    print("[EdgeExtraction] LocalSH 模块加载成功")
-except ImportError as e:
-    pass  # 静默处理，使用高效备选方法
+# 尝试从pre_process目录导入（.so文件所在位置）
+localsh_preprocess_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
+                                       'STAR-Edge', 'pre_process')
+# 尝试多个可能的.so文件名（Python 3.8, 3.11等）
+import sys
+python_version = f"{sys.version_info.major}{sys.version_info.minor}"
+localsh_so_path = os.path.join(localsh_preprocess_path, f'LocalSH.cpython-{python_version}-x86_64-linux-gnu.so')
+# 如果找不到，尝试Python 3.8版本（向后兼容）
+if not os.path.exists(localsh_so_path):
+    localsh_so_path = os.path.join(localsh_preprocess_path, 'LocalSH.cpython-38-x86_64-linux-gnu.so')
+# 如果还是找不到，尝试从LocalSH目录直接加载
+if not os.path.exists(localsh_so_path):
+    localsh_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'STAR-Edge', 'LocalSH')
+    localsh_so_path = os.path.join(localsh_dir, f'LocalSH.cpython-{python_version}-x86_64-linux-gnu.so')
+
+if os.path.exists(localsh_so_path):
+    sys.path.insert(0, localsh_preprocess_path)
+    try:
+        # 使用importlib直接加载.so文件
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("LocalSH", localsh_so_path)
+        if spec is not None and spec.loader is not None:
+            _LocalSH = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_LocalSH)
+            LocalSH = _LocalSH
+            
+            # 尝试访问LocalSHFeature子模块
+            if hasattr(_LocalSH, 'LocalSHFeature'):
+                LocalSHFeature = _LocalSH.LocalSHFeature
+                LOCALSH_AVAILABLE = True
+                print("[EdgeExtraction] ✓ LocalSH 模块加载成功（强制使用STAR-Edge）")
+            else:
+                raise ImportError("LocalSH模块缺少LocalSHFeature子模块")
+        else:
+            raise ImportError(f"无法创建LocalSH模块规范: {localsh_so_path}")
+    except Exception as e:
+        raise RuntimeError(f"[EdgeExtraction] ✗ LocalSH 模块加载失败: {e}\n"
+                          f"请确保STAR-Edge的LocalSH模块已正确编译。\n"
+                          f"路径: {localsh_so_path}")
+else:
+    raise RuntimeError(f"[EdgeExtraction] ✗ LocalSH .so文件不存在: {localsh_so_path}\n"
+                      f"请确保STAR-Edge已正确安装。")
 
 
 class EdgeExtractionConfig:
@@ -492,9 +524,9 @@ class EdgeExtractor:
             
             if sample_size < 10:
                 # 如果下采样后点数太少，回退到随机采样
-            sample_size = min(5000, N)
-            sample_indices = np.random.choice(N, sample_size, replace=False)
-            sample_points = points[sample_indices]
+                sample_size = min(5000, N)
+                sample_indices = np.random.choice(N, sample_size, replace=False)
+                sample_points = points[sample_indices]
             else:
                 sample_points = downsampled_points
             
@@ -553,14 +585,24 @@ class EdgeExtractor:
             threshold_ratio = np.partition(curvatures, threshold_idx)[threshold_idx]
             edge_mask_by_ratio = curvatures >= threshold_ratio
         
-        # 取两种方法的交集，确保不会选择过多点
-        edge_mask = np.logical_and(edge_mask_by_threshold, edge_mask_by_ratio)
+        # 智能选择策略：优先使用阈值方法，但如果结果不合理则调整
+        edge_mask = edge_mask_by_threshold
         
-        # 如果交集结果太少（<1%），则使用阈值方法
-        if edge_mask.sum() < N * 0.01:
-            edge_mask = edge_mask_by_threshold
-            # 如果阈值方法还是太多（>50%），则使用比例方法
-            if edge_mask.sum() > N * 0.5:
+        # 如果阈值方法选的点太少（<0.5%），降低阈值
+        if edge_mask.sum() < N * 0.005:
+            # 使用更宽松的阈值：mean + 0.5 * threshold * std
+            threshold_value_relaxed = curv_mean + 0.5 * self.config.curvature_threshold * curv_std
+            edge_mask = curvatures > threshold_value_relaxed
+            # 如果还是太少，使用比例方法作为下限
+            if edge_mask.sum() < N * 0.005:
+                edge_mask = edge_mask_by_ratio
+        # 如果阈值方法选的点太多（>30%），提高阈值
+        elif edge_mask.sum() > N * 0.3:
+            # 使用更严格的阈值：mean + 1.5 * threshold * std
+            threshold_value_strict = curv_mean + 1.5 * self.config.curvature_threshold * curv_std
+            edge_mask = curvatures > threshold_value_strict
+            # 如果还是太多，使用比例方法作为上限
+            if edge_mask.sum() > N * 0.3:
                 edge_mask = edge_mask_by_ratio
         
         return edge_mask, edge_scores
@@ -569,7 +611,7 @@ class EdgeExtractor:
     
     def extract_edges(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        提取边缘点（自动选择方法）
+        提取边缘点（强制使用STAR-Edge方法，无回退）
         
         Args:
             points: 点云 (N, 3)
@@ -578,7 +620,113 @@ class EdgeExtractor:
             edge_mask: 边缘点mask (N,) bool
             edge_scores: 边缘分数 (N,)
         """
-        return self.extract_edges_curvature_fast(points)
+        # 强制使用STAR-Edge的LocalSH方法（无回退机制）
+        if not LOCALSH_AVAILABLE:
+            raise RuntimeError("[轮廓提取] ✗ LocalSH不可用，无法使用STAR-Edge方法。"
+                             "请确保LocalSH模块已正确加载。")
+        
+        method_name = getattr(self.config, 'method', 'star_edge')
+        if method_name not in ['star_edge', 'localsh']:
+            print(f"[轮廓提取] 警告: method={method_name}，强制使用STAR-Edge方法")
+        
+        print(f"[轮廓提取] ✓ 使用STAR-Edge LocalSH方法提取轮廓")
+        return self.extract_edges_star_edge(points)
+    
+    def extract_edges_star_edge(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        使用STAR-Edge的LocalSH方法提取边缘点（强制方法，无回退）
+        
+        Args:
+            points: 点云 (N, 3)
+            
+        Returns:
+            edge_mask: 边缘点mask (N,) bool
+            edge_scores: 边缘分数 (N,)
+        """
+        if not LOCALSH_AVAILABLE or LocalSHFeature is None:
+            raise RuntimeError("[轮廓提取] ✗ LocalSH模块不可用，无法使用STAR-Edge方法")
+        
+        N = len(points)
+        if N < 10:
+            return np.zeros(N, dtype=bool), np.zeros(N, dtype=np.float32)
+        
+        # STAR-Edge参数
+        bw = 10  # 球面谐波带宽
+        kk = 26  # KNN邻居数
+        sampleNum = bw * 4  # 采样数
+        
+        # 调用LocalSH计算特征（强制使用，无回退）
+        if LocalSHFeature is None:
+            raise RuntimeError("[轮廓提取] ✗ LocalSHFeature不可用")
+        
+        result = LocalSHFeature.ComLSHF_knn_upsample(
+            points.astype(np.float64),
+            bw, kk, sampleNum
+        )
+        
+        # 获取特征描述符和法线
+        descs = result["Descs"]  # (N, bw) - 局部球面曲线特征
+        normals = result["normals"]  # (N, 3) - 法线
+        
+        # 使用特征描述符的方差或熵来识别边缘点
+        # 边缘点的特征描述符通常有更高的变化
+        if descs.shape[1] > 0:
+            # 计算每个点特征描述符的方差
+            desc_var = np.var(descs, axis=1)
+            
+            # 归一化到0-1
+            if desc_var.max() - desc_var.min() > 1e-6:
+                edge_scores = (desc_var - desc_var.min()) / (desc_var.max() - desc_var.min())
+            else:
+                edge_scores = np.zeros(N, dtype=np.float32)
+            
+            # 使用阈值方法选择边缘点
+            curv_mean = desc_var.mean()
+            curv_std = desc_var.std()
+            threshold_value = curv_mean + self.config.curvature_threshold * curv_std
+            edge_mask = desc_var > threshold_value
+            
+            # 如果阈值方法选的点太多或太少，使用比例方法调整
+            # 计算目标轮廓点数量（考虑比例和绝对上限）
+            num_edges_by_ratio = max(10, int(N * self.config.edge_ratio))
+            # 如果有max_points配置，限制绝对数量上限
+            if hasattr(self.config, 'max_points') and self.config.max_points > 0:
+                num_edges_threshold = min(num_edges_by_ratio, self.config.max_points)
+            else:
+                num_edges_threshold = num_edges_by_ratio
+            
+            if edge_mask.sum() < num_edges_threshold * 0.5:
+                # 太少，降低阈值（但不超过edge_ratio的2倍）
+                threshold_value = curv_mean + 0.5 * self.config.curvature_threshold * curv_std
+                edge_mask = desc_var > threshold_value
+                # 如果还是太少，使用比例方法确保至少有一些边缘点
+                if edge_mask.sum() < num_edges_threshold * 0.5:
+                    threshold_idx = N - num_edges_threshold
+                    threshold_ratio = np.partition(desc_var, threshold_idx)[threshold_idx]
+                    edge_mask = desc_var >= threshold_ratio
+            elif edge_mask.sum() > num_edges_threshold * 2.0:
+                # 太多，使用比例方法限制到目标数量（考虑max_points上限）
+                threshold_idx = N - num_edges_threshold
+                threshold_ratio = np.partition(desc_var, threshold_idx)[threshold_idx]
+                edge_mask = desc_var >= threshold_ratio
+            
+            # 最终检查：确保不超过max_points绝对上限
+            if hasattr(self.config, 'max_points') and self.config.max_points > 0:
+                if edge_mask.sum() > self.config.max_points:
+                    # 如果超过上限，只保留分数最高的max_points个点
+                    edge_scores_sorted = np.argsort(desc_var)[::-1]  # 从高到低排序
+                    edge_mask = np.zeros(N, dtype=bool)
+                    edge_mask[edge_scores_sorted[:self.config.max_points]] = True
+                    print(f"[轮廓提取] 轮廓点数量({edge_mask.sum()})超过上限({self.config.max_points})，已限制到上限")
+            
+            # 如果阈值方法选的点在合理范围内，保持原结果
+        else:
+            # 回退到法线变化方法
+            # 计算法线变化（使用KNN）
+            edge_mask = np.zeros(N, dtype=bool)
+            edge_scores = np.zeros(N, dtype=np.float32)
+        
+        return edge_mask, edge_scores
     
     def project_points_to_image(self, points_3d: np.ndarray, 
                                  K: np.ndarray, R: np.ndarray, T: np.ndarray,
