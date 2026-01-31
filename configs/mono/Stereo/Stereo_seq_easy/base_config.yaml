@@ -22,6 +22,10 @@ Dataset:
   point_size: 0.003
   sensor_type: monocular
   type: tum
+  # 轮廓引导采样配置（在下采样前使用原始点云提取轮廓）
+  edge_guided_sampling: true      # 启用轮廓引导采样
+  edge_keep_ratio: 0.5            # 轮廓点保留比例（0.5表示保留50%的轮廓点）
+  save_edge_visualization: true   # 保存轮廓可视化图片（PLY点云、mask、叠加图）
 Results:
   color_refinement: true
   eval_rendering: true
@@ -131,3 +135,20 @@ rgb_edge_pnp:
     enabled: true
     max_matches: 300
     viz_every: 10
+
+# ================= 轮廓提取配置（用于轮廓引导采样）=================
+# 说明：
+# - 用于在下采样前从原始点云提取轮廓信息
+# - 轮廓区域的点会有更高的保留率，提高重建质量
+edge_extraction:
+  method: 'fast_curvature'          # 'depth_gradient', 'fast_curvature', 'hybrid'
+  
+  # 快速曲率方法参数（用于3D点云轮廓提取）
+  knn_neighbors: 15                  # KNN邻域大小
+  curvature_threshold: 0.1           # 曲率阈值
+  edge_ratio: 0.1                    # 保留的边缘点比例
+  
+  # 下采样参数（轮廓提取前的预处理）
+  voxel_size: 0.02                   # 体素大小（用于快速下采样加速计算）
+  max_points: 20000                  # 最大点数限制（避免内存问题）
+  min_points_ratio: 0.05

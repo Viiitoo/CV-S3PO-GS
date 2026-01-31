@@ -486,27 +486,41 @@ class EdgeExtractor:
         
         # 对于大点云，先进行下采样以加速计算
         if N > 5000:
-            # 随机采样子集进行曲率计算
+            # 使用体素下采样而不是随机采样，保持空间分布
+            downsampled_points, sample_indices = self.voxel_downsample(points, voxel_size=self.config.voxel_size)
+            sample_size = len(downsampled_points)
+            
+            if sample_size < 10:
+                # 如果下采样后点数太少，回退到随机采样
             sample_size = min(5000, N)
             sample_indices = np.random.choice(N, sample_size, replace=False)
             sample_points = points[sample_indices]
+            else:
+                sample_points = downsampled_points
             
             # 计算采样点的曲率
             normals = self.compute_normals_fast(sample_points)
             curvatures_sample = self.compute_curvature_fast(sample_points, normals)
             
-            # 将曲率传播到所有点（使用最近邻）
+            # 将曲率传播到所有点（使用KNN找到最近邻）
             curvatures = np.zeros(N, dtype=np.float32)
             curvatures[sample_indices] = curvatures_sample
             
-            # 对未采样的点，使用最近采样点的曲率
+            # 对未采样的点，使用KNN找到最近采样点的曲率
             non_sample_mask = np.ones(N, dtype=bool)
             non_sample_mask[sample_indices] = False
             non_sample_indices = np.where(non_sample_mask)[0]
             
-            if len(non_sample_indices) > 0:
-                # 简单方法：使用采样点曲率的平均值
-                curvatures[non_sample_indices] = curvatures_sample.mean()
+            if len(non_sample_indices) > 0 and SCIPY_AVAILABLE:
+                # 使用KDTree找到最近邻采样点
+                from scipy.spatial import cKDTree
+                tree = cKDTree(sample_points)
+                _, nearest_indices = tree.query(points[non_sample_indices], k=1, workers=-1)
+                # 使用最近邻采样点的曲率
+                curvatures[non_sample_indices] = curvatures_sample[nearest_indices]
+            elif len(non_sample_indices) > 0:
+                # 回退方法：使用采样点曲率的中位数（比平均值更稳健）
+                curvatures[non_sample_indices] = np.median(curvatures_sample)
         else:
             # 小点云直接计算
             normals = self.compute_normals_fast(points)
@@ -519,17 +533,35 @@ class EdgeExtractor:
         else:
             edge_scores = np.zeros(N, dtype=np.float32)
             
-        # 选择边缘点：取前edge_ratio的高曲率点
+        # 选择边缘点：优先使用阈值，如果阈值无效则使用比例
+        # 计算曲率的统计信息
+        curv_mean = curvatures.mean()
+        curv_std = curvatures.std()
+        
+        # 使用阈值方法：曲率 > mean + threshold * std
+        threshold_value = curv_mean + self.config.curvature_threshold * curv_std
+        edge_mask_by_threshold = curvatures > threshold_value
+        
+        # 使用比例方法：取前edge_ratio的高曲率点
         num_edges = max(10, int(N * self.config.edge_ratio))
         num_edges = min(num_edges, N)
         
         if num_edges >= N:
-            edge_mask = np.ones(N, dtype=bool)
+            edge_mask_by_ratio = np.ones(N, dtype=bool)
         else:
-            # 使用argpartition更快地找到top-k
             threshold_idx = N - num_edges
-            threshold = np.partition(curvatures, threshold_idx)[threshold_idx]
-            edge_mask = curvatures >= threshold
+            threshold_ratio = np.partition(curvatures, threshold_idx)[threshold_idx]
+            edge_mask_by_ratio = curvatures >= threshold_ratio
+        
+        # 取两种方法的交集，确保不会选择过多点
+        edge_mask = np.logical_and(edge_mask_by_threshold, edge_mask_by_ratio)
+        
+        # 如果交集结果太少（<1%），则使用阈值方法
+        if edge_mask.sum() < N * 0.01:
+            edge_mask = edge_mask_by_threshold
+            # 如果阈值方法还是太多（>50%），则使用比例方法
+            if edge_mask.sum() > N * 0.5:
+                edge_mask = edge_mask_by_ratio
         
         return edge_mask, edge_scores
     

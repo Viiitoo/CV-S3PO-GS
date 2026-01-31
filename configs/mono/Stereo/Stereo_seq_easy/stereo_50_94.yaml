@@ -28,3 +28,16 @@ Training:
     alpha: 0.98
     mapping_itr_nosingle: 30
 
+# ================= 优化内存使用 =================
+Dataset:
+  # 降低轮廓点保留率，减少内存占用
+  edge_keep_ratio: 0.2            # 从0.5降低到0.2，减少轮廓点保留
+  pcd_downsample: 512             # 增加下采样强度（从256增加到512）
+  pcd_downsample_init: 256       # 增加初始化下采样（从128增加到256）
+
+edge_extraction:
+  # 调整轮廓提取参数，减少识别的轮廓点数量
+  edge_ratio: 0.05                # 从0.1降低到0.05，只识别5%的点为轮廓点
+  curvature_threshold: 0.15      # 从0.1提高到0.15，提高轮廓识别阈值
+  max_points: 10000              # 从20000降低到10000，减少处理点数
+
