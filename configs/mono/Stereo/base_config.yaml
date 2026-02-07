@@ -130,34 +130,28 @@ pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
 
-# ================= RGB(+可选深度) 轮廓加权PnP（用于初始化相对位姿） =================
+# ================= 3D点云轮廓引导PnP（STAR-Edge，用于初始化相对位姿） =================
 # 说明：
 # - 仅影响 `utils/init_pose.get_pose()` 中的PnP初值，不影响后续基于GS渲染的tracking优化
-# - OpenCV solvePnPRansac不支持点权重，这里采用“按权重偏置采样 + inlier权重和评分”的加权RANSAC
+# - 在渲染深度生成的3D点云上提取轮廓（STAR-Edge），将分数映射到匹配点做加权/筛选
 rgb_edge_pnp:
-  enabled: False          # 默认关闭，打开后会更偏向轮廓点来估计位姿
-  use_depth: False        # 是否融合(渲染)深度边缘
-  rgb_method: "canny"     # canny/sobel/laplacian/combined
-  depth_method: "combined"
-  fuse: "max"             # max/sum
-  rgb_weight: 1.0
-  depth_weight: 1.0
-
-  canny_low: 50
-  canny_high: 150
-  dilate_kernel_size: 3
-  blur_ksize: 3
-
-  edge_weight: 2.0        # 轮廓区域匹配点的额外权重倍数（weights = 1 + edge_weight * score）
   iterations: 100
   reproj_error: 5.0
   min_sample: 6
   seed: 0
 
-  viz:
-    enabled: False
-    viz_every: 10
-    max_matches: 300
+  edge_guided_matching: false       # 启用3D点云轮廓引导的匹配点筛选/加权
+  edge_match_mode: "weight"         # "filter" 或 "weight"
+  edge_match_ratio: 0.5             # filter模式下的轮廓匹配点保留比例
+  edge_3d_weight: 2.0               # weight模式下轮廓区域的3D匹配点权重倍数
+
+  edge_extraction:
+    method: 'star_edge'
+    knn_neighbors: 15
+    curvature_threshold: 0.3
+    edge_ratio: 0.5
+    voxel_size: 0.02
+    max_points: 15000
 
 Flow:
   model_path: "./gmflow/checkpoints/gmflow_sintel-0c07dcb3.pth"

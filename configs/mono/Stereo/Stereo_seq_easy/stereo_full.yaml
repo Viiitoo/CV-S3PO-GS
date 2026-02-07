@@ -38,4 +38,9 @@ Training:
 #   model_path: "./gmflow/checkpoints/gmflow_sintel-0c07dcb3.pth"
 #   model_type: "gmflow"  # 可选: gmflow, raft, flowformer
 
-
+# rgb_edge_pnp（STAR-Edge 3D 轮廓引导，stereo_full 显式启用）
+rgb_edge_pnp:
+  edge_guided_matching: true
+  edge_match_mode: "weight"
+  edge_match_ratio: 0.5
+  edge_3d_weight: 2.0

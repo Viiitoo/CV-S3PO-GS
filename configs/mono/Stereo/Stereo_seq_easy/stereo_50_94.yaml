@@ -41,26 +41,18 @@ edge_extraction:
   curvature_threshold: 0.15      # 从0.1提高到0.15，提高轮廓识别阈值
   max_points: 10000              # 从20000降低到10000，减少处理点数
 
-# 修复：rgb_edge_pnp.edge_extraction 的配置（实际使用的配置）
+# rgb_edge_pnp 覆盖（STAR-Edge 3D 轮廓引导，stereo_50_94 内存优化）
 rgb_edge_pnp:
-  # 启用轮廓引导匹配（必须启用才能提取和保存轮廓）
-  edge_guided_matching: true     # 启用3D点云轮廓引导的匹配点筛选/加权
-  edge_match_mode: "weight"      # "filter" 或 "weight" - 筛选模式或加权模式
-  edge_match_ratio: 0.5           # filter模式下的轮廓匹配点保留比例
-  edge_3d_weight: 2.0            # weight模式下轮廓区域的3D匹配点权重倍数
-  
-  # 3D点云轮廓提取参数
+  edge_guided_matching: true
+  edge_match_mode: "weight"
+  edge_match_ratio: 0.5
+  edge_3d_weight: 2.0
+
   edge_extraction:
-    method: 'star_edge'           # 使用STAR-Edge方法
-    edge_ratio: 0.05              # 从0.1降低到0.05，只识别5%的点为轮廓点
-    curvature_threshold: 0.15      # 从0.1提高到0.15，提高轮廓识别阈值
-    max_points: 10000              # 从20000降低到10000，减少处理点数
+    method: 'star_edge'
+    edge_ratio: 0.05              # 从0.1降低到0.05，减少轮廓点
+    curvature_threshold: 0.15
+    max_points: 10000
     knn_neighbors: 15
     voxel_size: 0.02
-  
-  # 启用可视化保存（必须启用才能保存轮廓图片）
-  viz:
-    enabled: true                  # 启用可视化保存
-    viz_every: 1                   # 每1帧保存一次（改为1表示每帧都保存，方便调试）
-    max_matches: 300
 

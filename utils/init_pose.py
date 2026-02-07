@@ -104,84 +104,6 @@ def _save_mast3r_pc_edge_viz(viz_dir: str,
     if ply_xyz is not None and ply_rgb_u8 is not None and len(ply_xyz) > 0:
         _write_ply_xyzrgb_ascii(os.path.join(viz_dir, f"{tag}_pc_edge.ply"), ply_xyz, ply_rgb_u8)
 
-def _save_rgb_edge_pnp_viz(viz_dir,
-                           tag,
-                           rgb1_u8, rgb2_u8,
-                           edge1, edge2,
-                           matches1, matches2,
-                           weights=None,
-                           inliers=None,
-                           max_matches=300):
-    os.makedirs(viz_dir, exist_ok=True)
-
-    # edge masks
-    e1 = (np.clip(edge1, 0, 1) * 255).astype(np.uint8)
-    e2 = (np.clip(edge2, 0, 1) * 255).astype(np.uint8)
-    cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge1.png"), e1)
-    cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge2.png"), e2)
-
-    # overlays
-    ov1 = rgb1_u8.copy()
-    ov2 = rgb2_u8.copy()
-    ov1[..., 2] = np.maximum(ov1[..., 2], e1)  # red channel
-    ov2[..., 2] = np.maximum(ov2[..., 2], e2)
-    cv2.imwrite(os.path.join(viz_dir, f"{tag}_overlay1.png"), cv2.cvtColor(ov1, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(os.path.join(viz_dir, f"{tag}_overlay2.png"), cv2.cvtColor(ov2, cv2.COLOR_RGB2BGR))
-
-    # weighted matches visualization
-    H1, W1 = rgb1_u8.shape[:2]
-    H2, W2 = rgb2_u8.shape[:2]
-    canvas_h = max(H1, H2)
-    canvas_w = W1 + W2
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    canvas[:H1, :W1] = rgb1_u8
-    canvas[:H2, W1:W1+W2] = rgb2_u8
-
-    N = len(matches1)
-    if N == 0:
-        cv2.imwrite(os.path.join(viz_dir, f"{tag}_matches.png"), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
-        return
-
-    # subsample matches for drawing
-    if N > max_matches:
-        idx = np.random.choice(N, size=max_matches, replace=False)
-    else:
-        idx = np.arange(N)
-
-    inlier_set = set(inliers.reshape(-1).tolist()) if inliers is not None else None
-
-    if weights is None:
-        w = np.ones(N, dtype=np.float32)
-    else:
-        w = np.asarray(weights, dtype=np.float32).reshape(-1)
-        w = (w - w.min()) / (w.max() - w.min() + 1e-6)  # 0-1 for color mapping
-
-    for i in idx:
-        p1 = matches1[i]
-        p2 = matches2[i].copy()
-        p2[0] += W1
-        x1, y1 = int(round(p1[0])), int(round(p1[1]))
-        x2, y2 = int(round(p2[0])), int(round(p2[1]))
-        x1 = np.clip(x1, 0, W1 - 1)
-        y1 = np.clip(y1, 0, H1 - 1)
-        x2 = np.clip(x2, W1, W1 + W2 - 1)
-        y2 = np.clip(y2, 0, H2 - 1)
-
-        # color by weight: low=blue, high=yellow/red
-        ww = float(w[i])
-        color = (int(255 * (1 - ww)), int(255 * ww), int(255 * ww))  # RGB-ish
-        thickness = 1 + int(2 * ww)
-
-        if inlier_set is not None and i in inlier_set:
-            # highlight inliers: green
-            color = (0, 255, 0)
-            thickness = max(thickness, 2)
-
-        cv2.line(canvas, (x1, y1), (x2, y2), color=color, thickness=thickness, lineType=cv2.LINE_AA)
-
-    cv2.imwrite(os.path.join(viz_dir, f"{tag}_matches.png"), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
-
-
 def _weighted_ransac_pnp(objectPoints: np.ndarray,
                          imagePoints: np.ndarray,
                          K: np.ndarray,
@@ -405,67 +327,9 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     objectPoints = objectPoints.astype(np.float32)
     imagePoints = matches_im2.astype(np.float32)
 
-    # ---------- RGB(+可选深度) 轮廓加权 ----------
+    # ---------- 3D点云轮廓引导匹配（STAR-Edge / 曲率等） ----------
     weights = None
     cfg = rgb_edge_pnp or {}
-    viz_cfg = cfg.get("viz", {}) if isinstance(cfg, dict) else {}
-    viz_enabled = bool(viz_cfg.get("enabled", False))
-    viz_every = int(viz_cfg.get("viz_every", 1))
-    viz_dir = viz_cfg.get("dir", None)
-    tag = viz_cfg.get("tag", None)
-    if cfg.get("enabled", False):
-        try:
-            extractor = EdgeExtractor()
-
-            # matches 的坐标系对应 view['img'] 的分辨率（H1,W1）
-            rgb1 = view1["img"]  # 1x3xH1xW1, normalized
-            rgb2 = view2["img"]
-
-            use_depth = bool(cfg.get("use_depth", False))
-            depth_np = render_depth.detach().cpu().numpy()
-
-            edge_mask1 = extractor.extract_edges_from_rgb_and_depth(
-                rgb1,
-                depth_map=depth_np if use_depth else None,
-                rgb_method=cfg.get("rgb_method", "canny"),
-                depth_method=cfg.get("depth_method", "combined"),
-                fuse=cfg.get("fuse", "max"),
-                rgb_weight=float(cfg.get("rgb_weight", 1.0)),
-                depth_weight=float(cfg.get("depth_weight", 1.0)),
-                canny_low=int(cfg.get("canny_low", 50)),
-                canny_high=int(cfg.get("canny_high", 150)),
-                dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
-                blur_ksize=int(cfg.get("blur_ksize", 3)),
-            )
-            edge_mask2 = extractor.extract_edges_from_rgb_and_depth(
-                rgb2,
-                depth_map=depth_np if use_depth else None,
-                rgb_method=cfg.get("rgb_method", "canny"),
-                depth_method=cfg.get("depth_method", "combined"),
-                fuse=cfg.get("fuse", "max"),
-                rgb_weight=float(cfg.get("rgb_weight", 1.0)),
-                depth_weight=float(cfg.get("depth_weight", 1.0)),
-                canny_low=int(cfg.get("canny_low", 50)),
-                canny_high=int(cfg.get("canny_high", 150)),
-                dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
-                blur_ksize=int(cfg.get("blur_ksize", 3)),
-            )
-
-            weights, _ = extractor.enhance_matches_with_edges(
-                matches_im1.astype(np.float32),
-                matches_im2.astype(np.float32),
-                edge_mask1.astype(np.float32),
-                edge_mask2.astype(np.float32),
-                weight=float(cfg.get("edge_weight", 2.0)),
-            )
-        except Exception as e:
-            # 轮廓增强失败时自动回退（不影响主流程）
-            weights = None
-            edge_mask1, edge_mask2 = None, None
-    else:
-        edge_mask1, edge_mask2 = None, None
-
-    # ---------- 3D点云轮廓引导匹配（STAR-Edge / 曲率等） ----------
     # 说明：对“渲染深度生成的3D点云”做轮廓提取，然后把轮廓分数映射到每个匹配的3D点上。
     # - weight: 将每个match的权重乘上 (1 + edge_3d_weight * score)
     # - filter: 保留 score 最高的 edge_match_ratio 部分匹配点
@@ -549,44 +413,6 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
                 seed=int(cfg.get("seed", 0)),
             )
 
-    # ---------- 可视化输出 ----------
-    try:
-        if viz_enabled and viz_dir is not None and tag is not None and (int(viz_cfg.get("frame_idx", 0)) % viz_every == 0):
-            if edge_mask1 is None or edge_mask2 is None:
-                # 若未启用加权，但要求可视化，则至少做RGB边缘
-                extractor = EdgeExtractor()
-                rgb1 = view1["img"]
-                rgb2 = view2["img"]
-                edge_mask1 = extractor.extract_edges_from_rgb(rgb1,
-                                                             method=cfg.get("rgb_method", "canny"),
-                                                             canny_low=int(cfg.get("canny_low", 50)),
-                                                             canny_high=int(cfg.get("canny_high", 150)),
-                                                             dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
-                                                             blur_ksize=int(cfg.get("blur_ksize", 3)))
-                edge_mask2 = extractor.extract_edges_from_rgb(rgb2,
-                                                             method=cfg.get("rgb_method", "canny"),
-                                                             canny_low=int(cfg.get("canny_low", 50)),
-                                                             canny_high=int(cfg.get("canny_high", 150)),
-                                                             dilate_kernel_size=int(cfg.get("dilate_kernel_size", 3)),
-                                                             blur_ksize=int(cfg.get("blur_ksize", 3)))
-            rgb1_u8 = _to_uint8_rgb(view1["img"])
-            rgb2_u8 = _to_uint8_rgb(view2["img"])
-            _save_rgb_edge_pnp_viz(
-                viz_dir=viz_dir,
-                tag=tag,
-                rgb1_u8=rgb1_u8,
-                rgb2_u8=rgb2_u8,
-                edge1=edge_mask1,
-                edge2=edge_mask2,
-                matches1=matches_im1.astype(np.float32),
-                matches2=matches_im2.astype(np.float32),
-                weights=weights,
-                inliers=inliers if success else None,
-                max_matches=int(viz_cfg.get("max_matches", 300)),
-            )
-    except Exception:
-        pass
-    
     if success:
         R, _ = cv2.Rodrigues(rvec)
         pose_w2c = np.eye(4)

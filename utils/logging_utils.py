@@ -15,6 +15,7 @@ _log_styles = {
     "Densify": "bold yellow",
     "WARNING": "bold red",
     "INFO": "bold blue",
+    "Timing": "bold cyan",
 }
 
 

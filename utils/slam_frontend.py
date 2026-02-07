@@ -69,6 +69,14 @@ class FrontEnd(mp.Process):
         self.use_camera_flow = False
         self.flow_visualization = False
         self.use_gt_pose = False
+        
+        # 计时相关属性初始化
+        self._timing_get_pose = 0.0
+        self._timing_get_depth = 0.0
+        self._timing_optical_flow = 0.0
+        self._timing_pose_opt = 0.0
+        self._timing_pose_opt_iters = 0
+        self._timing_process_depth = 0.0
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -150,12 +158,17 @@ class FrontEnd(mp.Process):
                 
                 # Compute scale factor and adjust rendered depth (Pointmap Replacement)
                 render_depth = initial_depth.cpu().numpy()[0]
+                torch.cuda.synchronize()
+                t_process_depth_start = time.time()
                 initial_depth, scale_factor, error_mask, num_accurate_pixels = process_depth(render_depth, viewpoint.mono_depth, last_depth = viewpoint_last.mono_depth, 
                                                                                              im1 = viewpoint_last.original_image, im2 = viewpoint.original_image, model = self.model,
                                                                                              patch_size = self.config["depth"]["patch_size"], 
                                                                                              mean_threshold = self.config["depth"]["mean_threshold"], std_threshold = self.config["depth"]["std_threshold"],
                                                                                              error_threshold = self.config["depth"]["error_threshold"], final_error_threshold = self.config["depth"]["final_error_threshold"],
                                                                                              min_accurate_pixels_ratio = self.config["depth"]["min_accurate_pixels_ratio"])
+                torch.cuda.synchronize()
+                t_process_depth_end = time.time()
+                self._timing_process_depth = (t_process_depth_end - t_process_depth_start) * 1000  # ms
 
                 # Correct MASt3R scale
                 viewpoint.mono_depth = viewpoint.mono_depth * scale_factor
@@ -196,13 +209,25 @@ class FrontEnd(mp.Process):
                 _cfg["frame_idx"] = int(cur_frame_idx)
                 _cfg["tag"] = "f{:06d}".format(int(cur_frame_idx))
             mast_viz_cfg = _cfg
+        torch.cuda.synchronize()
+        t_init_depth_start = time.time()
         depth = get_depth(img, img, self.model, return_conf=False, mast3r_edge_viz=mast_viz_cfg)
+        torch.cuda.synchronize()
+        t_init_depth_end = time.time()
         viewpoint.mono_depth = depth
         
         self.kf_indices = []
+        t_init_kf_start = time.time()
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
+        t_init_kf_end = time.time()
         self.request_init(cur_frame_idx, viewpoint, depth_map)      # Request initialization and push related info into the backend queue
         self.reset = False
+        
+        t_init_total = (t_init_kf_end - t_init_depth_start) * 1000
+        Log(f"[Frame {cur_frame_idx}] 初始化总计: {t_init_total:.1f}ms | "
+            f"MASt3R深度: {(t_init_depth_end - t_init_depth_start)*1000:.1f}ms | "
+            f"添加关键帧: {(t_init_kf_end - t_init_kf_start)*1000:.1f}ms",
+            tag="Timing")
    
     def tracking(self, cur_frame_idx, viewpoint):    
         ##=====================Pointmap Anchored Pose Estimation(PAPE)=====================
@@ -219,20 +244,14 @@ class FrontEnd(mp.Process):
         # Estimate the relative pose between the current frame and its adjacent keyframe
         img2 = viewpoint.original_image
         rgb_edge_pnp_cfg = self.config.get("rgb_edge_pnp", None)
-        if isinstance(rgb_edge_pnp_cfg, dict):
-            # 为可视化补充运行期信息（不污染原config引用）
-            _cfg = dict(rgb_edge_pnp_cfg)
-            viz = dict(_cfg.get("viz", {}))
-            if viz.get("enabled", False):
-                viz_dir = os.path.join(self.save_dir, "viz_rgb_edge_pnp")
-                viz["dir"] = viz_dir
-                viz["frame_idx"] = int(cur_frame_idx)
-                viz["tag"] = "f{:06d}_kf{:06d}".format(int(cur_frame_idx), int(last_keyframe_idx))
-            _cfg["viz"] = viz
-            rgb_edge_pnp_cfg = _cfg
+        torch.cuda.synchronize()
+        t_pose_start = time.time()
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
                             viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background,
                             rgb_edge_pnp=rgb_edge_pnp_cfg)
+        torch.cuda.synchronize()
+        t_pose_end = time.time()
+        self._timing_get_pose = (t_pose_end - t_pose_start) * 1000  # ms
         
         # get mono_depth from MASt3R
         mast_viz_cfg = self.config.get("mast3r_edge_viz", None)
@@ -244,10 +263,18 @@ class FrontEnd(mp.Process):
                 _cfg["frame_idx"] = int(cur_frame_idx)
                 _cfg["tag"] = "f{:06d}".format(int(cur_frame_idx))
             mast_viz_cfg = _cfg
+        torch.cuda.synchronize()
+        t_depth_start = time.time()
         depth = get_depth(img2, img2, self.model, return_conf=False, mast3r_edge_viz=mast_viz_cfg)
+        torch.cuda.synchronize()
+        t_depth_end = time.time()
+        self._timing_get_depth = (t_depth_end - t_depth_start) * 1000  # ms
         viewpoint.mono_depth = depth
         
         # 计算光流（如果启用）
+        torch.cuda.synchronize()
+        t_flow_start = time.time()
+        self._timing_optical_flow = 0.0  # 默认0，如果未启用光流
         if (self.use_optical_flow or self.use_camera_flow) and self.flownet is not None:
             try:
                 from utils.flow_utils import compute_optical_flow
@@ -364,6 +391,10 @@ class FrontEnd(mp.Process):
                 Log(f"详细错误: {traceback.format_exc()}", tag="Flow")
                 pass
         
+        torch.cuda.synchronize()
+        t_flow_end = time.time()
+        self._timing_optical_flow = (t_flow_end - t_flow_start) * 1000  # ms
+        
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)
         rel_pose = torch.from_numpy(rel_pose).to(self.device).float()
@@ -410,6 +441,8 @@ class FrontEnd(mp.Process):
         )
 
         pose_optimizer = torch.optim.Adam(opt_params)
+        torch.cuda.synchronize()
+        t_opt_start = time.time()
         for tracking_itr in range(self.tracking_itr_num):
             attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=len(self.dataset))
             render_pkg = render(
@@ -446,6 +479,11 @@ class FrontEnd(mp.Process):
                 )
             if converged:
                 break
+        
+        torch.cuda.synchronize()
+        t_opt_end = time.time()
+        self._timing_pose_opt = (t_opt_end - t_opt_start) * 1000  # ms
+        self._timing_pose_opt_iters = tracking_itr + 1  # 实际迭代次数
         
         self.median_depth = get_median_depth(depth, opacity)        # Median of rendered depth, used to determine whether the frame is a keyframe
         return render_pkg
@@ -766,10 +804,16 @@ class FrontEnd(mp.Process):
                     time.sleep(0.01)
                     continue
                 
+                torch.cuda.synchronize()
+                t_frame_start = time.time()
+                
+                t_cam_init_start = time.time()
                 viewpoint = Camera.init_from_dataset(self.dataset, cur_frame_idx, projection_matrix)
                 attach_time_to_viewpoint(viewpoint, frame_idx=cur_frame_idx, num_frames=len(self.dataset))
                 viewpoint.compute_grad_mask(self.config)
                 self.cameras[cur_frame_idx] = viewpoint
+                torch.cuda.synchronize()
+                t_cam_init_end = time.time()
 
                 if self.reset:
                     self.initialize(cur_frame_idx, viewpoint)
@@ -780,7 +824,11 @@ class FrontEnd(mp.Process):
                 self.initialized = self.initialized or (len(self.current_window) == self.window_size)
 
                 # Tracking
+                torch.cuda.synchronize()
+                t_tracking_start = time.time()
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
+                torch.cuda.synchronize()
+                t_tracking_end = time.time()
                 
                 # Check if tracking failed (e.g., no points initialized yet)
                 if render_pkg is None:
@@ -836,12 +884,35 @@ class FrontEnd(mp.Process):
                 if self.single_thread:      
                     create_kf = check_time and create_kf
                 
+                t_kf_start = time.time()
                 if create_kf:     
                     self.current_window, removed = self.add_to_window(cur_frame_idx, curr_visibility, self.occ_aware_visibility, self.current_window)       
                     depth_map = self.add_new_keyframe(cur_frame_idx, depth=render_pkg["depth"], opacity=render_pkg["opacity"], init=False)
                     self.request_keyframe(cur_frame_idx, viewpoint, self.current_window, depth_map)
                 else:
                     self.cleanup(cur_frame_idx)
+                torch.cuda.synchronize()
+                t_kf_end = time.time()
+                
+                # ==================== 帧计时汇总 ====================
+                t_frame_end = time.time()
+                t_frame_total = (t_frame_end - t_frame_start) * 1000
+                t_cam_init = (t_cam_init_end - t_cam_init_start) * 1000
+                t_tracking = (t_tracking_end - t_tracking_start) * 1000
+                t_kf_creation = (t_kf_end - t_kf_start) * 1000
+                
+                kf_tag = " [KF]" if create_kf else ""
+                Log(f"[Frame {cur_frame_idx}]{kf_tag} 总计: {t_frame_total:.1f}ms | "
+                    f"相机初始化: {t_cam_init:.1f}ms | "
+                    f"Tracking: {t_tracking:.1f}ms ("
+                    f"get_pose: {self._timing_get_pose:.1f}ms, "
+                    f"get_depth: {self._timing_get_depth:.1f}ms, "
+                    f"光流: {self._timing_optical_flow:.1f}ms, "
+                    f"位姿优化: {self._timing_pose_opt:.1f}ms/{self._timing_pose_opt_iters}itr) | "
+                    f"KF处理: {t_kf_creation:.1f}ms"
+                    + (f" (process_depth: {getattr(self, '_timing_process_depth', 0.0):.1f}ms)" if create_kf else ""),
+                    tag="Timing")
+                # ====================================================
                 
                 cur_frame_idx += 1          
 
