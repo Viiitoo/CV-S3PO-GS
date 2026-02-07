@@ -187,7 +187,16 @@ class FrontEnd(mp.Process):
 
         # get mono_depth from MASt3R
         img = viewpoint.original_image
-        depth = get_depth(img, img, self.model, return_conf=False)
+        mast_viz_cfg = self.config.get("mast3r_edge_viz", None)
+        if isinstance(mast_viz_cfg, dict):
+            _cfg = dict(mast_viz_cfg)
+            if _cfg.get("enabled", False):
+                viz_dir = os.path.join(self.save_dir, "viz_mast3r_pc_edge")
+                _cfg["dir"] = viz_dir
+                _cfg["frame_idx"] = int(cur_frame_idx)
+                _cfg["tag"] = "f{:06d}".format(int(cur_frame_idx))
+            mast_viz_cfg = _cfg
+        depth = get_depth(img, img, self.model, return_conf=False, mast3r_edge_viz=mast_viz_cfg)
         viewpoint.mono_depth = depth
         
         self.kf_indices = []
@@ -214,16 +223,11 @@ class FrontEnd(mp.Process):
             # 为可视化补充运行期信息（不污染原config引用）
             _cfg = dict(rgb_edge_pnp_cfg)
             viz = dict(_cfg.get("viz", {}))
-            # 如果启用了edge_guided_matching，即使viz.enabled为False，也设置viz_dir和tag（用于轮廓可视化）
-            if viz.get("enabled", False) or _cfg.get("edge_guided_matching", False):
+            if viz.get("enabled", False):
                 viz_dir = os.path.join(self.save_dir, "viz_rgb_edge_pnp")
                 viz["dir"] = viz_dir
                 viz["frame_idx"] = int(cur_frame_idx)
                 viz["tag"] = "f{:06d}_kf{:06d}".format(int(cur_frame_idx), int(last_keyframe_idx))
-                # 如果edge_guided_matching启用但viz.enabled未设置，则启用viz
-                if _cfg.get("edge_guided_matching", False) and not viz.get("enabled", False):
-                    viz["enabled"] = True
-                    print(f"[轮廓可视化] 检测到edge_guided_matching启用，自动启用可视化保存")
             _cfg["viz"] = viz
             rgb_edge_pnp_cfg = _cfg
         rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
@@ -231,7 +235,16 @@ class FrontEnd(mp.Process):
                             rgb_edge_pnp=rgb_edge_pnp_cfg)
         
         # get mono_depth from MASt3R
-        depth = get_depth(img2, img2, self.model, return_conf=False)
+        mast_viz_cfg = self.config.get("mast3r_edge_viz", None)
+        if isinstance(mast_viz_cfg, dict):
+            _cfg = dict(mast_viz_cfg)
+            if _cfg.get("enabled", False):
+                viz_dir = os.path.join(self.save_dir, "viz_mast3r_pc_edge")
+                _cfg["dir"] = viz_dir
+                _cfg["frame_idx"] = int(cur_frame_idx)
+                _cfg["tag"] = "f{:06d}".format(int(cur_frame_idx))
+            mast_viz_cfg = _cfg
+        depth = get_depth(img2, img2, self.model, return_conf=False, mast3r_edge_viz=mast_viz_cfg)
         viewpoint.mono_depth = depth
         
         # 计算光流（如果启用）

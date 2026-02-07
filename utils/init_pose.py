@@ -16,19 +16,12 @@ from PIL.ImageOps import exif_transpose
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
+from typing import Optional
 
 from gaussian_splatting.gaussian_renderer import render_with_custom_resolution
 from utils.edge_extraction import EdgeExtractor
 
 import torchvision.transforms as tvf
-
-# 尝试导入Open3D用于点云保存
-try:
-    import open3d as o3d
-    O3D_AVAILABLE = True
-except ImportError:
-    O3D_AVAILABLE = False
-    print("[轮廓可视化] 警告: Open3D不可用，无法保存点云PLY文件")
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 ImgNorm = tvf.Compose([tvf.ToTensor(), tvf.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
@@ -52,6 +45,64 @@ def _to_uint8_rgb(img):
             arr = arr * 255.0
         arr = arr.astype(np.uint8)
     return arr
+
+
+def _write_ply_xyzrgb_ascii(save_path: str, xyz: np.ndarray, rgb_u8: np.ndarray):
+    """写一个简单的ASCII PLY（x y z + uchar rgb），便于可视化查看。"""
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    rgb_u8 = np.asarray(rgb_u8, dtype=np.uint8).reshape(-1, 3)
+    assert len(xyz) == len(rgb_u8)
+
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {len(xyz)}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    )
+    with open(save_path, "w") as f:
+        f.write(header)
+        for p, c in zip(xyz, rgb_u8):
+            f.write(f"{p[0]} {p[1]} {p[2]} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+
+
+def _save_mast3r_pc_edge_viz(viz_dir: str,
+                             tag: str,
+                             rgb_u8: np.ndarray,
+                             score_map: np.ndarray,
+                             mask_map: np.ndarray,
+                             ply_xyz: Optional[np.ndarray] = None,
+                             ply_rgb_u8: Optional[np.ndarray] = None):
+    """
+    保存 MASt3R 点云轮廓提取可视化：
+    - score_map/mask_map: HxW, float32/bool
+    - rgb_u8: HxWx3 uint8 (与 score_map 同分辨率或已对齐)
+    """
+    os.makedirs(viz_dir, exist_ok=True)
+
+    # 保存 score colormap
+    s = np.clip(score_map, 0.0, 1.0)
+    s_u8 = (s * 255).astype(np.uint8)
+    s_color = cv2.applyColorMap(s_u8, cv2.COLORMAP_TURBO)
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_score.png"), s_color)
+
+    # 保存 mask
+    m = (mask_map.astype(np.uint8) * 255)
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_mask.png"), m)
+
+    # 保存 overlay（红色覆盖mask）
+    ov = rgb_u8.copy()
+    ov[..., 0] = np.maximum(ov[..., 0], m)  # R channel (RGB)
+    cv2.imwrite(os.path.join(viz_dir, f"{tag}_overlay.png"), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+
+    # 保存 PLY（可选）
+    if ply_xyz is not None and ply_rgb_u8 is not None and len(ply_xyz) > 0:
+        _write_ply_xyzrgb_ascii(os.path.join(viz_dir, f"{tag}_pc_edge.ply"), ply_xyz, ply_rgb_u8)
 
 def _save_rgb_edge_pnp_viz(viz_dir,
                            tag,
@@ -129,263 +180,6 @@ def _save_rgb_edge_pnp_viz(viz_dir,
         cv2.line(canvas, (x1, y1), (x2, y2), color=color, thickness=thickness, lineType=cv2.LINE_AA)
 
     cv2.imwrite(os.path.join(viz_dir, f"{tag}_matches.png"), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
-
-
-def _save_3d_edge_projection_viz(viz_dir,
-                                 tag,
-                                 rgb_u8,
-                                 pts3d,
-                                 edge_mask_2d,
-                                 K,
-                                 dist_coeffs=None,
-                                 max_points=10000,
-                                 edge_scores_2d=None):
-    """
-    保存3D轮廓点在图像上的投影可视化（改进版，更清晰显示轮廓点）
-    
-    Args:
-        viz_dir: 保存目录
-        tag: 文件名标签
-        rgb_u8: RGB图像 (H, W, 3) uint8
-        pts3d: 3D点云 (H, W, 3)
-        edge_mask_2d: 轮廓mask (H, W) bool
-        K: 相机内参 (3, 3)
-        dist_coeffs: 畸变系数，可选
-        max_points: 最大显示点数
-        edge_scores_2d: 轮廓分数 (H, W)，可选，用于热力图显示
-    """
-    os.makedirs(viz_dir, exist_ok=True)
-    
-    H, W = rgb_u8.shape[:2]
-    
-    # 1. 保存轮廓mask（二值图）
-    edge_mask_vis = (edge_mask_2d.astype(np.uint8) * 255)
-    cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge_mask_3d.png"), edge_mask_vis)
-    
-    # 2. 创建叠加图像：在RGB图像上标记轮廓点（使用更明显的标记）
-    overlay = rgb_u8.copy()
-    
-    # 获取轮廓点的2D坐标
-    edge_y, edge_x = np.where(edge_mask_2d)
-    
-    # 如果轮廓点太多，随机采样显示（但保留更多点以便看到完整轮廓）
-    display_points = min(len(edge_y), max_points)
-    if len(edge_y) > max_points:
-        indices = np.random.choice(len(edge_y), max_points, replace=False)
-        edge_y_display = edge_y[indices]
-        edge_x_display = edge_x[indices]
-    else:
-        edge_y_display = edge_y
-        edge_x_display = edge_x
-    
-    # 在图像上标记轮廓点（使用更明显的红色，更大的点）
-    for y, x in zip(edge_y_display, edge_x_display):
-        # 绘制红色圆点标记轮廓点（半径3，更明显）
-        cv2.circle(overlay, (int(x), int(y)), radius=3, color=(255, 0, 0), thickness=-1)
-        # 添加白色边框以便在深色区域也能看到
-        cv2.circle(overlay, (int(x), int(y)), radius=3, color=(255, 255, 255), thickness=1)
-    
-    # 保存叠加图像
-    cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge_overlay_3d.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-    
-    # 3. 如果有轮廓分数，创建热力图可视化
-    if edge_scores_2d is not None and edge_scores_2d.shape == edge_mask_2d.shape:
-        # 创建热力图：轮廓分数越高，颜色越红
-        heatmap = np.zeros((H, W, 3), dtype=np.uint8)
-        # 归一化分数到0-255
-        scores_norm = np.clip((edge_scores_2d / (edge_scores_2d.max() + 1e-6)) * 255, 0, 255).astype(np.uint8)
-        # 红色通道表示轮廓分数
-        heatmap[:, :, 0] = scores_norm  # 红色
-        heatmap[:, :, 1] = 0
-        heatmap[:, :, 2] = 0
-        # 叠加到原图（半透明）
-        heatmap_overlay = cv2.addWeighted(rgb_u8, 0.6, heatmap, 0.4, 0)
-        cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge_heatmap_3d.png"), cv2.cvtColor(heatmap_overlay, cv2.COLOR_RGB2BGR))
-    
-    # 4. 投影3D轮廓点到图像空间（使用相机参数）
-    valid_mask = np.isfinite(pts3d).all(axis=2) & (pts3d[:, :, 2] > 0)
-    edge_3d_points = pts3d[edge_mask_2d & valid_mask]  # 只取有效的轮廓3D点
-    
-    if len(edge_3d_points) > 0:
-        # 投影3D点到2D
-        if dist_coeffs is not None:
-            projected_points, _ = cv2.projectPoints(
-                edge_3d_points.reshape(-1, 1, 3),
-                np.zeros(3), np.zeros(3), K, dist_coeffs
-            )
-            projected_points = projected_points.reshape(-1, 2)
-        else:
-            # 无畸变情况下的简单投影
-            projected_points = edge_3d_points[:, :2] / edge_3d_points[:, 2:3]
-            projected_points = projected_points @ K[:2, :2].T + K[:2, 2]
-        
-        # 创建投影可视化
-        proj_overlay = rgb_u8.copy()
-        
-        # 限制显示点数
-        display_proj_points = min(len(projected_points), max_points)
-        if len(projected_points) > max_points:
-            indices = np.random.choice(len(projected_points), max_points, replace=False)
-            projected_points_display = projected_points[indices]
-        else:
-            projected_points_display = projected_points
-        
-        # 绘制投影点（使用更明显的绿色，更大的点）
-        for pt in projected_points_display:
-            x, y = int(round(pt[0])), int(round(pt[1]))
-            if 0 <= x < W and 0 <= y < H:
-                # 绘制绿色圆点（半径2）
-                cv2.circle(proj_overlay, (x, y), radius=2, color=(0, 255, 0), thickness=-1)
-                # 添加白色边框
-                cv2.circle(proj_overlay, (x, y), radius=2, color=(255, 255, 255), thickness=1)
-        
-        cv2.imwrite(os.path.join(viz_dir, f"{tag}_edge_projection_3d.png"), cv2.cvtColor(proj_overlay, cv2.COLOR_RGB2BGR))
-    
-    print(f"[轮廓可视化] 已保存3D轮廓投影图像到 {viz_dir}/{tag}_*.png (轮廓点数: {len(edge_y)})")
-
-
-def _save_colored_pointcloud_ply(points_3d: np.ndarray,
-                                  edge_mask: np.ndarray,
-                                  viz_dir: str,
-                                  tag: str,
-                                  rgb_u8: np.ndarray = None,
-                                  pts3d_2d: np.ndarray = None,
-                                  K: np.ndarray = None,
-                                  dist_coeffs: np.ndarray = None,
-                                  max_points: int = 500000,
-                                  edge_color: tuple = (255, 0, 0),
-                                  valid_indices_2d: tuple = None):
-    """
-    保存带颜色标记的点云PLY文件（保留原始颜色，轮廓点用特殊颜色标记）
-    
-    Args:
-        points_3d: 3D点云 (N, 3)
-        edge_mask: 轮廓mask (N,) bool
-        viz_dir: 保存目录
-        tag: 文件名标签
-        rgb_u8: RGB图像 (H, W, 3) uint8，用于获取原始颜色
-        pts3d_2d: 3D点云对应的2D坐标 (H, W, 3)，用于映射到图像
-        K: 相机内参 (3, 3)，用于投影
-        dist_coeffs: 畸变系数，可选
-        max_points: 最大保存点数（如果点太多，随机采样）
-        edge_color: 轮廓点标记颜色 (R, G, B)，默认红色(255, 0, 0)
-        valid_indices_2d: 2D索引元组 (y_indices, x_indices)，如果提供则直接使用索引获取颜色（最快）
-    """
-    if not O3D_AVAILABLE:
-        print("[轮廓可视化] 警告: Open3D不可用，跳过点云PLY保存")
-        return
-    
-    os.makedirs(viz_dir, exist_ok=True)
-    
-    N = len(points_3d)
-    if N == 0:
-        print("[轮廓可视化] 警告: 点云为空，跳过PLY保存")
-        return
-    
-    # 如果点太多，随机采样
-    if N > max_points:
-        indices = np.random.choice(N, max_points, replace=False)
-        points_3d = points_3d[indices]
-        edge_mask = edge_mask[indices]
-        print(f"[轮廓可视化] 点云点数过多({N})，随机采样到{max_points}个点")
-    
-    # 创建颜色数组
-    colors = np.zeros((len(points_3d), 3), dtype=np.uint8)
-    
-    # 如果有RGB图像和投影信息，从图像中获取原始颜色
-    if rgb_u8 is not None and K is not None:
-        H, W = rgb_u8.shape[:2]
-        
-        # 如果提供了valid_indices_2d，直接使用索引获取颜色（最快最准确）
-        if valid_indices_2d is not None and len(valid_indices_2d) == 2:
-            y_indices, x_indices = valid_indices_2d
-            if len(y_indices) == len(points_3d):
-                # 直接通过索引从RGB图像获取颜色（向量化操作，最快）
-                for i, (y, x) in enumerate(zip(y_indices, x_indices)):
-                    if 0 <= x < W and 0 <= y < H:
-                        colors[i] = rgb_u8[y, x]
-                    else:
-                        colors[i] = [128, 128, 128]
-            else:
-                # 索引数量不匹配，使用投影方法
-                if dist_coeffs is not None:
-                    projected_points, _ = cv2.projectPoints(
-                        points_3d.reshape(-1, 1, 3),
-                        np.zeros(3), np.zeros(3), K, dist_coeffs
-                    )
-                    projected_points = projected_points.reshape(-1, 2)
-                else:
-                    projected_points = points_3d[:, :2] / points_3d[:, 2:3]
-                    projected_points = projected_points @ K[:2, :2].T + K[:2, 2]
-                
-                for i, (x, y) in enumerate(projected_points):
-                    x_int, y_int = int(round(x)), int(round(y))
-                    if 0 <= x_int < W and 0 <= y_int < H:
-                        colors[i] = rgb_u8[y_int, x_int]
-                    else:
-                        colors[i] = [128, 128, 128]
-        # 如果有pts3d_2d（H, W, 3格式），尝试通过最近邻查找匹配点
-        elif pts3d_2d is not None and pts3d_2d.shape[:2] == (H, W):
-            # 使用投影方法（更可靠）
-            if dist_coeffs is not None:
-                projected_points, _ = cv2.projectPoints(
-                    points_3d.reshape(-1, 1, 3),
-                    np.zeros(3), np.zeros(3), K, dist_coeffs
-                )
-                projected_points = projected_points.reshape(-1, 2)
-            else:
-                projected_points = points_3d[:, :2] / points_3d[:, 2:3]
-                projected_points = projected_points @ K[:2, :2].T + K[:2, 2]
-            
-            for i, (x, y) in enumerate(projected_points):
-                x_int, y_int = int(round(x)), int(round(y))
-                if 0 <= x_int < W and 0 <= y_int < H:
-                    colors[i] = rgb_u8[y_int, x_int]
-                else:
-                    colors[i] = [128, 128, 128]
-        else:
-            # 使用投影方法
-            if dist_coeffs is not None:
-                projected_points, _ = cv2.projectPoints(
-                    points_3d.reshape(-1, 1, 3),
-                    np.zeros(3), np.zeros(3), K, dist_coeffs
-                )
-                projected_points = projected_points.reshape(-1, 2)
-            else:
-                # 无畸变情况下的简单投影
-                projected_points = points_3d[:, :2] / points_3d[:, 2:3]
-                projected_points = projected_points @ K[:2, :2].T + K[:2, 2]
-            
-            # 从RGB图像中采样颜色
-            for i, (x, y) in enumerate(projected_points):
-                x_int, y_int = int(round(x)), int(round(y))
-                if 0 <= x_int < W and 0 <= y_int < H:
-                    colors[i] = rgb_u8[y_int, x_int]
-                else:
-                    colors[i] = [128, 128, 128]
-        
-        # 轮廓点用特殊颜色标记（覆盖原始颜色）
-        colors[edge_mask] = edge_color
-        print(f"[轮廓可视化] 已从RGB图像获取原始颜色，轮廓点用特殊颜色({edge_color})标记")
-    else:
-        # 没有RGB图像信息，使用默认策略：轮廓点红色，非轮廓点灰色
-        colors[edge_mask] = edge_color  # 红色 - 轮廓点
-        colors[~edge_mask] = [128, 128, 128]  # 灰色 - 非轮廓点
-        print(f"[轮廓可视化] 未提供RGB图像信息，使用默认颜色方案")
-    
-    # 创建Open3D点云对象
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_3d.astype(np.float64))
-    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
-    
-    # 保存PLY文件
-    ply_path = os.path.join(viz_dir, f"{tag}_pointcloud.ply")
-    o3d.io.write_point_cloud(ply_path, pcd)
-    
-    num_edge_points = edge_mask.sum()
-    num_total_points = len(points_3d)
-    print(f"[轮廓可视化] ✓ 已保存带颜色标记的点云PLY: {ply_path}")
-    print(f"  - 总点数: {num_total_points}, 轮廓点(特殊颜色): {num_edge_points} ({num_edge_points/num_total_points*100:.1f}%), 非轮廓点(原始颜色): {num_total_points-num_edge_points}")
 
 
 def _weighted_ransac_pnp(objectPoints: np.ndarray,
@@ -606,243 +400,10 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
 
     pts3d = depth_to_3d(render_depth.detach().cpu().numpy(), K_new, dist_coeffs=dist_coeffs)
 
-    # ========== 在MASt3R输出的原始点云上提取轮廓（下采样前）==========
-    edge_mask_3d = None
-    edge_scores_3d = None
-    
-    # 检查是否启用轮廓引导的匹配点采样
-    enable_edge_guided_matching = rgb_edge_pnp is not None and isinstance(rgb_edge_pnp, dict) and rgb_edge_pnp.get("edge_guided_matching", False)
-    
-    # 调试信息
-    if rgb_edge_pnp is not None:
-        print(f"[轮廓提取调试] rgb_edge_pnp存在: {isinstance(rgb_edge_pnp, dict)}, edge_guided_matching: {rgb_edge_pnp.get('edge_guided_matching', 'NOT_SET')}")
-    
-    if enable_edge_guided_matching:
-        try:
-            H, W = pts3d.shape[:2]
-            
-            # 将pts3d从(H, W, 3)转换为点云数组(N, 3)，只取有效点
-            valid_mask = np.isfinite(pts3d).all(axis=2) & (pts3d[:, :, 2] > 0)  # 深度>0且所有坐标有效
-            valid_indices = np.where(valid_mask)
-            
-            if len(valid_indices[0]) > 0:
-                # 提取有效点云（原始点云，下采样前）
-                original_points_3d = pts3d[valid_indices].reshape(-1, 3)
-                
-                # 创建轮廓提取器（使用STAR-Edge方法）
-                edge_config = rgb_edge_pnp.get("edge_extraction", {})
-                # 确保使用STAR-Edge方法
-                if "method" not in edge_config:
-                    edge_config["method"] = "star_edge"  # 或 "localsh" 或 "fast_curvature"
-                extractor = EdgeExtractor(edge_config)
-                
-                # 在原始点云上提取轮廓（使用STAR-Edge的LocalSH方法）
-                edge_mask_3d, edge_scores_3d = extractor.extract_edges(original_points_3d)
-                
-                # 将轮廓mask映射回(H, W)格式，用于后续匹配点筛选
-                edge_mask_2d = np.zeros((H, W), dtype=bool)
-                edge_mask_2d[valid_indices] = edge_mask_3d
-                
-                # 统计轮廓点数量
-                num_edge_points = edge_mask_3d.sum()
-                num_valid_points = len(original_points_3d)
-                edge_ratio_actual = num_edge_points / num_valid_points if num_valid_points > 0 else 0.0
-                
-                print(f"[轮廓提取] 点云尺寸: {H}x{W}, 有效点: {num_valid_points}, 轮廓点: {num_edge_points} ({edge_ratio_actual*100:.2f}%)")
-                
-                # ========== 保存3D轮廓投影可视化 ==========
-                # 检查是否启用可视化保存（复用RGB边缘PNP的可视化配置）
-                cfg = rgb_edge_pnp or {}
-                viz_cfg = cfg.get("viz", {}) if isinstance(cfg, dict) else {}
-                viz_enabled = bool(viz_cfg.get("enabled", False))
-                viz_every = int(viz_cfg.get("viz_every", 1))
-                viz_dir = viz_cfg.get("dir", None)
-                tag = viz_cfg.get("tag", None)
-                
-                # 调试信息
-                print(f"[轮廓可视化调试] viz_enabled: {viz_enabled}, viz_dir: {viz_dir}, tag: {tag}, viz_every: {viz_every}")
-                
-                # 检查是否需要保存（需要viz_enabled、viz_dir、tag，且满足viz_every条件）
-                if viz_enabled and viz_dir is not None and tag is not None:
-                    try:
-                        # 获取当前帧索引
-                        frame_idx = int(viz_cfg.get("frame_idx", 0))
-                        
-                        # 调试信息：显示是否满足保存条件
-                        should_save = (frame_idx % viz_every == 0)
-                        print(f"[轮廓可视化调试] frame_idx: {frame_idx}, viz_every: {viz_every}, should_save: {should_save}")
-                        
-                        if should_save:
-                            print(f"[轮廓可视化] 开始保存轮廓可视化图片...")
-                            # 获取RGB图像（使用view1的图像，因为pts3d对应的是view1的深度）
-                            rgb1 = view1["img"]  # 1x3xH1xW1, normalized
-                            rgb1_u8 = _to_uint8_rgb(rgb1)
-                            
-                            # pts3d的尺寸应该与view1["img"]匹配（都是H1, W1）
-                            # 但edge_mask_2d是基于pts3d的原始尺寸(H, W)创建的
-                            # 需要调整edge_mask_2d以匹配RGB图像尺寸
-                            H1, W1 = rgb1_u8.shape[:2]
-                            
-                            if H != H1 or W != W1:
-                                # 需要调整尺寸以匹配RGB图像
-                                edge_mask_2d_resized = cv2.resize(
-                                    edge_mask_2d.astype(np.uint8), 
-                                    (W1, H1), 
-                                    interpolation=cv2.INTER_NEAREST
-                                ).astype(bool)
-                                
-                                # pts3d也需要调整尺寸
-                                pts3d_resized = pts3d.reshape(H, W, 3)
-                                pts3d_resized = cv2.resize(
-                                    pts3d_resized.astype(np.float32),
-                                    (W1, H1),
-                                    interpolation=cv2.INTER_LINEAR
-                                )
-                            else:
-                                edge_mask_2d_resized = edge_mask_2d
-                                pts3d_resized = pts3d.reshape(H, W, 3)
-                            
-                            # 将轮廓分数映射回2D（用于热力图显示）
-                            edge_scores_2d_resized = None
-                            if edge_scores_3d is not None:
-                                edge_scores_2d = np.zeros((H, W), dtype=np.float32)
-                                edge_scores_2d[valid_indices] = edge_scores_3d
-                                if H != H1 or W != W1:
-                                    edge_scores_2d_resized = cv2.resize(
-                                        edge_scores_2d.astype(np.float32),
-                                        (W1, H1),
-                                        interpolation=cv2.INTER_LINEAR
-                                    )
-                                else:
-                                    edge_scores_2d_resized = edge_scores_2d
-                            
-                            # 保存可视化（包含轮廓分数用于热力图）
-                            _save_3d_edge_projection_viz(
-                                viz_dir=viz_dir,
-                                tag=f"{tag}_3d_edge",
-                                rgb_u8=rgb1_u8,
-                                pts3d=pts3d_resized,
-                                edge_mask_2d=edge_mask_2d_resized,
-                                K=K_new,
-                                dist_coeffs=dist_coeffs,
-                                max_points=10000,  # 增加显示点数以便看到完整轮廓
-                                edge_scores_2d=edge_scores_2d_resized
-                            )
-                            
-                            # 保存带颜色标记的点云PLY文件（保留原始颜色，轮廓点用特殊颜色标记）
-                            try:
-                                # 从调整尺寸后的pts3d和edge_mask中提取点云，以便与RGB图像对应
-                                valid_mask_resized = np.isfinite(pts3d_resized).all(axis=2) & (pts3d_resized[:, :, 2] > 0)
-                                valid_indices_resized = np.where(valid_mask_resized)
-                                
-                                if len(valid_indices_resized[0]) > 0:
-                                    points_3d_for_ply = pts3d_resized[valid_indices_resized].reshape(-1, 3)
-                                    edge_mask_2d_flat = edge_mask_2d_resized[valid_indices_resized]
-                                    
-                                    _save_colored_pointcloud_ply(
-                                        points_3d=points_3d_for_ply,
-                                        edge_mask=edge_mask_2d_flat,
-                                        viz_dir=viz_dir,
-                                        tag=f"{tag}_3d_edge",
-                                        rgb_u8=rgb1_u8,  # RGB图像，用于获取原始颜色
-                                        pts3d_2d=pts3d_resized,  # 3D点云对应的2D坐标（用于快速查找）
-                                        K=K_new,  # 相机内参
-                                        dist_coeffs=dist_coeffs,  # 畸变系数
-                                        max_points=500000,  # 最多保存50万个点
-                                        edge_color=(255, 0, 0),  # 轮廓点标记颜色：红色
-                                        valid_indices_2d=valid_indices_resized  # 直接传递索引，用于快速获取颜色
-                                    )
-                                else:
-                                    print("[轮廓可视化] 警告: 调整尺寸后的点云无效，跳过PLY保存")
-                            except Exception as e:
-                                print(f"[轮廓可视化] 警告: 保存点云PLY失败: {e}")
-                                import traceback
-                                traceback.print_exc()
-                            except Exception as e:
-                                print(f"[轮廓可视化] 警告: 保存点云PLY失败: {e}")
-                                import traceback
-                                traceback.print_exc()
-                    except Exception as e:
-                        print(f"[轮廓可视化] 警告: 保存3D轮廓可视化失败: {e}")
-            else:
-                print("[轮廓提取] 警告: 没有有效的3D点")
-                edge_mask_2d = None
-        except Exception as e:
-            print(f"[轮廓提取] 警告: 轮廓提取失败: {e}, 使用常规匹配")
-            edge_mask_3d = None
-            edge_mask_2d = None
-            edge_scores_3d = None
-
     # Extract 3D points from image 1 and corresponding 2D points from image 2 for PnP
     objectPoints = pts3d[matches_im1[:, 1].astype(int), matches_im1[:, 0].astype(int), :]
     objectPoints = objectPoints.astype(np.float32)
     imagePoints = matches_im2.astype(np.float32)
-    
-    # ========== 使用轮廓信息筛选或加权匹配点 ==========
-    if enable_edge_guided_matching and edge_mask_2d is not None:
-        try:
-            # 获取匹配点在图像1中的位置
-            match_y = matches_im1[:, 1].astype(int)
-            match_x = matches_im1[:, 0].astype(int)
-            
-            # 检查匹配点是否在轮廓区域
-            valid_coords = (match_y >= 0) & (match_y < H) & (match_x >= 0) & (match_x < W)
-            edge_match_mask = np.zeros(len(matches_im1), dtype=bool)
-            edge_match_mask[valid_coords] = edge_mask_2d[match_y[valid_coords], match_x[valid_coords]]
-            
-            # 根据配置决定是筛选还是加权
-            edge_match_mode = rgb_edge_pnp.get("edge_match_mode", "weight")  # "filter" 或 "weight"
-            edge_match_ratio = rgb_edge_pnp.get("edge_match_ratio", 0.5)  # 如果filter模式，保留的轮廓匹配点比例
-            
-            if edge_match_mode == "filter":
-                # 筛选模式：优先保留轮廓区域的匹配点
-                num_edge_matches = int(len(matches_im1) * edge_match_ratio)
-                num_non_edge_matches = len(matches_im1) - num_edge_matches
-                
-                edge_match_indices = np.where(edge_match_mask)[0]
-                non_edge_match_indices = np.where(~edge_match_mask)[0]
-                
-                # 保留所有轮廓匹配点，如果不够则补充非轮廓点
-                if len(edge_match_indices) >= num_edge_matches:
-                    selected_edge = edge_match_indices[:num_edge_matches]
-                else:
-                    selected_edge = edge_match_indices
-                
-                # 补充非轮廓点
-                if len(non_edge_match_indices) > 0:
-                    num_needed = num_non_edge_matches - (len(edge_match_indices) - len(selected_edge))
-                    if num_needed > 0:
-                        selected_non_edge = non_edge_match_indices[:min(num_needed, len(non_edge_match_indices))]
-                        selected_indices = np.concatenate([selected_edge, selected_non_edge])
-                    else:
-                        selected_indices = selected_edge
-                else:
-                    selected_indices = selected_edge
-                
-                # 筛选匹配点
-                objectPoints = objectPoints[selected_indices]
-                imagePoints = imagePoints[selected_indices]
-                # 同步更新匹配点索引（用于后续可视化）
-                matches_im1 = matches_im1[selected_indices]
-                matches_im2 = matches_im2[selected_indices]
-                
-                print(f"[轮廓引导匹配] 筛选后: {len(selected_indices)}/{len(matches_im1)} 匹配点 (轮廓点: {len(selected_edge)})")
-                # 筛选模式下不需要3D轮廓权重（已经通过筛选实现了）
-                weights_3d = None
-            else:
-                # 加权模式：轮廓区域的匹配点权重更高（与RGB边缘加权合并）
-                edge_weights_3d = np.ones(len(matches_im1), dtype=np.float32)
-                edge_weights_3d[edge_match_mask] = rgb_edge_pnp.get("edge_3d_weight", 2.0)
-                
-                # 保存3D轮廓权重，稍后与RGB边缘权重合并
-                weights_3d = edge_weights_3d
-                
-                print(f"[轮廓引导匹配] 加权模式: {edge_match_mask.sum()}/{len(matches_im1)} 匹配点在轮廓区域")
-        except Exception as e:
-            print(f"[轮廓引导匹配] 警告: 轮廓引导匹配失败: {e}, 使用常规匹配")
-            weights_3d = None
-    else:
-        weights_3d = None
 
     # ---------- RGB(+可选深度) 轮廓加权 ----------
     weights = None
@@ -903,16 +464,67 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
             edge_mask1, edge_mask2 = None, None
     else:
         edge_mask1, edge_mask2 = None, None
-    
-    # ========== 合并3D轮廓权重和RGB边缘权重 ==========
-    if enable_edge_guided_matching and 'weights_3d' in locals() and weights_3d is not None:
-        if weights is not None:
-            # 合并RGB边缘权重和3D轮廓权重
-            weights = weights * weights_3d
-            print(f"[轮廓引导匹配] 已合并RGB边缘权重和3D轮廓权重")
-        elif len(objectPoints) == len(weights_3d):
-            # 如果只有3D轮廓权重，直接使用
-            weights = weights_3d
+
+    # ---------- 3D点云轮廓引导匹配（STAR-Edge / 曲率等） ----------
+    # 说明：对“渲染深度生成的3D点云”做轮廓提取，然后把轮廓分数映射到每个匹配的3D点上。
+    # - weight: 将每个match的权重乘上 (1 + edge_3d_weight * score)
+    # - filter: 保留 score 最高的 edge_match_ratio 部分匹配点
+    if cfg.get("edge_guided_matching", False):
+        try:
+            edge_method_cfg = cfg.get("edge_extraction", {}) if isinstance(cfg, dict) else {}
+            extractor3d = EdgeExtractor({"edge_extraction": edge_method_cfg})
+
+            # 全量点云：来自 depth_to_3d 的 (H,W,3)
+            pts3d_all = pts3d.reshape(-1, 3).astype(np.float32)
+            valid = np.isfinite(pts3d_all).all(axis=1) & (pts3d_all[:, 2] > 1e-6)
+            pts3d_all = pts3d_all[valid]
+
+            if len(pts3d_all) >= 50:
+                # 下采样以加速（用EdgeExtractor自带体素下采样/点数上限）
+                down_pts, _ = extractor3d.voxel_downsample(pts3d_all)
+                if len(down_pts) >= 20:
+                    edge_mask3d, edge_scores3d = extractor3d.extract_edges(down_pts[:, :3])
+                    edge_scores3d = np.asarray(edge_scores3d, dtype=np.float32).reshape(-1)
+
+                    # 把downsampled分数映射回每个match的3D点（最近邻）
+                    try:
+                        from scipy.spatial import cKDTree
+                        tree = cKDTree(down_pts[:, :3])
+                        _, nn = tree.query(objectPoints[:, :3], k=1, workers=-1)
+                        score_match = edge_scores3d[np.asarray(nn, dtype=np.int64)]
+                    except Exception:
+                        score_match = None
+
+                    if score_match is not None:
+                        mode = str(cfg.get("edge_match_mode", "weight")).lower()
+                        edge_3d_weight = float(cfg.get("edge_3d_weight", 2.0))
+
+                        if mode == "filter":
+                            keep_ratio = float(cfg.get("edge_match_ratio", 0.5))
+                            keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
+                            keep_n = int(round(len(objectPoints) * keep_ratio))
+                            keep_n = max(0, min(keep_n, len(objectPoints)))
+                            # 保证PnP最小点数
+                            if keep_n >= 6:
+                                keep_idx = np.argsort(score_match)[-keep_n:]
+                                objectPoints = objectPoints[keep_idx]
+                                imagePoints = imagePoints[keep_idx]
+                                matches_im1 = matches_im1[keep_idx]
+                                matches_im2 = matches_im2[keep_idx]
+                                if weights is not None:
+                                    weights = np.asarray(weights, dtype=np.float32)[keep_idx]
+                                score_match = score_match[keep_idx]
+
+                        # 默认 weight 模式
+                        if mode != "filter":
+                            w3d = (1.0 + edge_3d_weight * np.clip(score_match, 0.0, 1.0)).astype(np.float32)
+                            if weights is None:
+                                weights = w3d
+                            else:
+                                weights = (np.asarray(weights, dtype=np.float32) * w3d).astype(np.float32)
+        except Exception:
+            # 3D轮廓引导失败时自动回退
+            pass
 
     # Skip PnP if there are not enough points
     if len(objectPoints) < 6 or len(imagePoints) < 6:
@@ -987,7 +599,7 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
         return pose_w2c, render_depth.detach().cpu().numpy()  
 
 # Extract depth and confidence from MASt3R
-def get_depth(img1, img2, model, return_conf=False): # <--- 改动：增加参数
+def get_depth(img1, img2, model, return_conf=False, mast3r_edge_viz=None): # <--- 改动：增加参数
     device = 'cuda'
     # ... (原有参数设置不变) ...
     H1 = img1.shape[1]
@@ -1002,6 +614,79 @@ def get_depth(img1, img2, model, return_conf=False): # <--- 改动：增加参�
     z1 = pts1[...,2]
     z1 = z1.detach().cpu().numpy()
     z1_resized = cv2.resize(z1, (W1,H1), interpolation=cv2.INTER_NEAREST)
+
+    # --- 新增：对 MASt3R 输出点云做每帧轮廓提取并保存可视化 ---
+    cfg = mast3r_edge_viz or {}
+    if isinstance(cfg, dict) and cfg.get("enabled", False):
+        try:
+            viz_every = int(cfg.get("viz_every", 1))
+            frame_idx = int(cfg.get("frame_idx", 0))
+            viz_dir = cfg.get("dir", None)
+            tag = cfg.get("tag", f"f{frame_idx:06d}")
+            save_ply = bool(cfg.get("save_ply", True))
+            max_ply_points = int(cfg.get("max_ply_points", 50000))
+            max_ply_points = max(1000, max_ply_points)
+
+            if viz_dir is not None and (frame_idx % viz_every == 0):
+                # MASt3R 点云（在 view1 分辨率）
+                pts_map = pred1['pts3d'].squeeze(0).detach().cpu().numpy()  # (h,w,3)
+                h, w = pts_map.shape[:2]
+                pts_flat = pts_map.reshape(-1, 3)
+                valid = np.isfinite(pts_flat).all(axis=1) & (pts_flat[:, 2] > 1e-6)
+                valid_idx = np.flatnonzero(valid)
+
+                if len(valid_idx) > 200:
+                    pts_valid = pts_flat[valid_idx].astype(np.float32)
+
+                    # edge_extraction 配置：优先使用 cfg.edge_extraction，否则用全局 config 的默认（star_edge）
+                    edge_cfg = cfg.get("edge_extraction", {})
+                    extractor = EdgeExtractor({"edge_extraction": edge_cfg} if isinstance(edge_cfg, dict) else None)
+                    edge_mask, edge_scores = extractor.extract_edges(pts_valid)
+                    edge_scores = np.asarray(edge_scores, dtype=np.float32).reshape(-1)
+                    edge_mask = np.asarray(edge_mask, dtype=bool).reshape(-1)
+
+                    # 映射回2D map（view1分辨率）
+                    score_full = np.zeros((h * w,), dtype=np.float32)
+                    mask_full = np.zeros((h * w,), dtype=bool)
+                    score_full[valid_idx] = edge_scores
+                    mask_full[valid_idx] = edge_mask
+                    score_map = score_full.reshape(h, w)
+                    mask_map = mask_full.reshape(h, w)
+
+                    # 用 view1['img'] 生成对应分辨率的 RGB（比原图更对齐）
+                    rgb_pred_u8 = _to_uint8_rgb(view1["img"])  # HWC uint8 RGB
+                    if rgb_pred_u8.shape[:2] != (h, w):
+                        rgb_pred_u8 = cv2.resize(rgb_pred_u8, (w, h), interpolation=cv2.INTER_LINEAR)
+
+                    # 构建 PLY（仅保存一个下采样子集，避免文件过大）
+                    ply_xyz = None
+                    ply_rgb = None
+                    if save_ply:
+                        if len(valid_idx) > max_ply_points:
+                            sub = np.random.choice(valid_idx, size=max_ply_points, replace=False)
+                            sub = np.asarray(sub, dtype=np.int64)
+                        else:
+                            sub = valid_idx.astype(np.int64)
+
+                        sub_pts = pts_flat[sub]
+                        sub_rgb = rgb_pred_u8.reshape(-1, 3)[sub].copy()
+                        sub_edge = mask_full[sub]
+                        sub_rgb[sub_edge] = np.array([255, 0, 0], dtype=np.uint8)
+                        ply_xyz = sub_pts
+                        ply_rgb = sub_rgb
+
+                    _save_mast3r_pc_edge_viz(
+                        viz_dir=viz_dir,
+                        tag=tag,
+                        rgb_u8=rgb_pred_u8,
+                        score_map=score_map,
+                        mask_map=mask_map,
+                        ply_xyz=ply_xyz,
+                        ply_rgb_u8=ply_rgb,
+                    )
+        except Exception:
+            # 仅可视化失败时不影响主流程
+            pass
    
     # --- 改动：处理置信度 ---
     if return_conf:

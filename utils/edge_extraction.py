@@ -19,7 +19,7 @@ import cv2
 import sys
 import os
 import time
-import importlib.util
+import glob
 from typing import Optional, Tuple, Union
 
 # 尝试导入scipy用于快速KNN
@@ -30,59 +30,41 @@ except ImportError:
     SCIPY_AVAILABLE = False
     print("[EdgeExtraction] scipy不可用，将使用基础方法")
 
-# 强制使用STAR-Edge的LocalSH（无回退机制）
+# 尝试导入LocalSH（保持兼容性）
 LOCALSH_AVAILABLE = False
 LocalSH = None
-LocalSHFeature = None
 
-# 尝试从pre_process目录导入（.so文件所在位置）
-localsh_preprocess_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
-                                       'STAR-Edge', 'pre_process')
-# 尝试多个可能的.so文件名（Python 3.8, 3.11等）
-import sys
-python_version = f"{sys.version_info.major}{sys.version_info.minor}"
-localsh_so_path = os.path.join(localsh_preprocess_path, f'LocalSH.cpython-{python_version}-x86_64-linux-gnu.so')
-# 如果找不到，尝试Python 3.8版本（向后兼容）
-if not os.path.exists(localsh_so_path):
-    localsh_so_path = os.path.join(localsh_preprocess_path, 'LocalSH.cpython-38-x86_64-linux-gnu.so')
-# 如果还是找不到，尝试从LocalSH目录直接加载
-if not os.path.exists(localsh_so_path):
-    localsh_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'STAR-Edge', 'LocalSH')
-    localsh_so_path = os.path.join(localsh_dir, f'LocalSH.cpython-{python_version}-x86_64-linux-gnu.so')
+try:
+    repo_root = os.path.dirname(os.path.dirname(__file__))
 
-if os.path.exists(localsh_so_path):
-    sys.path.insert(0, localsh_preprocess_path)
-    try:
-        # 使用importlib直接加载.so文件
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("LocalSH", localsh_so_path)
-        if spec is not None and spec.loader is not None:
-            _LocalSH = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(_LocalSH)
-            LocalSH = _LocalSH
-            
-            # 尝试访问LocalSHFeature子模块
-            if hasattr(_LocalSH, 'LocalSHFeature'):
-                LocalSHFeature = _LocalSH.LocalSHFeature
-                LOCALSH_AVAILABLE = True
-                print("[EdgeExtraction] ✓ LocalSH 模块加载成功（强制使用STAR-Edge）")
-            else:
-                raise ImportError("LocalSH模块缺少LocalSHFeature子模块")
-        else:
-            raise ImportError(f"无法创建LocalSH模块规范: {localsh_so_path}")
-    except Exception as e:
-        raise RuntimeError(f"[EdgeExtraction] ✗ LocalSH 模块加载失败: {e}\n"
-                          f"请确保STAR-Edge的LocalSH模块已正确编译。\n"
-                          f"路径: {localsh_so_path}")
-else:
-    raise RuntimeError(f"[EdgeExtraction] ✗ LocalSH .so文件不存在: {localsh_so_path}\n"
-                      f"请确保STAR-Edge已正确安装。")
+    # 兼容多种LocalSH编译产物目录布局：
+    # - STAR-Edge/LocalSH/build
+    # - STAR-Edge/LocalSH/build/lib.linux-*/ (setuptools生成)
+    # - STAR-Edge/LocalSH (inplace build)
+    # - STAR-Edge/pre_process (已有预编译so)
+    candidate_paths = [
+        os.path.join(repo_root, 'STAR-Edge', 'LocalSH', 'build'),
+        os.path.join(repo_root, 'STAR-Edge', 'LocalSH'),
+        os.path.join(repo_root, 'STAR-Edge', 'pre_process'),
+    ]
+    candidate_paths.extend(glob.glob(os.path.join(repo_root, 'STAR-Edge', 'LocalSH', 'build', 'lib.*')))
+
+    for p in candidate_paths:
+        if os.path.isdir(p) and p not in sys.path:
+            sys.path.insert(0, p)
+
+    import LocalSH as _LocalSH  # pybind11 module
+    LocalSH = _LocalSH
+    LOCALSH_AVAILABLE = True
+    print("[EdgeExtraction] LocalSH 模块加载成功")
+except ImportError as e:
+    pass  # 静默处理，使用高效备选方法
 
 
 class EdgeExtractionConfig:
     """边缘提取配置参数"""
     def __init__(self, config_dict=None):
-        # 方法选择: 'depth_gradient', 'fast_curvature', 'hybrid'
+        # 方法选择: 'depth_gradient', 'fast_curvature', 'hybrid', 'star_edge', 'localsh'
         self.method = 'depth_gradient'  # 默认使用最快的深度梯度方法
         
         # 深度梯度方法参数
@@ -105,6 +87,18 @@ class EdgeExtractionConfig:
         self.dilate_kernel_size = 5  # 膨胀核大小
         self.gaussian_blur_size = 3  # 高斯模糊核大小
         self.edge_weight = 2.0  # 边缘区域权重
+
+        # STAR-Edge(LocalSH + MLP) 参数（“满血版”）
+        # 说明：STAR-Edge 的预处理脚本默认 bw=10, kk=26, sampleNum=bw*4
+        self.star_edge_bw = 10
+        self.star_edge_kk = 26
+        self.star_edge_sample_num = 40
+        self.star_edge_threshold = 0.5
+        self.star_edge_model_path = None  # 默认使用 STAR-Edge/model/best.ckpt
+        self.star_edge_use_cuda = False   # 默认CPU推理（更稳）
+        self.star_edge_max_points = 50000  # LocalSH最大点数（过大将自动子采样）
+        self.star_edge_fallback = 'fast_curvature'
+        self.star_edge_profile = False  # 打印耗时统计（用于benchmark）
         
         # 从配置字典更新
         if config_dict is not None:
@@ -116,6 +110,54 @@ class EdgeExtractionConfig:
         for key, value in edge_config.items():
             if hasattr(self, key):
                 setattr(self, key, value)
+
+
+# ==================== STAR-Edge 推理辅助（带缓存）====================
+_STAR_EDGE_NET = None
+_STAR_EDGE_NET_DEVICE = None
+_STAR_EDGE_NET_PATH = None
+_STAR_EDGE_WARNED = False
+
+
+def _load_star_edge_classifier(model_path: str, use_cuda: bool = False):
+    """
+    加载 STAR-Edge 的 MLP 分类器（DescClassifier）。
+    - model_path: ckpt路径（默认 STAR-Edge/model/best.ckpt）
+    - use_cuda: 是否把MLP放到CUDA（LocalSH仍在CPU侧计算）
+    """
+    global _STAR_EDGE_NET, _STAR_EDGE_NET_DEVICE, _STAR_EDGE_NET_PATH
+
+    device = torch.device("cuda:0" if (use_cuda and torch.cuda.is_available()) else "cpu")
+    device_key = str(device)
+
+    if _STAR_EDGE_NET is not None and _STAR_EDGE_NET_PATH == model_path and _STAR_EDGE_NET_DEVICE == device_key:
+        return _STAR_EDGE_NET, device
+
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    star_edge_root = os.path.join(repo_root, "STAR-Edge")
+    if os.path.isdir(star_edge_root) and star_edge_root not in sys.path:
+        sys.path.insert(0, star_edge_root)
+
+    try:
+        from net import DescClassifier  # STAR-Edge/net.py
+    except Exception as e:
+        raise ImportError(f"无法导入 STAR-Edge/net.py 的 DescClassifier: {e}")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"STAR-Edge 模型权重不存在: {model_path}")
+
+    net = DescClassifier()
+    ckpt = torch.load(model_path, map_location="cpu")
+    state = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    # 允许strict=False以兼容不同保存格式（例如Lightning额外前缀）
+    net.load_state_dict(state, strict=False)
+    net.to(device=device)
+    net.eval()
+
+    _STAR_EDGE_NET = net
+    _STAR_EDGE_NET_DEVICE = device_key
+    _STAR_EDGE_NET_PATH = model_path
+    return net, device
 
 
 class EdgeExtractor:
@@ -518,41 +560,27 @@ class EdgeExtractor:
         
         # 对于大点云，先进行下采样以加速计算
         if N > 5000:
-            # 使用体素下采样而不是随机采样，保持空间分布
-            downsampled_points, sample_indices = self.voxel_downsample(points, voxel_size=self.config.voxel_size)
-            sample_size = len(downsampled_points)
-            
-            if sample_size < 10:
-                # 如果下采样后点数太少，回退到随机采样
-                sample_size = min(5000, N)
-                sample_indices = np.random.choice(N, sample_size, replace=False)
-                sample_points = points[sample_indices]
-            else:
-                sample_points = downsampled_points
+            # 随机采样子集进行曲率计算
+            sample_size = min(5000, N)
+            sample_indices = np.random.choice(N, sample_size, replace=False)
+            sample_points = points[sample_indices]
             
             # 计算采样点的曲率
             normals = self.compute_normals_fast(sample_points)
             curvatures_sample = self.compute_curvature_fast(sample_points, normals)
             
-            # 将曲率传播到所有点（使用KNN找到最近邻）
+            # 将曲率传播到所有点（使用最近邻）
             curvatures = np.zeros(N, dtype=np.float32)
             curvatures[sample_indices] = curvatures_sample
             
-            # 对未采样的点，使用KNN找到最近采样点的曲率
+            # 对未采样的点，使用最近采样点的曲率
             non_sample_mask = np.ones(N, dtype=bool)
             non_sample_mask[sample_indices] = False
             non_sample_indices = np.where(non_sample_mask)[0]
             
-            if len(non_sample_indices) > 0 and SCIPY_AVAILABLE:
-                # 使用KDTree找到最近邻采样点
-                from scipy.spatial import cKDTree
-                tree = cKDTree(sample_points)
-                _, nearest_indices = tree.query(points[non_sample_indices], k=1, workers=-1)
-                # 使用最近邻采样点的曲率
-                curvatures[non_sample_indices] = curvatures_sample[nearest_indices]
-            elif len(non_sample_indices) > 0:
-                # 回退方法：使用采样点曲率的中位数（比平均值更稳健）
-                curvatures[non_sample_indices] = np.median(curvatures_sample)
+            if len(non_sample_indices) > 0:
+                # 简单方法：使用采样点曲率的平均值
+                curvatures[non_sample_indices] = curvatures_sample.mean()
         else:
             # 小点云直接计算
             normals = self.compute_normals_fast(points)
@@ -565,45 +593,17 @@ class EdgeExtractor:
         else:
             edge_scores = np.zeros(N, dtype=np.float32)
             
-        # 选择边缘点：优先使用阈值，如果阈值无效则使用比例
-        # 计算曲率的统计信息
-        curv_mean = curvatures.mean()
-        curv_std = curvatures.std()
-        
-        # 使用阈值方法：曲率 > mean + threshold * std
-        threshold_value = curv_mean + self.config.curvature_threshold * curv_std
-        edge_mask_by_threshold = curvatures > threshold_value
-        
-        # 使用比例方法：取前edge_ratio的高曲率点
+        # 选择边缘点：取前edge_ratio的高曲率点
         num_edges = max(10, int(N * self.config.edge_ratio))
         num_edges = min(num_edges, N)
         
         if num_edges >= N:
-            edge_mask_by_ratio = np.ones(N, dtype=bool)
+            edge_mask = np.ones(N, dtype=bool)
         else:
+            # 使用argpartition更快地找到top-k
             threshold_idx = N - num_edges
-            threshold_ratio = np.partition(curvatures, threshold_idx)[threshold_idx]
-            edge_mask_by_ratio = curvatures >= threshold_ratio
-        
-        # 智能选择策略：优先使用阈值方法，但如果结果不合理则调整
-        edge_mask = edge_mask_by_threshold
-        
-        # 如果阈值方法选的点太少（<0.5%），降低阈值
-        if edge_mask.sum() < N * 0.005:
-            # 使用更宽松的阈值：mean + 0.5 * threshold * std
-            threshold_value_relaxed = curv_mean + 0.5 * self.config.curvature_threshold * curv_std
-            edge_mask = curvatures > threshold_value_relaxed
-            # 如果还是太少，使用比例方法作为下限
-            if edge_mask.sum() < N * 0.005:
-                edge_mask = edge_mask_by_ratio
-        # 如果阈值方法选的点太多（>30%），提高阈值
-        elif edge_mask.sum() > N * 0.3:
-            # 使用更严格的阈值：mean + 1.5 * threshold * std
-            threshold_value_strict = curv_mean + 1.5 * self.config.curvature_threshold * curv_std
-            edge_mask = curvatures > threshold_value_strict
-            # 如果还是太多，使用比例方法作为上限
-            if edge_mask.sum() > N * 0.3:
-                edge_mask = edge_mask_by_ratio
+            threshold = np.partition(curvatures, threshold_idx)[threshold_idx]
+            edge_mask = curvatures >= threshold
         
         return edge_mask, edge_scores
     
@@ -611,7 +611,7 @@ class EdgeExtractor:
     
     def extract_edges(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        提取边缘点（强制使用STAR-Edge方法，无回退）
+        提取边缘点（自动选择方法）
         
         Args:
             points: 点云 (N, 3)
@@ -620,112 +620,159 @@ class EdgeExtractor:
             edge_mask: 边缘点mask (N,) bool
             edge_scores: 边缘分数 (N,)
         """
-        # 强制使用STAR-Edge的LocalSH方法（无回退机制）
-        if not LOCALSH_AVAILABLE:
-            raise RuntimeError("[轮廓提取] ✗ LocalSH不可用，无法使用STAR-Edge方法。"
-                             "请确保LocalSH模块已正确加载。")
-        
-        method_name = getattr(self.config, 'method', 'star_edge')
-        if method_name not in ['star_edge', 'localsh']:
-            print(f"[轮廓提取] 警告: method={method_name}，强制使用STAR-Edge方法")
-        
-        print(f"[轮廓提取] ✓ 使用STAR-Edge LocalSH方法提取轮廓")
-        return self.extract_edges_star_edge(points)
-    
-    def extract_edges_star_edge(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        method = getattr(self.config, "method", "fast_curvature")
+
+        if method == "fast_curvature":
+            return self.extract_edges_curvature_fast(points)
+
+        if method in ("star_edge", "localsh"):
+            edge_mask, edge_scores = self.extract_edges_star_edge(points)
+            if edge_mask is not None and edge_scores is not None:
+                return edge_mask, edge_scores
+
+            # star-edge不可用时回退
+            fallback = getattr(self.config, "star_edge_fallback", "fast_curvature")
+            if fallback == "fast_curvature":
+                return self.extract_edges_curvature_fast(points)
+            # 兜底
+            return self.extract_edges_curvature_fast(points)
+
+        if method == "hybrid":
+            # 当前工程的“hybrid”主要用于2D(RGB/Depth)融合，这里对3D点云先回退到曲率
+            return self.extract_edges_curvature_fast(points)
+
+        # 未知方法：回退
+        return self.extract_edges_curvature_fast(points)
+
+    def extract_edges_star_edge(self, points: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        使用STAR-Edge的LocalSH方法提取边缘点（强制方法，无回退）
-        
-        Args:
-            points: 点云 (N, 3)
-            
+        STAR-Edge “满血”3D轮廓提取：
+        - LocalSHFeature: 计算 Local Spherical Curve 描述子（默认 bw=10）
+        - DescClassifier(MLP): 对每点输出边缘概率
+
         Returns:
-            edge_mask: 边缘点mask (N,) bool
-            edge_scores: 边缘分数 (N,)
+            edge_mask, edge_scores
+            若 LocalSH/模型不可用，则返回 (None, None) 让上层回退。
         """
-        if not LOCALSH_AVAILABLE or LocalSHFeature is None:
-            raise RuntimeError("[轮廓提取] ✗ LocalSH模块不可用，无法使用STAR-Edge方法")
-        
-        N = len(points)
-        if N < 10:
-            return np.zeros(N, dtype=bool), np.zeros(N, dtype=np.float32)
-        
-        # STAR-Edge参数
-        bw = 10  # 球面谐波带宽
-        kk = 26  # KNN邻居数
-        sampleNum = bw * 4  # 采样数
-        
-        # 调用LocalSH计算特征（强制使用，无回退）
-        if LocalSHFeature is None:
-            raise RuntimeError("[轮廓提取] ✗ LocalSHFeature不可用")
-        
-        result = LocalSHFeature.ComLSHF_knn_upsample(
-            points.astype(np.float64),
-            bw, kk, sampleNum
-        )
-        
-        # 获取特征描述符和法线
-        descs = result["Descs"]  # (N, bw) - 局部球面曲线特征
-        normals = result["normals"]  # (N, 3) - 法线
-        
-        # 使用特征描述符的方差或熵来识别边缘点
-        # 边缘点的特征描述符通常有更高的变化
-        if descs.shape[1] > 0:
-            # 计算每个点特征描述符的方差
-            desc_var = np.var(descs, axis=1)
-            
-            # 归一化到0-1
-            if desc_var.max() - desc_var.min() > 1e-6:
-                edge_scores = (desc_var - desc_var.min()) / (desc_var.max() - desc_var.min())
+        if points is None:
+            return np.zeros((0,), dtype=bool), np.zeros((0,), dtype=np.float32)
+        pts = np.asarray(points)
+        if pts.size == 0:
+            return np.zeros((0,), dtype=bool), np.zeros((0,), dtype=np.float32)
+
+        global _STAR_EDGE_WARNED
+        if (not LOCALSH_AVAILABLE) or (LocalSH is None):
+            if not _STAR_EDGE_WARNED:
+                print("[EdgeExtraction] STAR-Edge(LocalSH) 不可用：未成功导入 LocalSH.so，将回退到 fast_curvature（可检查fftw依赖/LocalSH编译版本）")
+                _STAR_EDGE_WARNED = True
+            return None, None
+
+        # LocalSH 需要 float64
+        pts64 = np.asarray(pts[:, :3], dtype=np.float64)
+        N = pts64.shape[0]
+        profile = bool(getattr(self.config, "star_edge_profile", False))
+        t_total0 = time.perf_counter() if profile else None
+
+        # 过大点云自动子采样，避免LocalSH拖慢
+        maxN = int(getattr(self.config, "star_edge_max_points", 50000))
+        if N > maxN:
+            # 避免递归时重复打印profile
+            prev_profile = getattr(self.config, "star_edge_profile", False)
+            if profile:
+                setattr(self.config, "star_edge_profile", False)
+            idx = np.random.choice(N, size=maxN, replace=False)
+            sub_pts = pts64[idx]
+            t_sub0 = time.perf_counter() if profile else None
+            sub_mask, sub_scores = self.extract_edges_star_edge(sub_pts)
+            t_sub1 = time.perf_counter() if profile else None
+            if profile:
+                setattr(self.config, "star_edge_profile", prev_profile)
+            if sub_mask is None or sub_scores is None:
+                return None, None
+
+            # 将子集分数传播到全量点云（优先使用cKDTree，避免粗暴填充）
+            t_prop0 = time.perf_counter() if profile else None
+            if SCIPY_AVAILABLE:
+                try:
+                    tree = cKDTree(sub_pts)
+                    _, nn = tree.query(pts64, k=1, workers=-1)
+                    scores = sub_scores[np.asarray(nn, dtype=np.int64)].astype(np.float32)
+                except Exception:
+                    scores = np.zeros((N,), dtype=np.float32)
+                    scores[idx] = sub_scores.astype(np.float32)
             else:
-                edge_scores = np.zeros(N, dtype=np.float32)
-            
-            # 使用阈值方法选择边缘点
-            curv_mean = desc_var.mean()
-            curv_std = desc_var.std()
-            threshold_value = curv_mean + self.config.curvature_threshold * curv_std
-            edge_mask = desc_var > threshold_value
-            
-            # 如果阈值方法选的点太多或太少，使用比例方法调整
-            # 计算目标轮廓点数量（考虑比例和绝对上限）
-            num_edges_by_ratio = max(10, int(N * self.config.edge_ratio))
-            # 如果有max_points配置，限制绝对数量上限
-            if hasattr(self.config, 'max_points') and self.config.max_points > 0:
-                num_edges_threshold = min(num_edges_by_ratio, self.config.max_points)
-            else:
-                num_edges_threshold = num_edges_by_ratio
-            
-            if edge_mask.sum() < num_edges_threshold * 0.5:
-                # 太少，降低阈值（但不超过edge_ratio的2倍）
-                threshold_value = curv_mean + 0.5 * self.config.curvature_threshold * curv_std
-                edge_mask = desc_var > threshold_value
-                # 如果还是太少，使用比例方法确保至少有一些边缘点
-                if edge_mask.sum() < num_edges_threshold * 0.5:
-                    threshold_idx = N - num_edges_threshold
-                    threshold_ratio = np.partition(desc_var, threshold_idx)[threshold_idx]
-                    edge_mask = desc_var >= threshold_ratio
-            elif edge_mask.sum() > num_edges_threshold * 2.0:
-                # 太多，使用比例方法限制到目标数量（考虑max_points上限）
-                threshold_idx = N - num_edges_threshold
-                threshold_ratio = np.partition(desc_var, threshold_idx)[threshold_idx]
-                edge_mask = desc_var >= threshold_ratio
-            
-            # 最终检查：确保不超过max_points绝对上限
-            if hasattr(self.config, 'max_points') and self.config.max_points > 0:
-                if edge_mask.sum() > self.config.max_points:
-                    # 如果超过上限，只保留分数最高的max_points个点
-                    edge_scores_sorted = np.argsort(desc_var)[::-1]  # 从高到低排序
-                    edge_mask = np.zeros(N, dtype=bool)
-                    edge_mask[edge_scores_sorted[:self.config.max_points]] = True
-                    print(f"[轮廓提取] 轮廓点数量({edge_mask.sum()})超过上限({self.config.max_points})，已限制到上限")
-            
-            # 如果阈值方法选的点在合理范围内，保持原结果
-        else:
-            # 回退到法线变化方法
-            # 计算法线变化（使用KNN）
-            edge_mask = np.zeros(N, dtype=bool)
-            edge_scores = np.zeros(N, dtype=np.float32)
-        
+                # 无scipy时退化：未采样点填充均值（比填0更稳）
+                scores = np.zeros((N,), dtype=np.float32)
+                scores[idx] = sub_scores.astype(np.float32)
+                fill = float(sub_scores.mean()) if len(sub_scores) > 0 else 0.0
+                scores[scores == 0] = fill
+            t_prop1 = time.perf_counter() if profile else None
+
+            thr = float(getattr(self.config, "star_edge_threshold", 0.5))
+            mask = scores >= thr
+            if profile:
+                t_total1 = time.perf_counter()
+                print(
+                    "[STAR-Edge] N={} maxN={} sub_ms={:.2f} prop_ms={:.2f} total_ms={:.2f} scipy={}".format(
+                        int(N),
+                        int(maxN),
+                        (t_sub1 - t_sub0) * 1000.0 if (t_sub0 is not None and t_sub1 is not None) else -1.0,
+                        (t_prop1 - t_prop0) * 1000.0 if (t_prop0 is not None and t_prop1 is not None) else -1.0,
+                        (t_total1 - t_total0) * 1000.0 if t_total0 is not None else -1.0,
+                        bool(SCIPY_AVAILABLE),
+                    )
+                )
+            return mask.astype(bool), scores.astype(np.float32)
+
+        bw = int(getattr(self.config, "star_edge_bw", 10))
+        kk = int(getattr(self.config, "star_edge_kk", 26))
+        sample_num = int(getattr(self.config, "star_edge_sample_num", bw * 4))
+
+        # 计算LocalSH描述子
+        try:
+            localsh_feature = getattr(LocalSH, "LocalSHFeature", None)
+            if localsh_feature is None:
+                return None, None
+            t_lsh0 = time.perf_counter() if profile else None
+            result = localsh_feature.ComLSHF_knn_upsample(pts64, bw, kk, sample_num)
+            t_lsh1 = time.perf_counter() if profile else None
+            desc = result["Descs"]  # (N, bw)
+        except Exception:
+            return None, None
+
+        # MLP 推理
+        try:
+            repo_root = os.path.dirname(os.path.dirname(__file__))
+            default_ckpt = os.path.join(repo_root, "STAR-Edge", "model", "best.ckpt")
+            model_path = getattr(self.config, "star_edge_model_path", None) or default_ckpt
+            use_cuda = bool(getattr(self.config, "star_edge_use_cuda", False))
+            net, device = _load_star_edge_classifier(model_path, use_cuda=use_cuda)
+
+            t_mlp0 = time.perf_counter() if profile else None
+            x = torch.from_numpy(np.asarray(desc, dtype=np.float32)).to(device=device)
+            with torch.no_grad():
+                prob = net(x).detach().cpu().numpy().astype(np.float32)
+            t_mlp1 = time.perf_counter() if profile else None
+        except Exception:
+            return None, None
+
+        thr = float(getattr(self.config, "star_edge_threshold", 0.5))
+        edge_scores = np.clip(prob, 0.0, 1.0).astype(np.float32)
+        edge_mask = (edge_scores >= thr).astype(bool)
+        if profile:
+            t_total1 = time.perf_counter()
+            print(
+                "[STAR-Edge] N={} bw={} kk={} sample={} localsh_ms={:.2f} mlp_ms={:.2f} total_ms={:.2f} device={}".format(
+                    int(N),
+                    int(bw),
+                    int(kk),
+                    int(sample_num),
+                    (t_lsh1 - t_lsh0) * 1000.0 if (t_lsh0 is not None and t_lsh1 is not None) else -1.0,
+                    (t_mlp1 - t_mlp0) * 1000.0 if (t_mlp0 is not None and t_mlp1 is not None) else -1.0,
+                    (t_total1 - t_total0) * 1000.0 if t_total0 is not None else -1.0,
+                    str(device),
+                )
+            )
         return edge_mask, edge_scores
     
     def project_points_to_image(self, points_3d: np.ndarray, 

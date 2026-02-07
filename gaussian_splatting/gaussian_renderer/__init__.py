@@ -163,8 +163,18 @@ def render(
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    # Try to get additional information for full-mode optical flow calculation (MotionGS style)
+    # If rasterizer doesn't support, fall back to basic mode
+    proj_2D = None
+    conic_2D = None
+    conic_2D_inv = None
+    gs_per_pixel = None
+    weight_per_gs_pixel = None
+    x_mu = None
+    alpha = None
+    
     if mask is not None:
-        rendered_image, radii, depth, opacity = rasterizer(
+        rasterizer_result = rasterizer(
             means3D=means3D[mask],
             means2D=means2D[mask],
             shs=shs[mask],
@@ -178,7 +188,7 @@ def render(
         )
         n_touched = None
     else:
-        rendered_image, radii, depth, opacity, n_touched = rasterizer(
+        rasterizer_result = rasterizer(
             means3D=means3D,
             means2D=means2D,
             shs=shs,
@@ -190,10 +200,45 @@ def render(
             theta=viewpoint_camera.cam_rot_delta,
             rho=viewpoint_camera.cam_trans_delta,
         )
+    
+    # Handle different return value counts (basic mode vs full mode)
+    # 【调试信息】记录rasterizer返回值数量（仅在首次检测到不同模式时打印）
+    if not hasattr(render, '_rasterizer_mode_logged'):
+        render._rasterizer_mode_logged = {}
+    
+    result_count = len(rasterizer_result)
+    if result_count not in render._rasterizer_mode_logged:
+        try:
+            from utils.logging_utils import Log
+            if result_count == 5:
+                Log(f"Render: Rasterizer返回5个值（基础模式）", tag="Render")
+            elif result_count == 10:
+                Log(f"Render: Rasterizer返回10个值（完整模式）", tag="Render")
+            else:
+                Log(f"Render: Rasterizer返回{result_count}个值（未知模式）", tag="Render")
+        except:
+            pass  # 如果Log不可用，静默失败
+        render._rasterizer_mode_logged[result_count] = True
+    
+    if len(rasterizer_result) == 5:
+        # Basic mode: rendered_image, radii, depth, opacity, n_touched
+        rendered_image, radii, depth, opacity, n_touched = rasterizer_result
+    elif len(rasterizer_result) == 10:
+        # Full mode (MotionGS style): rendered_image, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu
+        rendered_image, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu = rasterizer_result
+        opacity = alpha  # Use alpha as opacity for compatibility
+        n_touched = None  # Not returned in full mode
+    else:
+        # Fallback: try to unpack what we can
+        rendered_image = rasterizer_result[0]
+        radii = rasterizer_result[1] if len(rasterizer_result) > 1 else None
+        depth = rasterizer_result[2] if len(rasterizer_result) > 2 else None
+        opacity = rasterizer_result[3] if len(rasterizer_result) > 3 else None
+        n_touched = rasterizer_result[4] if len(rasterizer_result) > 4 else None
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {
+    result = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,
@@ -202,6 +247,24 @@ def render(
         "opacity": opacity,
         "n_touched": n_touched,
     }
+    
+    # Add full-mode optical flow information if available
+    if proj_2D is not None:
+        result["proj_2D"] = proj_2D
+    if conic_2D is not None:
+        result["conic_2D"] = conic_2D
+    if conic_2D_inv is not None:
+        result["conic_2D_inv"] = conic_2D_inv
+    if gs_per_pixel is not None:
+        result["gs_per_pixel"] = gs_per_pixel
+    if weight_per_gs_pixel is not None:
+        result["weight_per_gs_pixel"] = weight_per_gs_pixel
+    if x_mu is not None:
+        result["x_mu"] = x_mu
+    if alpha is not None:
+        result["alpha"] = alpha
+    
+    return result
 
 # Render depth map with specified resolution
 def render_with_custom_resolution(
@@ -326,8 +389,17 @@ def render_with_custom_resolution(
     else:
         colors_precomp = override_color
 
+    # Try to get additional information for full-mode optical flow calculation (MotionGS style)
+    proj_2D = None
+    conic_2D = None
+    conic_2D_inv = None
+    gs_per_pixel = None
+    weight_per_gs_pixel = None
+    x_mu = None
+    alpha = None
+    
     if mask is not None:
-        rendered_image, radii, depth, opacity = rasterizer(
+        rasterizer_result = rasterizer(
             means3D=means3D[mask],
             means2D=means2D[mask],
             shs=shs[mask],
@@ -341,7 +413,7 @@ def render_with_custom_resolution(
         )
         n_touched = None
     else:
-        rendered_image, radii, depth, opacity, n_touched = rasterizer(
+        rasterizer_result = rasterizer(
             means3D=means3D,
             means2D=means2D,
             shs=shs,
@@ -353,13 +425,30 @@ def render_with_custom_resolution(
             theta=viewpoint_camera.cam_rot_delta,
             rho=viewpoint_camera.cam_trans_delta,
         )
+    
+    # Handle different return value counts (basic mode vs full mode)
+    if len(rasterizer_result) == 5:
+        # Basic mode: rendered_image, radii, depth, opacity, n_touched
+        rendered_image, radii, depth, opacity, n_touched = rasterizer_result
+    elif len(rasterizer_result) == 10:
+        # Full mode (MotionGS style): rendered_image, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu
+        rendered_image, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu = rasterizer_result
+        opacity = alpha  # Use alpha as opacity for compatibility
+        n_touched = None  # Not returned in full mode
+    else:
+        # Fallback: try to unpack what we can
+        rendered_image = rasterizer_result[0]
+        radii = rasterizer_result[1] if len(rasterizer_result) > 1 else None
+        depth = rasterizer_result[2] if len(rasterizer_result) > 2 else None
+        opacity = rasterizer_result[3] if len(rasterizer_result) > 3 else None
+        n_touched = rasterizer_result[4] if len(rasterizer_result) > 4 else None
 
     # Restore original camera parameters
     viewpoint_camera.image_width = original_width
     viewpoint_camera.image_height = original_height
     viewpoint_camera.projection_matrix = original_projection_matrix
 
-    return {
+    result = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,
@@ -368,3 +457,21 @@ def render_with_custom_resolution(
         "opacity": opacity,
         "n_touched": n_touched,
     }
+    
+    # Add full-mode optical flow information if available
+    if proj_2D is not None:
+        result["proj_2D"] = proj_2D
+    if conic_2D is not None:
+        result["conic_2D"] = conic_2D
+    if conic_2D_inv is not None:
+        result["conic_2D_inv"] = conic_2D_inv
+    if gs_per_pixel is not None:
+        result["gs_per_pixel"] = gs_per_pixel
+    if weight_per_gs_pixel is not None:
+        result["weight_per_gs_pixel"] = weight_per_gs_pixel
+    if x_mu is not None:
+        result["x_mu"] = x_mu
+    if alpha is not None:
+        result["alpha"] = alpha
+    
+    return result

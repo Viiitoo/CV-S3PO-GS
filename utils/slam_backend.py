@@ -314,12 +314,15 @@ class BackEnd(mp.Process):
                 # ====================================================================
                 
                 # 【第280-282行】检查是否要计算flow loss
-                # 这行代码的意思是：如果满足三个条件，就计算flow loss
+                # 这行代码的意思是：如果满足四个条件，就计算flow loss
                 # 条件1：flow_loss_weight > 0（flow loss的权重大于0，说明启用了flow loss）
                 # 条件2：iteration_count >= flow_warm_up（迭代次数够了，可以开始用flow loss了）
                 # 条件3：kf_idx in self.motion_flow_dict（字典里有这个关键帧的motion flow）
+                # 条件4：flow_loss_interval - 每N次迭代才计算一次，避免每迭代都渲染+GS Flow导致严重卡顿
+                flow_loss_interval = self.config["Training"].get("flow_loss_interval", 5)
                 if (self.config["Training"].get("flow_loss_weight", 0) > 0 and
                     self.iteration_count >= self.config["Training"].get("flow_warm_up", 1000) and
+                    (self.iteration_count % flow_loss_interval) == 0 and
                     kf_idx in self.motion_flow_dict):  # 【问题1-1】在字典里查找当前关键帧的motion flow
                     
                     # 【问题1-1详细解释】
@@ -414,12 +417,69 @@ class BackEnd(mp.Process):
                                     if depth_for_flow.dim() == 2:
                                         depth_for_flow = depth_for_flow.unsqueeze(0)
                                     
-                                    # 【修复完成】计算GS Flow（这是3D模型预测的光流）
-                                    # 现在计算的是从当前关键帧到下一个关键帧的GS flow（已修复）
-                                    gs_flow = calculate_gs_flow(depth1=depth_for_flow, cam1=viewpoint, cam2=viewpoint_next)
+                                    # 【迁移完成】尝试使用完整模式计算GS Flow（MotionGS风格）
+                                    # 从render结果中提取完整模式所需的信息
+                                    proj_2D = render_pkg.get("proj_2D")
+                                    conic_2D = render_pkg.get("conic_2D")
+                                    conic_2D_inv = render_pkg.get("conic_2D_inv")
+                                    gs_per_pixel = render_pkg.get("gs_per_pixel")
+                                    weight_per_gs_pixel = render_pkg.get("weight_per_gs_pixel")
+                                    x_mu = render_pkg.get("x_mu")
                                     
-                                    # 【第337行】对齐GS Flow到Motion Flow的坐标系
-                                    gs_flow_aligned = warping_gs_flow(depth_for_flow, gs_flow, viewpoint, viewpoint_next)
+                                    # 从下一帧的render结果中提取信息
+                                    next_proj_2D = render_pkg_next.get("proj_2D")
+                                    next_conic_2D = render_pkg_next.get("conic_2D")
+                                    
+                                    # 【调试信息】检查完整模式所需的信息是否可用
+                                    full_mode_params = {
+                                        "proj_2D": proj_2D is not None,
+                                        "conic_2D": conic_2D is not None,
+                                        "conic_2D_inv": conic_2D_inv is not None,
+                                        "gs_per_pixel": gs_per_pixel is not None,
+                                        "weight_per_gs_pixel": weight_per_gs_pixel is not None,
+                                        "x_mu": x_mu is not None,
+                                        "next_proj_2D": next_proj_2D is not None,
+                                        "next_conic_2D": next_conic_2D is not None,
+                                    }
+                                    missing_params = [k for k, v in full_mode_params.items() if not v]
+                                    _log_flow = (self.iteration_count % max(1, flow_loss_interval * 10)) == 0  # 降低日志频率
+                                    
+                                    # 使用完整模式计算光流（如果所有必需信息都可用）
+                                    if all(full_mode_params.values()):
+                                        # 完整模式：使用高斯点的详细信息计算光流（更精确）
+                                        if _log_flow:
+                                            Log(f"GS Flow: [green]使用完整模式[/green] | 关键帧: {kf_idx} -> {next_kf_idx}", tag="Flow")
+                                        if proj_2D is not None and _log_flow:
+                                            Log(f"GS Flow: proj_2D形状: {list(proj_2D.shape) if hasattr(proj_2D, 'shape') else 'N/A'}", tag="Flow")
+                                        if gs_per_pixel is not None and _log_flow:
+                                            Log(f"GS Flow: gs_per_pixel形状: {list(gs_per_pixel.shape) if hasattr(gs_per_pixel, 'shape') else 'N/A'}", tag="Flow")
+                                        
+                                        gs_flow = calculate_gs_flow(
+                                            gs_per_pixel=gs_per_pixel,
+                                            weight_per_gs_pixel=weight_per_gs_pixel,
+                                            next_conic_2D=next_conic_2D,
+                                            conic_2D_inv=conic_2D_inv,
+                                            proj_2D=proj_2D,
+                                            next_proj_2D=next_proj_2D,
+                                            x_mu=x_mu
+                                        )
+                                        # 完整模式不需要warping，因为光流已经在正确的坐标系中
+                                        gs_flow_aligned = gs_flow
+                                        if _log_flow:
+                                            Log(f"GS Flow: 完整模式计算完成 | 光流形状: {list(gs_flow.shape) if hasattr(gs_flow, 'shape') else 'N/A'}", tag="Flow")
+                                    else:
+                                        # 回退到简化模式：基于深度图计算光流
+                                        if _log_flow:
+                                            Log(f"GS Flow: [yellow]使用简化模式[/yellow] | 关键帧: {kf_idx} -> {next_kf_idx}", tag="Flow")
+                                            if missing_params:
+                                                Log(f"GS Flow: 缺少参数: {', '.join(missing_params)}", tag="Flow")
+                                            Log(f"GS Flow: 使用深度图计算 | 深度形状: {list(depth_for_flow.shape) if hasattr(depth_for_flow, 'shape') else 'N/A'}", tag="Flow")
+                                        
+                                        gs_flow = calculate_gs_flow(depth1=depth_for_flow, cam1=viewpoint, cam2=viewpoint_next)
+                                        # 简化模式需要对齐到Motion Flow的坐标系
+                                        gs_flow_aligned = warping_gs_flow(depth_for_flow, gs_flow, viewpoint, viewpoint_next)
+                                        if _log_flow:
+                                            Log(f"GS Flow: 简化模式计算完成 | 光流形状: {list(gs_flow_aligned.shape) if hasattr(gs_flow_aligned, 'shape') else 'N/A'}", tag="Flow")
                                     
                                     # 【问题1-7详细解释】
                                     # 这行代码试图把gs_flow转换到motion_flow的坐标系

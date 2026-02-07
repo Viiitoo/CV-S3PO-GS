@@ -714,10 +714,100 @@ class GaussianModel:
             project_valid_depth_only=True,
         )
         
-        # 下采样点云
-        pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
-        new_xyz = np.asarray(pcd_tmp.points)
-        new_rgb = np.asarray(pcd_tmp.colors)
+        # 下采样点云（可选：轮廓引导采样）
+        use_edge_guided = bool(self.config.get("Dataset", {}).get("edge_guided_sampling", False))
+        if use_edge_guided:
+            try:
+                from utils.edge_extraction import EdgeExtractor
+
+                pts_all = np.asarray(pcd_tmp.points)
+                rgb_all = np.asarray(pcd_tmp.colors)
+
+                # 目标采样数量与原random_down_sample一致
+                target_n = max(1, int(len(pts_all) / float(downsample_factor)))
+                edge_keep_ratio = float(self.config.get("Dataset", {}).get("edge_keep_ratio", 0.5))
+                edge_keep_ratio = float(np.clip(edge_keep_ratio, 0.0, 1.0))
+                edge_n = int(round(target_n * edge_keep_ratio))
+                rand_n = max(0, target_n - edge_n)
+
+                # 使用全局 edge_extraction 配置（root级别）
+                edge_cfg = self.config.get("edge_extraction", {}) if isinstance(self.config, dict) else {}
+                extractor = EdgeExtractor({"edge_extraction": edge_cfg})
+
+                edge_mask, edge_scores = extractor.extract_edges(pts_all.astype(np.float32))
+                edge_mask = np.asarray(edge_mask, dtype=bool).reshape(-1)
+                edge_scores = np.asarray(edge_scores, dtype=np.float32).reshape(-1)
+
+                edge_idx = np.flatnonzero(edge_mask)
+                non_edge_idx = np.flatnonzero(~edge_mask)
+
+                # 从边缘点按分数采样（若不足则尽量全取）
+                chosen = []
+                if edge_n > 0 and len(edge_idx) > 0:
+                    edge_n_eff = min(edge_n, len(edge_idx))
+                    w = edge_scores[edge_idx].astype(np.float64)
+                    w = np.clip(w, 1e-6, None)
+                    w = w / w.sum()
+                    chosen_edge = np.random.choice(edge_idx, size=edge_n_eff, replace=False, p=w)
+                    chosen.append(chosen_edge)
+
+                # 非边缘点随机补齐
+                if rand_n > 0 and len(non_edge_idx) > 0:
+                    rand_n_eff = min(rand_n, len(non_edge_idx))
+                    chosen_rand = np.random.choice(non_edge_idx, size=rand_n_eff, replace=False)
+                    chosen.append(chosen_rand)
+
+                if len(chosen) == 0:
+                    # 退化：没有选到任何点，回退到random_down_sample
+                    pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+                    new_xyz = np.asarray(pcd_tmp.points)
+                    new_rgb = np.asarray(pcd_tmp.colors)
+                else:
+                    sel = np.unique(np.concatenate(chosen, axis=0))
+                    # 若不足target_n，再从剩余点补齐
+                    if len(sel) < target_n:
+                        remaining = np.setdiff1d(np.arange(len(pts_all)), sel, assume_unique=False)
+                        need = target_n - len(sel)
+                        if len(remaining) > 0:
+                            add = np.random.choice(remaining, size=min(need, len(remaining)), replace=False)
+                            sel = np.unique(np.concatenate([sel, add], axis=0))
+                    # 若超出target_n（因为unique/补齐），截断
+                    if len(sel) > target_n:
+                        sel = np.random.choice(sel, size=target_n, replace=False)
+
+                    new_xyz = pts_all[sel]
+                    new_rgb = rgb_all[sel]
+
+                    # 可视化保存（仅初始化时保存，避免每帧大量IO）
+                    if init and bool(self.config.get("Dataset", {}).get("save_edge_visualization", False)):
+                        try:
+                            save_dir = None
+                            if self.config is not None and "Results" in self.config:
+                                save_dir = self.config["Results"].get("save_dir", None)
+                            if save_dir is not None:
+                                edge_viz_dir = os.path.join(save_dir, "edge_guided_sampling")
+                                mkdir_p(edge_viz_dir)
+                                o3d_pcd = o3d.geometry.PointCloud()
+                                o3d_pcd.points = o3d.utility.Vector3dVector(new_xyz)
+                                # 轮廓点标红，非轮廓保留原色
+                                viz_rgb = new_rgb.copy()
+                                # sel 在原始索引空间，构建局部mask
+                                local_edge = edge_mask[sel]
+                                viz_rgb[local_edge] = np.array([1.0, 0.0, 0.0], dtype=viz_rgb.dtype)
+                                o3d_pcd.colors = o3d.utility.Vector3dVector(viz_rgb)
+                                ply_path = os.path.join(edge_viz_dir, "init_edge_guided_sampled.ply")
+                                o3d.io.write_point_cloud(ply_path, o3d_pcd)
+                        except Exception:
+                            pass
+            except Exception:
+                # 任意失败都不影响主流程：回退到random_down_sample
+                pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+                new_xyz = np.asarray(pcd_tmp.points)
+                new_rgb = np.asarray(pcd_tmp.colors)
+        else:
+            pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+            new_xyz = np.asarray(pcd_tmp.points)
+            new_rgb = np.asarray(pcd_tmp.colors)
         
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))

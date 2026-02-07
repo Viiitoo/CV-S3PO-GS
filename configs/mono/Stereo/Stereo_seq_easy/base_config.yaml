@@ -43,6 +43,7 @@ Training:
   use_gt_pose: True  # 使用真值位姿计算camera flow
   flow_loss_weight: 0.5  # flow loss权重，参考MotionGS
   flow_warm_up: 1000  # 在warm_up之后才开始计算flow loss
+  flow_loss_interval: 5  # 每N次map迭代才计算一次flow loss，避免每迭代都渲染+GS Flow导致卡顿（默认5）
   a_invalid: 1.1
   a_valid: 0.1
   alpha: 0.98
@@ -77,6 +78,31 @@ Training:
   spherical_harmonics: false
   tracking_itr_num: 100
   window_size: 8
+
+# ================= MASt3R 点云轮廓提取（每帧）可视化保存 =================
+# 说明：
+# - 轮廓提取直接作用于 MASt3R 输出的 pred['pts3d'] 点云（每帧）
+# - 输出到 results/.../viz_mast3r_pc_edge/ 下：
+#   - fXXXXXX_score.png / fXXXXXX_mask.png / fXXXXXX_overlay.png / fXXXXXX_pc_edge.ply
+mast3r_edge_viz:
+  enabled: true
+  # 若要“每帧”都跑 star-edge：设为 1；若只测首帧：设很大（如 999999）
+  viz_every: 1
+  # 想要 <1s/帧：建议先关闭 PLY 写盘（避免IO影响），只保留 png（score/mask/overlay）
+  save_ply: false
+  max_ply_points: 50000
+  # 可选：覆盖 edge_extraction 配置（不填则沿用全局 edge_extraction 的默认值）
+  edge_extraction:
+    method: 'star_edge'
+    # 更稠密：降低阈值（越小越稠密，常用 0.2~0.4）
+    star_edge_threshold: 0.35
+    # <1s 关键：LocalSH 最大点数（基本近似线性缩放；从 80k->3k 才可能到 1s 级别）
+    star_edge_max_points: 3000
+    # <1s 关键：降低LocalSH的邻域规模/采样数（更快，但可能略降质量）
+    star_edge_kk: 16
+    star_edge_sample_num: 20
+    # 打印每次STAR-Edge推理耗时（LocalSH / MLP / total）
+    star_edge_profile: true
 config_file_path: configs/mono/Stereo/Stereo_seq_easy/stereo_full.yaml
 depth:
   error_threshold: 0.08
@@ -142,15 +168,15 @@ rgb_edge_pnp:
   edge_extraction:
     method: 'star_edge'           # 'star_edge' - 使用STAR-Edge的LocalSH方法（如果可用，否则回退到fast_curvature）
     knn_neighbors: 15
-    curvature_threshold: 0.1
-    edge_ratio: 0.1               # 保留的边缘点比例
+    curvature_threshold: 0.3
+    edge_ratio: 0.5               # 保留的边缘点比例
     voxel_size: 0.02
-    max_points: 20000
+    max_points: 150000
   
   viz:
     enabled: true
     max_matches: 300
-    viz_every: 10
+    viz_every: 1
 
 # ================= 轮廓提取配置（用于轮廓引导采样）=================
 # 说明：
