@@ -132,45 +132,26 @@ def get_median_depth(depth, opacity=None, mask=None, return_std=False):
 def flow_loss(flow_pred, flow_gt, height, width):
     """
     计算光流损失，归一化到[-1, 1]范围
-    
+
     Args:
         flow_pred: 预测的光流，形状为 (2, H, W)
         flow_gt: 真实的光流，形状为 (2, H, W)
         height: 图像高度
         width: 图像宽度
-    
+
     Returns:
         loss: L1损失
     """
-    # #region agent log
-    try:
-        log_path = '/home/sjw/data0/lsx/S3PO_baseline/.cursor/debug.log'
-        with open(log_path, 'a') as f:
-            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"slam_utils.py:129","message":"flow_loss entry","data":{"l1_loss_in_globals":"l1_loss" in globals(),"l1_loss_in_locals":"l1_loss" in locals(),"flow_pred_shape":list(flow_pred.shape) if hasattr(flow_pred, 'shape') else None,"flow_gt_shape":list(flow_gt.shape) if hasattr(flow_gt, 'shape') else None},"timestamp":int(time.time()*1000)}) + '\n')
-    except Exception:
-        pass
-    # #endregion
-    
     # 归一化到[-1, 1]范围
     flow_pred = flow_pred.clone()
     flow_gt = flow_gt.clone()
-    
+
     flow_pred[0] /= height
     flow_pred[1] /= width
     flow_pred = flow_pred.clamp(-1, 1)
-    
+
     flow_gt[0] /= height
     flow_gt[1] /= width
     flow_gt = flow_gt.clamp(-1, 1)
-    
-    # #region agent log
-    try:
-        import time
-        log_path = '/home/sjw/data0/lsx/S3PO_baseline/.cursor/debug.log'
-        with open(log_path, 'a') as f:
-            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"slam_utils.py:154","message":"Before l1_loss call","data":{"l1_loss_in_globals":"l1_loss" in globals(),"l1_loss_in_locals":"l1_loss" in locals()},"timestamp":int(time.time()*1000)}) + '\n')
-    except Exception:
-        pass
-    # #endregion
-    
+
     return l1_loss(flow_pred, flow_gt)

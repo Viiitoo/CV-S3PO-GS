@@ -41,7 +41,7 @@ Training:
   use_camera_flow: True
   flow_visualization: True
   use_gt_pose: True  # 使用真值位姿计算camera flow
-  flow_loss_weight: 0.5  # flow loss权重，参考MotionGS
+  flow_loss_weight: 0.1  # flow loss权重（降低以避免错误flow主导优化）
   flow_warm_up: 1000  # 在warm_up之后才开始计算flow loss
   flow_loss_interval: 5  # 每N次map迭代才计算一次flow loss，避免每迭代都渲染+GS Flow导致卡顿（默认5）
   a_invalid: 1.1
