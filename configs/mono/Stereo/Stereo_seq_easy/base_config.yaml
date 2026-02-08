@@ -94,13 +94,14 @@ mast3r_edge_viz:
   # 可选：覆盖 edge_extraction 配置（不填则沿用全局 edge_extraction 的默认值）
   edge_extraction:
     method: 'star_edge'
+    star_edge_cuda: true
     # 更稠密：降低阈值（越小越稠密，常用 0.2~0.4）
     star_edge_threshold: 0.35
-    # <1s 关键：LocalSH 最大点数（基本近似线性缩放；从 80k->3k 才可能到 1s 级别）
-    star_edge_max_points: 3000
-    # <1s 关键：降低LocalSH的邻域规模/采样数（更快，但可能略降质量）
-    star_edge_kk: 16
-    star_edge_sample_num: 20
+    # CUDA kernel 加速后可大幅调高（30K 约 15ms/帧）
+    star_edge_max_points: 30000
+    # 邻域规模/采样数（CUDA下可恢复默认值以提高质量）
+    star_edge_kk: 26
+    star_edge_sample_num: 30
     # 打印每次STAR-Edge推理耗时（LocalSH / MLP / total）
     star_edge_profile: true
 config_file_path: configs/mono/Stereo/Stereo_seq_easy/stereo_full.yaml
@@ -155,6 +156,7 @@ rgb_edge_pnp:
   # 3D点云轮廓提取参数（用于edge_guided_matching）
   edge_extraction:
     method: 'star_edge'            # 'star_edge' - 使用STAR-Edge的LocalSH方法（如果可用，否则回退到fast_curvature）
+    star_edge_cuda: true
     knn_neighbors: 15
     curvature_threshold: 0.3
     edge_ratio: 0.5                # 保留的边缘点比例
@@ -168,6 +170,7 @@ rgb_edge_pnp:
 # - 使用STAR-Edge的LocalSH方法（如果可用）或快速曲率方法
 edge_extraction:
   method: 'star_edge'                # 'star_edge', 'localsh', 'fast_curvature', 'depth_gradient', 'hybrid'
+  star_edge_cuda: true               # 启用 CUDA kernel 加速路径
   
   # 快速曲率方法参数（用于3D点云轮廓提取）
   knn_neighbors: 15                  # KNN邻域大小

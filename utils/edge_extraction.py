@@ -96,6 +96,7 @@ class EdgeExtractionConfig:
         self.star_edge_threshold = 0.5
         self.star_edge_model_path = None  # 默认使用 STAR-Edge/model/best.ckpt
         self.star_edge_use_cuda = False   # 默认CPU推理（更稳）
+        self.star_edge_cuda = True        # 启用 CUDA kernel 加速路径（自动回退到CPU）
         self.star_edge_max_points = 50000  # LocalSH最大点数（过大将自动子采样）
         self.star_edge_fallback = 'fast_curvature'
         self.star_edge_profile = False  # 打印耗时统计（用于benchmark）
@@ -127,7 +128,7 @@ def _load_star_edge_classifier(model_path: str, use_cuda: bool = False):
     """
     global _STAR_EDGE_NET, _STAR_EDGE_NET_DEVICE, _STAR_EDGE_NET_PATH
 
-    device = torch.device("cuda:0" if (use_cuda and torch.cuda.is_available()) else "cpu")
+    device = torch.device(f"cuda:{torch.cuda.current_device()}" if (use_cuda and torch.cuda.is_available()) else "cpu")
     device_key = str(device)
 
     if _STAR_EDGE_NET is not None and _STAR_EDGE_NET_PATH == model_path and _STAR_EDGE_NET_DEVICE == device_key:
@@ -646,7 +647,7 @@ class EdgeExtractor:
 
     def extract_edges_star_edge(self, points: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        STAR-Edge “满血”3D轮廓提取：
+        STAR-Edge "满血"3D轮廓提取：
         - LocalSHFeature: 计算 Local Spherical Curve 描述子（默认 bw=10）
         - DescClassifier(MLP): 对每点输出边缘概率
 
@@ -659,6 +660,16 @@ class EdgeExtractor:
         pts = np.asarray(points)
         if pts.size == 0:
             return np.zeros((0,), dtype=bool), np.zeros((0,), dtype=np.float32)
+
+        # ---- CUDA kernel 加速路径 ----
+        use_cuda_kernel = bool(getattr(self.config, "star_edge_cuda", False))
+        if use_cuda_kernel and torch.cuda.is_available():
+            try:
+                return self._extract_edges_star_edge_cuda(pts)
+            except ImportError:
+                print("[EdgeExtraction] star_edge_cuda 未安装，回退到 CPU 路径")
+            except Exception as e:
+                print(f"[EdgeExtraction] CUDA STAR-Edge 失败 ({e})，回退到 CPU 路径")
 
         global _STAR_EDGE_WARNED
         if (not LOCALSH_AVAILABLE) or (LocalSH is None):
@@ -774,7 +785,66 @@ class EdgeExtractor:
                 )
             )
         return edge_mask, edge_scores
-    
+
+    def _extract_edges_star_edge_cuda(self, pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """CUDA kernel 加速的 STAR-Edge 轮廓提取"""
+        import star_edge_cuda
+
+        pts32 = np.asarray(pts[:, :3], dtype=np.float32)
+        N = pts32.shape[0]
+
+        bw = int(getattr(self.config, "star_edge_bw", 10))
+        kk = int(getattr(self.config, "star_edge_kk", 26))
+        sample_num = int(getattr(self.config, "star_edge_sample_num", 30))
+        profile = bool(getattr(self.config, "star_edge_profile", False))
+        t0 = time.perf_counter() if profile else None
+
+        # 使用当前可见GPU（尊重 CUDA_VISIBLE_DEVICES）
+        cuda_dev = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cuda:0"
+
+        # 大点云子采样（与 CPU 版逻辑一致）
+        maxN = int(getattr(self.config, "star_edge_max_points", 50000))
+        if N > maxN:
+            idx = np.random.choice(N, size=maxN, replace=False)
+            sub_desc = star_edge_cuda.compute_descriptors(
+                pts32[idx], bw=bw, kk=kk, num_samples=sample_num, device=cuda_dev)
+            if SCIPY_AVAILABLE:
+                tree = cKDTree(pts32[idx])
+                _, nn = tree.query(pts32, k=1, workers=-1)
+                desc = sub_desc[np.asarray(nn, dtype=np.int64)]
+            else:
+                desc = np.zeros((N, bw), dtype=np.float32)
+                desc[idx] = sub_desc
+        else:
+            desc = star_edge_cuda.compute_descriptors(
+                pts32, bw=bw, kk=kk, num_samples=sample_num, device=cuda_dev)
+
+        t_desc = time.perf_counter() if profile else None
+
+        # MLP 推理（沿用已有的分类器加载逻辑）
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        default_ckpt = os.path.join(repo_root, "STAR-Edge", "model", "best.ckpt")
+        model_path = getattr(self.config, "star_edge_model_path", None) or default_ckpt
+        net, device = _load_star_edge_classifier(model_path, use_cuda=True)
+
+        x = torch.from_numpy(np.asarray(desc, dtype=np.float32)).to(device=device)
+        with torch.no_grad():
+            prob = net(x).detach().cpu().numpy().astype(np.float32)
+
+        thr = float(getattr(self.config, "star_edge_threshold", 0.5))
+        edge_scores = np.clip(prob, 0.0, 1.0).astype(np.float32)
+        edge_mask = (edge_scores >= thr).astype(bool)
+
+        if profile:
+            t1 = time.perf_counter()
+            print("[STAR-Edge CUDA] N={} desc_ms={:.2f} total_ms={:.2f}".format(
+                N,
+                (t_desc - t0) * 1000.0 if t0 is not None and t_desc is not None else -1.0,
+                (t1 - t0) * 1000.0 if t0 is not None else -1.0,
+            ))
+
+        return edge_mask, edge_scores
+
     def project_points_to_image(self, points_3d: np.ndarray, 
                                  K: np.ndarray, R: np.ndarray, T: np.ndarray,
                                  width: int, height: int,
