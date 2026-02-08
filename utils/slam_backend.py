@@ -168,6 +168,20 @@ class BackEnd(mp.Process):
         if len(current_window) == 0:
             return
 
+        # 首次调用 map() 时打印光流光栅化器配置摘要
+        if not getattr(self, '_map_flow_config_logged', False):
+            _fr_cfg = self.config["Training"].get("use_flow_rasterizer", False)
+            _fr_fb = self.config["Training"].get("flow_rasterizer_fallback", True)
+            _fl_w = self.config["Training"].get("flow_loss_weight", 0)
+            _fl_wu = self.config["Training"].get("flow_warm_up", 1000)
+            _fl_int = self.config["Training"].get("flow_loss_interval", 5)
+            from gaussian_splatting.gaussian_renderer import FLOW_RASTERIZER_AVAILABLE
+            Log(f"[FlowRasterizer 配置] use_flow_rasterizer={_fr_cfg} | "
+                f"available={FLOW_RASTERIZER_AVAILABLE} | fallback={_fr_fb} | "
+                f"flow_loss_weight={_fl_w} | warm_up={_fl_wu} | interval={_fl_int}",
+                tag="Backend")
+            self._map_flow_config_logged = True
+
         viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in current_window]
         random_viewpoint_stack = []
         frames_to_optimize = self.config["Training"]["pose_window"]
@@ -199,7 +213,43 @@ class BackEnd(mp.Process):
                 kf_idx = current_window[cam_idx]
                 attach_time_to_viewpoint(viewpoint, frame_idx=kf_idx, num_frames=self.num_frames)
 
-                render_pkg = render(viewpoint, self.gaussians, self.pipeline_params, self.background)
+                # 读取光流光栅化器配置
+                use_flow_raster_cfg = self.config["Training"].get("use_flow_rasterizer", False)
+                flow_loss_weight = self.config["Training"].get("flow_loss_weight", 0)
+                flow_loss_interval = self.config["Training"].get("flow_loss_interval", 5)
+                flow_warm_up = self.config["Training"].get("flow_warm_up", 1000)
+                flow_rasterizer_fallback = self.config["Training"].get("flow_rasterizer_fallback", True)
+
+                # 优化：只在最近的N对关键帧上计算flow loss，避免重复计算所有frame对
+                # flow_on_all_frames=True: 在所有frame对上计算
+                # flow_on_all_frames=False (默认): 只在最近的1对上计算（cam_idx=1，即次新帧->最新帧）
+                # 注意: cam_idx=0是最新帧，通常没有next frame，不会计算flow loss
+                flow_on_all_frames = self.config["Training"].get("flow_on_all_frames", False)
+                flow_max_pairs = self.config["Training"].get("flow_max_pairs", 1)  # 最多计算几对关键帧
+
+                # 判断本次迭代是否需要使用光流光栅化器
+                # 仅在以下条件全部满足时使用：配置启用、有光流数据、超过预热期、到达计算间隔
+                use_flow_raster_now = (
+                    use_flow_raster_cfg and
+                    flow_loss_weight > 0 and
+                    self.iteration_count >= flow_warm_up and
+                    (self.iteration_count % flow_loss_interval) == 0 and
+                    kf_idx in self.optical_flow_dict and
+                    (flow_on_all_frames or cam_idx < flow_max_pairs + 1)  # 默认只在最近的N对上计算(cam_idx=1到N)
+                )
+
+                # 首次激活光流光栅化器时打印详细日志
+                if use_flow_raster_now and not getattr(self, '_flow_raster_first_logged', False):
+                    from gaussian_splatting.gaussian_renderer import FLOW_RASTERIZER_AVAILABLE
+                    Log(f"[FlowRasterizer] 首次激活 | iter={self.iteration_count} kf={kf_idx} | "
+                        f"cfg={use_flow_raster_cfg} available={FLOW_RASTERIZER_AVAILABLE} "
+                        f"fallback={flow_rasterizer_fallback} | flow_max_pairs={flow_max_pairs}", tag="Backend")
+                    self._flow_raster_first_logged = True
+
+                render_pkg = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,
+                    use_flow_rasterizer=use_flow_raster_now
+                )
                 # Check if rendering failed (e.g., no points initialized yet)
                 if render_pkg is None:
                     # Skip this keyframe if no points are available yet
@@ -232,15 +282,20 @@ class BackEnd(mp.Process):
                 # ============================================================
                 # Flow Loss: 使用原始 optical_flow，后端重新计算 camera_flow
                 # 修复：1) 帧对齐验证 2) 用当前优化位姿计算camera_flow 3) 梯度截断
+                # 当 use_flow_rasterizer=True 时，render返回10个输出，
+                # 包含 proj_2D, conic_2D 等完整模式所需的中间信息
                 # ============================================================
                 flow_loss_weight = self.config["Training"].get("flow_loss_weight", 0)
                 flow_loss_interval = self.config["Training"].get("flow_loss_interval", 5)
                 flow_warm_up = self.config["Training"].get("flow_warm_up", 1000)
+                flow_on_all_frames = self.config["Training"].get("flow_on_all_frames", False)
+                flow_max_pairs = self.config["Training"].get("flow_max_pairs", 1)
 
                 if (flow_loss_weight > 0 and
                     self.iteration_count >= flow_warm_up and
                     (self.iteration_count % flow_loss_interval) == 0 and
-                    kf_idx in self.optical_flow_dict):
+                    kf_idx in self.optical_flow_dict and
+                    (flow_on_all_frames or cam_idx < flow_max_pairs + 1)):  # 默认只在最近的N对上计算
 
                     # 取出前端存储的 (optical_flow, target_kf_idx)
                     optical_flow_data = self.optical_flow_dict[kf_idx]
@@ -273,7 +328,10 @@ class BackEnd(mp.Process):
                             viewpoint_next = self.viewpoints[actual_next_kf]
                             attach_time_to_viewpoint(viewpoint_next, frame_idx=actual_next_kf, num_frames=self.num_frames)
 
-                            render_pkg_next = render(viewpoint_next, self.gaussians, self.pipeline_params, self.background)
+                            render_pkg_next = render(
+                                viewpoint_next, self.gaussians, self.pipeline_params, self.background,
+                                use_flow_rasterizer=use_flow_raster_now
+                            )
 
                             if render_pkg_next is not None:
                                 depth_for_flow = depth
@@ -313,22 +371,31 @@ class BackEnd(mp.Process):
                                 _log_flow = (self.iteration_count % max(1, flow_loss_interval * 10)) == 0
 
                                 if all(full_mode_params.values()):
-                                    if _log_flow:
-                                        Log(f"GS Flow: [green]完整模式[/green] | {kf_idx} -> {actual_next_kf}", tag="Flow")
-                                    gs_flow = calculate_gs_flow(
-                                        gs_per_pixel=gs_per_pixel,
-                                        weight_per_gs_pixel=weight_per_gs_pixel,
-                                        next_conic_2D=next_conic_2D,
-                                        conic_2D_inv=conic_2D_inv,
-                                        proj_2D=proj_2D,
-                                        next_proj_2D=next_proj_2D,
-                                        x_mu=x_mu
-                                    )
-                                    gs_flow_aligned = gs_flow
+                                    # 完整模式：使用各向异性GS光流计算
+                                    # 验证张量形状一致性
+                                    H_render, W_render = render_pkg["render"].shape[1:]
+                                    if gs_per_pixel.shape[-2:] != (H_render, W_render):
+                                        if _log_flow:
+                                            Log(f"GS Flow: [red]形状不匹配[/red] gs_per_pixel {gs_per_pixel.shape} vs render ({H_render}, {W_render})，降级到简化模式", tag="Flow")
+                                        gs_flow = calculate_gs_flow(depth1=depth_for_flow, cam1=viewpoint, cam2=viewpoint_next)
+                                        gs_flow_aligned = warping_gs_flow(depth_for_flow, gs_flow, viewpoint, viewpoint_next)
+                                    else:
+                                        if _log_flow:
+                                            Log(f"GS Flow: [green]完整模式[/green] | {kf_idx} -> {actual_next_kf} | iter={self.iteration_count}", tag="Flow")
+                                        gs_flow = calculate_gs_flow(
+                                            gs_per_pixel=gs_per_pixel,
+                                            weight_per_gs_pixel=weight_per_gs_pixel,
+                                            next_conic_2D=next_conic_2D,
+                                            conic_2D_inv=conic_2D_inv,
+                                            proj_2D=proj_2D,
+                                            next_proj_2D=next_proj_2D,
+                                            x_mu=x_mu
+                                        )
+                                        gs_flow_aligned = gs_flow  # 完整模式内部已处理对齐
                                 else:
                                     if _log_flow:
                                         missing = [k for k, v in full_mode_params.items() if not v]
-                                        Log(f"GS Flow: [yellow]简化模式[/yellow] | {kf_idx} -> {actual_next_kf} | 缺少: {missing}", tag="Flow")
+                                        Log(f"GS Flow: [yellow]简化模式[/yellow] | {kf_idx} -> {actual_next_kf} | 缺少: {missing} | iter={self.iteration_count}", tag="Flow")
                                     gs_flow = calculate_gs_flow(depth1=depth_for_flow, cam1=viewpoint, cam2=viewpoint_next)
                                     gs_flow_aligned = warping_gs_flow(depth_for_flow, gs_flow, viewpoint, viewpoint_next)
 
@@ -340,7 +407,7 @@ class BackEnd(mp.Process):
                                 loss_mapping += flow_loss_weight * flow_loss_clamped
 
                                 if _log_flow:
-                                    Log(f"Flow loss: {flow_loss_value.item():.6f} (clamped: {flow_loss_clamped.item():.6f}) | weight: {flow_loss_weight}", tag="Flow")
+                                    Log(f"Flow loss: {flow_loss_value.item():.6f} (clamped: {flow_loss_clamped.item():.6f}) | weight: {flow_loss_weight} | iter={self.iteration_count}", tag="Flow")
 
                         except Exception as e:
                             import traceback
@@ -406,7 +473,13 @@ class BackEnd(mp.Process):
                         if kf_idx in kf_to_n_touched_idx:
                             n_touched_idx = kf_to_n_touched_idx[kf_idx]
                             n_touched = n_touched_acm[n_touched_idx]
-                            self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
+                            if n_touched is not None:
+                                self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
+                            else:
+                                # FlowRasterizer doesn't return n_touched, assume all points visible
+                                self.occ_aware_visibility[kf_idx] = torch.ones(
+                                    self.gaussians._xyz.shape[0], dtype=torch.long, device=self.device
+                                )
                         else:
                             # If rendering failed, set visibility to zero
                             self.occ_aware_visibility[kf_idx] = torch.zeros(

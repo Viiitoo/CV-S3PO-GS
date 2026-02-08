@@ -43,7 +43,11 @@ Training:
   use_gt_pose: True  # 使用真值位姿计算camera flow
   flow_loss_weight: 0.1  # flow loss权重（降低以避免错误flow主导优化）
   flow_warm_up: 1000  # 在warm_up之后才开始计算flow loss
-  flow_loss_interval: 5  # 每N次map迭代才计算一次flow loss，避免每迭代都渲染+GS Flow导致卡顿（默认5）
+  flow_loss_interval: 20  # 每N次map迭代才计算一次flow loss，避免每迭代都渲染+GS Flow导致卡顿（默认5，提速可改为10-20）
+  flow_on_all_frames: false  # 若为true，在所有窗口frame对上计算flow loss；若为false（默认），只在最近N对上计算
+  flow_max_pairs: 1  # 最多在最近的几对关键帧上计算flow loss（默认1，即只计算最新一对：如5->10）
+  use_flow_rasterizer: True  # 启用完整MotionGS光流光栅化器（返回10个输出，支持各向异性光流）
+  flow_rasterizer_fallback: True  # 光流光栅化器不可用时自动降级到简化模式
   a_invalid: 1.1
   a_valid: 0.1
   alpha: 0.98

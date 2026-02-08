@@ -20,6 +20,21 @@ from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWor
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.sh_utils import eval_sh
 
+# 尝试导入光流光栅化器（MotionGS版本，返回10个输出，包含proj_2D, conic_2D等）
+# 包名已重命名为 flow_diff_gaussian_rasterization 以避免与标准光栅化器冲突
+try:
+    from flow_diff_gaussian_rasterization import (
+        GaussianRasterizationSettings as FlowRasterSettings,
+        GaussianRasterizer as FlowRasterizer,
+    )
+    FLOW_RASTERIZER_AVAILABLE = True
+    print("[Render] FlowRasterizer 导入成功 (flow_diff_gaussian_rasterization)")
+except ImportError as e:
+    FLOW_RASTERIZER_AVAILABLE = False
+    FlowRasterizer = None
+    FlowRasterSettings = None
+    print(f"[Render] FlowRasterizer 不可用: {e}")
+
 
 def render(
     viewpoint_camera,
@@ -29,6 +44,7 @@ def render(
     scaling_modifier=1.0,
     override_color=None,
     mask=None,
+    use_flow_rasterizer=False,
 ):
     """
     Render the scene.
@@ -113,22 +129,63 @@ def render(
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        projmatrix_raw=viewpoint_camera.projection_matrix,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=False,
-    )
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    # 根据模式选择光栅化器
+    # 光流光栅化器（FlowRasterizer）返回10个输出，包含 proj_2D, conic_2D 等光流计算所需的中间信息
+    # 标准光栅化器返回5个输出，不包含这些信息
+    # 注意API差异：光流光栅化器不支持 projmatrix_raw, theta, rho 参数
+    _use_flow = use_flow_rasterizer and FLOW_RASTERIZER_AVAILABLE
+
+    # 仅在首次使用某种光栅化器时打印日志
+    if not hasattr(render, '_rasterizer_used_logged'):
+        render._rasterizer_used_logged = set()
+    _raster_key = "flow" if _use_flow else "standard"
+    if _raster_key not in render._rasterizer_used_logged:
+        try:
+            from utils.logging_utils import Log
+            if _use_flow:
+                Log("[green]使用 FlowRasterizer（光流模式，10输出）[/green]", tag="Render")
+            else:
+                if use_flow_rasterizer and not FLOW_RASTERIZER_AVAILABLE:
+                    Log("[red]请求使用 FlowRasterizer 但未安装，降级到标准模式[/red]", tag="Render")
+                else:
+                    Log("使用标准 GaussianRasterizer（5输出）", tag="Render")
+        except Exception:
+            pass
+        render._rasterizer_used_logged.add(_raster_key)
+
+    if _use_flow:
+        raster_settings = FlowRasterSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False,
+            debug=False,
+        )
+        rasterizer = FlowRasterizer(raster_settings=raster_settings)
+    else:
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            projmatrix_raw=viewpoint_camera.projection_matrix,
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False,
+            debug=False,
+        )
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
 
 
@@ -172,9 +229,9 @@ def render(
     weight_per_gs_pixel = None
     x_mu = None
     alpha = None
-    
+
     if mask is not None:
-        rasterizer_result = rasterizer(
+        rasterizer_args = dict(
             means3D=means3D[mask],
             means2D=means2D[mask],
             shs=shs[mask],
@@ -183,12 +240,15 @@ def render(
             scales=scales[mask],
             rotations=rotations[mask],
             cov3D_precomp=cov3D_precomp[mask] if cov3D_precomp is not None else None,
-            theta=viewpoint_camera.cam_rot_delta,
-            rho=viewpoint_camera.cam_trans_delta,
         )
+        # 标准光栅化器支持 theta/rho，光流光栅化器不支持
+        if not _use_flow:
+            rasterizer_args["theta"] = viewpoint_camera.cam_rot_delta
+            rasterizer_args["rho"] = viewpoint_camera.cam_trans_delta
+        rasterizer_result = rasterizer(**rasterizer_args)
         n_touched = None
     else:
-        rasterizer_result = rasterizer(
+        rasterizer_args = dict(
             means3D=means3D,
             means2D=means2D,
             shs=shs,
@@ -197,9 +257,12 @@ def render(
             scales=scales,
             rotations=rotations,
             cov3D_precomp=cov3D_precomp,
-            theta=viewpoint_camera.cam_rot_delta,
-            rho=viewpoint_camera.cam_trans_delta,
         )
+        # 标准光栅化器支持 theta/rho，光流光栅化器不支持
+        if not _use_flow:
+            rasterizer_args["theta"] = viewpoint_camera.cam_rot_delta
+            rasterizer_args["rho"] = viewpoint_camera.cam_trans_delta
+        rasterizer_result = rasterizer(**rasterizer_args)
     
     # Handle different return value counts (basic mode vs full mode)
     # 【调试信息】记录rasterizer返回值数量（仅在首次检测到不同模式时打印）

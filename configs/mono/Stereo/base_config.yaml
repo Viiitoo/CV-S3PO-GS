@@ -52,6 +52,8 @@ Training:
   use_optical_flow: False  # 启用optical flow计算
   use_camera_flow: False  # 启用camera flow计算
   flow_visualization: False  # 是否保存光流可视化图像
+  use_flow_rasterizer: False  # 启用完整MotionGS光流光栅化器（返回10个输出，支持各向异性光流）
+  flow_rasterizer_fallback: True  # 光流光栅化器不可用时自动降级到简化模式
 
   mapping_itr_nosingle: 10
   a_invalid: 0.5
