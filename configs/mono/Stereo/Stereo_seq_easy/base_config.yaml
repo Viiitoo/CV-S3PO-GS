@@ -90,7 +90,8 @@ Training:
 #   - fXXXXXX_score.png / fXXXXXX_mask.png / fXXXXXX_overlay.png / fXXXXXX_pc_edge.ply
 mast3r_edge_viz:
   enabled: true
-  # 若要“每帧”都跑 star-edge：设为 1；若只测首帧：设很大（如 999999）
+  edge_border_margin: 30    # 排除图像边缘 30 像素的 3D 点（避免 STAR-Edge 边界噪声）
+  # 若要"每帧"都跑 star-edge：设为 1；若只测首帧：设很大（如 999999）
   viz_every: 1
   # 想要 <1s/帧：建议先关闭 PLY 写盘（避免IO影响），只保留 png（score/mask/overlay）
   save_ply: false

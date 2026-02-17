@@ -29,9 +29,9 @@ Training:
     mapping_itr_nosingle: 30
     # 光流相关配置（可选，默认从base_config继承）
     use_gt_pose: False  # 使用真值位姿模式（用于测试光流功能）
-    # use_optical_flow: False  # 启用optical flow计算
-    # use_camera_flow: False  # 启用camera flow计算
-    # flow_visualization: False  # 是否保存光流可视化图像
+    use_optical_flow: False  # 启用optical flow计算
+    use_camera_flow: False  # 启用camera flow计算
+    flow_visualization: False  # 是否保存光流可视化图像
 
 # Flow配置（可选，默认从base_config继承）
 # Flow:
@@ -44,3 +44,4 @@ rgb_edge_pnp:
   edge_match_mode: "weight"
   edge_match_ratio: 0.5
   edge_3d_weight: 2.0
+  edge_border_margin: 30    # 排除图像边缘 30 像素的 3D 点（避免 STAR-Edge 边界噪声）

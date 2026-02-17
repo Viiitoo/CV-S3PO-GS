@@ -339,6 +339,7 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
             extractor3d = EdgeExtractor({"edge_extraction": edge_method_cfg})
 
             # 全量点云：来自 depth_to_3d 的 (H,W,3)
+            H_img, W_img = pts3d.shape[:2]
             pts3d_all = pts3d.reshape(-1, 3).astype(np.float32)
             valid = np.isfinite(pts3d_all).all(axis=1) & (pts3d_all[:, 2] > 1e-6)
             pts3d_all = pts3d_all[valid]
@@ -350,6 +351,20 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
                     edge_mask3d, edge_scores3d = extractor3d.extract_edges(down_pts[:, :3])
                     edge_scores3d = np.asarray(edge_scores3d, dtype=np.float32).reshape(-1)
 
+                    # 在3D层面抑制边界噪声：将下采样点投影回2D，抑制边界区域的轮廓分数
+                    border_margin = int(cfg.get("edge_border_margin", 30))
+                    if border_margin > 0:
+                        z_vals = down_pts[:, 2].clip(min=1e-8)
+                        proj_x = (K_new[0, 0] * down_pts[:, 0] / z_vals) + K_new[0, 2]
+                        proj_y = (K_new[1, 1] * down_pts[:, 1] / z_vals) + K_new[1, 2]
+                        in_border_3d = (
+                            (proj_x < border_margin) |
+                            (proj_x >= W_img - border_margin) |
+                            (proj_y < border_margin) |
+                            (proj_y >= H_img - border_margin)
+                        )
+                        edge_scores3d[in_border_3d] = 0.0
+
                     # 把downsampled分数映射回每个match的3D点（最近邻）
                     try:
                         from scipy.spatial import cKDTree
@@ -358,6 +373,18 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
                         score_match = edge_scores3d[np.asarray(nn, dtype=np.int64)]
                     except Exception:
                         score_match = None
+
+                    # 抑制图像边缘区域匹配点的轮廓分数（STAR-Edge 边界噪声后处理）
+                    border_margin = int(cfg.get("edge_border_margin", 30))
+                    if border_margin > 0 and score_match is not None:
+                        ip = imagePoints.reshape(-1, 2)
+                        in_border = (
+                            (ip[:, 0] < border_margin) |
+                            (ip[:, 0] >= W_img - border_margin) |
+                            (ip[:, 1] < border_margin) |
+                            (ip[:, 1] >= H_img - border_margin)
+                        )
+                        score_match[in_border] = 0.0
 
                     if score_match is not None:
                         mode = str(cfg.get("edge_match_mode", "weight")).lower()
@@ -478,6 +505,18 @@ def get_depth(img1, img2, model, return_conf=False, mast3r_edge_viz=None): # <--
                     mask_full[valid_idx] = edge_mask
                     score_map = score_full.reshape(h, w)
                     mask_map = mask_full.reshape(h, w)
+
+                    # 抑制图像边缘区域的轮廓分数（STAR-Edge 边界噪声后处理）
+                    border_margin = int(cfg.get("edge_border_margin", 30))
+                    if border_margin > 0:
+                        score_map[:border_margin, :] = 0.0
+                        score_map[-border_margin:, :] = 0.0
+                        score_map[:, :border_margin] = 0.0
+                        score_map[:, -border_margin:] = 0.0
+                        mask_map[:border_margin, :] = False
+                        mask_map[-border_margin:, :] = False
+                        mask_map[:, :border_margin] = False
+                        mask_map[:, -border_margin:] = False
 
                     # 用 view1['img'] 生成对应分辨率的 RGB（比原图更对齐）
                     rgb_pred_u8 = _to_uint8_rgb(view1["img"])  # HWC uint8 RGB
