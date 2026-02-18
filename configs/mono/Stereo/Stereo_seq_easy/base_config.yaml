@@ -153,6 +153,7 @@ rgb_edge_pnp:
   seed: 0
 
   # ========== 3D点云轮廓引导匹配（STAR-Edge）==========
+  center_crop_ratio: 1.0            # 中心裁剪面积比例(1.0=不裁剪, 0.6=保留中心60%面积)
   edge_guided_matching: true       # 启用3D点云轮廓引导的匹配点筛选/加权
   edge_match_mode: "weight"        # "filter" 或 "weight" - 筛选模式或加权模式
   edge_match_ratio: 0.5            # filter模式下的轮廓匹配点保留比例

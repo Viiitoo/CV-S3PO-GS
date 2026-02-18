@@ -3,6 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
+总是使用中文回答！
 
 S3PO-GS (CV-S3PO-GS) is a real-time monocular/stereo SLAM system built on 3D Gaussian Splatting with time-varying deformation for dynamic scene modeling. It uses MASt3R for depth/pose estimation and supports multiple datasets (KITTI, Waymo, DL3DV, StereoMIS).
 

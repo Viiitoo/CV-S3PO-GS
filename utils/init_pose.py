@@ -327,9 +327,31 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     objectPoints = objectPoints.astype(np.float32)
     imagePoints = matches_im2.astype(np.float32)
 
+    # ---------- 中心区域裁剪过滤（排除图像边缘的匹配点） ----------
+    cfg = rgb_edge_pnp or {}
+    center_crop_ratio = float(cfg.get("center_crop_ratio", 1.0))
+    if center_crop_ratio < 1.0:
+        H_img, W_img = pts3d.shape[:2]
+        # center_crop_ratio 是面积比例，每个维度保留 sqrt(ratio) 的范围
+        import math
+        dim_ratio = math.sqrt(center_crop_ratio)
+        margin_x = (1.0 - dim_ratio) / 2.0 * W_img
+        margin_y = (1.0 - dim_ratio) / 2.0 * H_img
+        ip = imagePoints.reshape(-1, 2)
+        center_mask = (
+            (ip[:, 0] >= margin_x) & (ip[:, 0] < W_img - margin_x) &
+            (ip[:, 1] >= margin_y) & (ip[:, 1] < H_img - margin_y)
+        )
+        n_before = len(objectPoints)
+        objectPoints = objectPoints[center_mask]
+        imagePoints = imagePoints[center_mask]
+        matches_im1 = matches_im1[center_mask]
+        matches_im2 = matches_im2[center_mask]
+        print(f"[CenterCrop] area_ratio={center_crop_ratio:.2f}, dim_ratio={dim_ratio:.4f}, "
+              f"kept {len(objectPoints)}/{n_before} points")
+
     # ---------- 3D点云轮廓引导匹配（STAR-Edge / 曲率等） ----------
     weights = None
-    cfg = rgb_edge_pnp or {}
     # 说明：对“渲染深度生成的3D点云”做轮廓提取，然后把轮廓分数映射到每个匹配的3D点上。
     # - weight: 将每个match的权重乘上 (1 + edge_3d_weight * score)
     # - filter: 保留 score 最高的 edge_match_ratio 部分匹配点

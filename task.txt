@@ -1,0 +1,9 @@
+参考文件：
+1.剔除形变网络后的效果：results/stereo_seq_easy_stereo_seq_easy/S3PO+0.5轮廓
+2.带形变网络运行的效果：results/stereo_seq_easy_stereo_seq_easy/S3PO+0.4轮廓+形变网络，
+results/stereo_seq_easy_stereo_seq_easy/S3PO+0.6轮廓+形变网络
+
+问题描述：
+不引入形变网络时，SLAM轨迹较准，rgb渲染结果（results/stereo_seq_easy_stereo_seq_easy/S3PO+0.5轮廓/viz）很差
+引入形变网络时，SLAM轨迹很不准，rgb渲染结果好
+

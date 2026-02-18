@@ -1,0 +1,48 @@
+inherit_from: "configs/mono/Stereo/Stereo_seq_easy/base_config.yaml"
+
+Dataset:
+  begin: 0
+  dataset_path: "datasets/StereoMIS/stereo_seq_easy/stereo_seq_easy/train"
+  Calibration:
+    fx: 516.95
+    fy: 516.86
+    cx: 302.29
+    cy: 241.49
+    k1: -0.00020782629144378
+    k2: 0.000180254035512917
+    p1: 0.0
+    p2: 0.0
+    k3: 9.6945594123099e-05
+    width: 640
+    height: 480
+    depth_scale: 1000.0
+    distorted: False
+
+Training:
+  alpha: 0.98
+  mapping_itr_nosingle: 30
+  use_gt_pose: False
+  use_optical_flow: False
+  use_camera_flow: False
+  flow_visualization: False
+  flow_loss_weight: 0
+  decouple_pose_deform:
+    enabled: true
+    pose_steps: 3
+    deform_steps: 1
+
+opt_params:
+  position_lr_init: 0.0016
+  position_lr_final: 0.00016
+  init_lr: 6
+
+model_params:
+  use_deformation: true
+
+rgb_edge_pnp:
+  edge_guided_matching: true
+  edge_match_mode: "weight"
+  edge_match_ratio: 0.5
+  edge_3d_weight: 2.0
+  edge_border_margin: 30
+  center_crop_ratio: 0.5

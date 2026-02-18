@@ -478,7 +478,14 @@ class FrontEnd(mp.Process):
                 )
             if converged:
                 break
-        
+
+        # ====== 实验：强制使用GT位姿 ======
+        force_gt_pose = self.config.get("Training", {}).get("force_gt_pose", False)
+        if force_gt_pose and hasattr(viewpoint, 'R_gt') and hasattr(viewpoint, 'T_gt'):
+            viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+            viewpoint.cam_rot_delta.data.fill_(0)
+            viewpoint.cam_trans_delta.data.fill_(0)
+
         torch.cuda.synchronize()
         t_opt_end = time.time()
         self._timing_pose_opt = (t_opt_end - t_opt_start) * 1000  # ms

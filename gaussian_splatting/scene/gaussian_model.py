@@ -63,6 +63,17 @@ class GaussianModel:
         else:
             self.deform_table_threshold = 0.0001  # 默认值：比原0.01小100倍
 
+        # ========== 是否启用形变网络 ==========
+        if config is not None and "use_deformation" in config.get("model_params", {}):
+            self.use_deformation = config["model_params"]["use_deformation"]
+        else:
+            self.use_deformation = True  # 默认启用，向后兼容
+
+        # ========== 是否冻结形变系数 ==========
+        # freeze_coefs=True: 保留形变代码路径但 _coefs 全零且不参与优化，等价于零形变
+        self.freeze_coefs = (config is not None and
+                             config.get("model_params", {}).get("freeze_coefs", False))
+
         # ========== 时间形变相关参数（生命周期机制，参考EH-SurGS）==========
         # K_time: 时间基函数的数量（basis_num）
         # EH-SurGS使用17-20个基函数，我们默认使用17个（与EH-SurGS默认值一致）
@@ -940,21 +951,23 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         
         # ========== 初始化形变表相关参数（参考EH-SurGS）==========
-        # 如果 deformation_table 还没有初始化，或者大小不匹配，则初始化为全 True（所有点都需要形变）
-        num_points = self.get_xyz.shape[0]
-        if self._deformation_table.numel() == 0 or self._deformation_table.shape[0] != num_points:
-            # 初始化为全 True：所有点都需要形变（训练初期）
-            self._deformation_table = torch.ones(num_points, dtype=torch.bool, device="cuda")
-        
-        # 如果 deformation_accum 还没有初始化，或者大小不匹配，则初始化为全零
-        # 形状为 [N, 3]，存储每个点在 x, y, z 三个方向上的累积形变量
-        if self._deformation_accum.numel() == 0 or self._deformation_accum.shape[0] != num_points:
-            # 初始化为全零：累积形变量从零开始
-            # 形状 [N, 3] 与 EH-SurGS 一致，存储 x, y, z 三个方向的累积形变量
-            self._deformation_accum = torch.zeros((num_points, 3), device="cuda")
-        elif self._deformation_accum.dim() == 1 or self._deformation_accum.shape[1] != 3:
-            # 如果形状不对（例如是 [N] 而不是 [N, 3]），重新初始化为 [N, 3]
-            self._deformation_accum = torch.zeros((num_points, 3), device="cuda")
+        # 仅在启用形变时初始化形变表
+        if self.use_deformation:
+            # 如果 deformation_table 还没有初始化，或者大小不匹配，则初始化为全 True（所有点都需要形变）
+            num_points = self.get_xyz.shape[0]
+            if self._deformation_table.numel() == 0 or self._deformation_table.shape[0] != num_points:
+                # 初始化为全 True：所有点都需要形变（训练初期）
+                self._deformation_table = torch.ones(num_points, dtype=torch.bool, device="cuda")
+
+            # 如果 deformation_accum 还没有初始化，或者大小不匹配，则初始化为全零
+            # 形状为 [N, 3]，存储每个点在 x, y, z 三个方向上的累积形变量
+            if self._deformation_accum.numel() == 0 or self._deformation_accum.shape[0] != num_points:
+                # 初始化为全零：累积形变量从零开始
+                # 形状 [N, 3] 与 EH-SurGS 一致，存储 x, y, z 三个方向的累积形变量
+                self._deformation_accum = torch.zeros((num_points, 3), device="cuda")
+            elif self._deformation_accum.dim() == 1 or self._deformation_accum.shape[1] != 3:
+                # 如果形状不对（例如是 [N] 而不是 [N, 3]），重新初始化为 [N, 3]
+                self._deformation_accum = torch.zeros((num_points, 3), device="cuda")
 
         l = [
             {
@@ -1002,7 +1015,7 @@ class GaussianModel:
         ) * self.spatial_lr_scale  # 乘以空间缩放因子
         
         # 将形变系数参数添加到优化器配置列表中（生命周期机制）
-        if self._coefs.numel() > 0:
+        if self._coefs.numel() > 0 and not self.freeze_coefs:
             l.append({
                 "params": [self._coefs],
                 "lr": deformation_lr,
@@ -1305,12 +1318,17 @@ class GaussianModel:
         else:
             # 初始化新的形变系数
             N = self._xyz.shape[0]
-            # 使用小的随机初始化，而不是全0，这样更容易学习
-            weight_coefs = torch.randn((N, self.ch_num, self.K_time), device="cuda") * 0.01
-            position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(N, self.ch_num, 1)
-            shape_coefs = torch.full((N, self.ch_num, self.K_time), 0.01, device="cuda")
-            _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
-            self._coefs = nn.Parameter(_coefs.requires_grad_(True))
+            if self.freeze_coefs:
+                # 冻结模式：全零初始化，不参与优化
+                _coefs = torch.zeros((N, self.ch_num * 3 * self.K_time), device="cuda")
+                self._coefs = nn.Parameter(_coefs.requires_grad_(False))
+            else:
+                # 使用小的随机初始化，而不是全0，这样更容易学习
+                weight_coefs = torch.randn((N, self.ch_num, self.K_time), device="cuda") * 0.01
+                position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(N, self.ch_num, 1)
+                shape_coefs = torch.full((N, self.ch_num, self.K_time), 0.01, device="cuda")
+                _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N, -1)
+                self._coefs = nn.Parameter(_coefs.requires_grad_(True))
         
         # 为了向后兼容，保留旧的参数名（但不再使用）
         self._w_pos = torch.empty(0, device="cuda")
@@ -1446,35 +1464,41 @@ class GaussianModel:
             self._coefs = optimizable_tensors["coefs"]
         else:
             # 如果coefs没有被_prune_optimizer处理（因为大小不匹配），需要重新初始化
-            num_points_after_prune = valid_points_mask.sum().item()
-            if num_points_after_prune > 0:
-                from utils.logging_utils import Log
-                Log(f"形变系数未被优化器处理，已重新初始化（当前点数: {num_points_after_prune:,}）", tag="WARNING")
-                # 重新初始化_coefs以匹配当前点数
-                # 使用小的随机初始化，而不是全0，这样更容易学习
-                weight_coefs = torch.randn((num_points_after_prune, self.ch_num, self.K_time), device="cuda") * 0.01
-                position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(num_points_after_prune, self.ch_num, 1)
-                shape_coefs = torch.full((num_points_after_prune, self.ch_num, self.K_time), 0.01, device="cuda")
-                _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(num_points_after_prune, -1)
-                self._coefs = nn.Parameter(_coefs.requires_grad_(True))
-                # 如果优化器已经初始化，需要手动添加coefs参数组
-                if self.optimizer is not None:
-                    # 检查优化器中是否已有coefs参数组
-                    has_coefs_group = any(group.get("name") == "coefs" for group in self.optimizer.param_groups)
-                    if not has_coefs_group:
-                        # 添加coefs参数组到优化器
-                        deformation_lr = getattr(self, 'spatial_lr_scale', 1.0) * 0.001  # 使用默认学习率
-                        self.optimizer.add_param_group({
-                            "params": [self._coefs],
-                            "lr": deformation_lr,
-                            "name": "coefs",
-                        })
+            # 仅在启用形变时执行
+            if self.use_deformation:
+                num_points_after_prune = valid_points_mask.sum().item()
+                if num_points_after_prune > 0:
+                    from utils.logging_utils import Log
+                    Log(f"形变系数未被优化器处理，已重新初始化（当前点数: {num_points_after_prune:,}）", tag="WARNING")
+                    # 重新初始化_coefs以匹配当前点数
+                    if self.freeze_coefs:
+                        _coefs = torch.zeros((num_points_after_prune, self.ch_num * 3 * self.K_time), device="cuda")
+                        self._coefs = nn.Parameter(_coefs.requires_grad_(False))
                     else:
-                        # 更新现有参数组
-                        for group in self.optimizer.param_groups:
-                            if group.get("name") == "coefs":
-                                group["params"][0] = self._coefs
-                                break
+                        # 使用小的随机初始化，而不是全0，这样更容易学习
+                        weight_coefs = torch.randn((num_points_after_prune, self.ch_num, self.K_time), device="cuda") * 0.01
+                        position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(num_points_after_prune, self.ch_num, 1)
+                        shape_coefs = torch.full((num_points_after_prune, self.ch_num, self.K_time), 0.01, device="cuda")
+                        _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(num_points_after_prune, -1)
+                        self._coefs = nn.Parameter(_coefs.requires_grad_(True))
+                    # 如果优化器已经初始化，需要手动添加coefs参数组
+                    if self.optimizer is not None:
+                        # 检查优化器中是否已有coefs参数组
+                        has_coefs_group = any(group.get("name") == "coefs" for group in self.optimizer.param_groups)
+                        if not has_coefs_group:
+                            # 添加coefs参数组到优化器
+                            deformation_lr = getattr(self, 'spatial_lr_scale', 1.0) * 0.001  # 使用默认学习率
+                            self.optimizer.add_param_group({
+                                "params": [self._coefs],
+                                "lr": deformation_lr,
+                                "name": "coefs",
+                            })
+                        else:
+                            # 更新现有参数组
+                            for group in self.optimizer.param_groups:
+                                if group.get("name") == "coefs":
+                                    group["params"][0] = self._coefs
+                                    break
 
         # ========== 更新其他参数 ==========
         self._xyz = optimizable_tensors["xyz"]
@@ -1618,18 +1642,24 @@ class GaussianModel:
             return
         
         # ========== 初始化新点的形变系数（生命周期机制）==========
-        # 新点的形变系数初始化（参考EH-SurGS）：
-        # - weights: 使用小的随机初始化（而不是全0），这样更容易学习
-        #   使用小的随机值（std=0.01）可以让权重有小的初始形变，梯度更容易传播
-        # - means: 均匀分布在[0,1]（时间中心位置）
-        # - std_devs: 初始化为0.01（时间影响范围）
-        # 注意：虽然EH-SurGS使用全0初始化，但小的随机初始化可以让训练更稳定
-        weight_coefs = torch.randn((M, self.ch_num, self.K_time), device="cuda", dtype=new_xyz.dtype) * 0.01
-        position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(M, self.ch_num, 1)
-        shape_coefs = torch.full((M, self.ch_num, self.K_time), 0.01, device="cuda", dtype=new_xyz.dtype)
-        # 堆叠为 [M, ch_num, 3, K_time] 然后reshape为 [M, ch_num * 3 * K_time]
-        new_coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(M, -1)
-        
+        # 仅在启用形变时初始化 coefs
+        if self.use_deformation and self.K_time > 0:
+            if self.freeze_coefs:
+                # 冻结模式：全零初始化
+                new_coefs = torch.zeros((M, self.ch_num * 3 * self.K_time), device="cuda", dtype=new_xyz.dtype)
+            else:
+                # 新点的形变系数初始化（参考EH-SurGS）：
+                # - weights: 使用小的随机初始化（而不是全0），这样更容易学习
+                #   使用小的随机值（std=0.01）可以让权重有小的初始形变，梯度更容易传播
+                # - means: 均匀分布在[0,1]（时间中心位置）
+                # - std_devs: 初始化为0.01（时间影响范围）
+                # 注意：虽然EH-SurGS使用全0初始化，但小的随机初始化可以让训练更稳定
+                weight_coefs = torch.randn((M, self.ch_num, self.K_time), device="cuda", dtype=new_xyz.dtype) * 0.01
+                position_coefs = torch.linspace(0, 1, self.K_time, device="cuda").view(1, 1, -1).repeat(M, self.ch_num, 1)
+                shape_coefs = torch.full((M, self.ch_num, self.K_time), 0.01, device="cuda", dtype=new_xyz.dtype)
+                # 堆叠为 [M, ch_num, 3, K_time] 然后reshape为 [M, ch_num * 3 * K_time]
+                new_coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(M, -1)
+
 
         d = {
             "xyz": new_xyz,
@@ -1638,8 +1668,9 @@ class GaussianModel:
             "opacity": new_opacities,
             "scaling": new_scaling,
             "rotation": new_rotation,
-            "coefs": new_coefs,
         }
+        if self.use_deformation and self.K_time > 0:
+            d["coefs"] = new_coefs
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
 
@@ -1650,16 +1681,17 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         
-        # 安全处理coefs：如果优化器中还没有coefs参数组，使用传入的new_coefs
-        if "coefs" in optimizable_tensors:
-            self._coefs = optimizable_tensors["coefs"]
-        else:
-            # 如果优化器还没有初始化coefs参数组，直接使用new_coefs
-            # 这会在training_setup时被添加到优化器
-            if isinstance(new_coefs, nn.Parameter):
-                self._coefs = new_coefs
+        # 安全处理coefs：仅在启用形变时处理
+        if self.use_deformation and self.K_time > 0:
+            if "coefs" in optimizable_tensors:
+                self._coefs = optimizable_tensors["coefs"]
             else:
-                self._coefs = nn.Parameter(new_coefs.requires_grad_(True))
+                # 如果优化器还没有初始化coefs参数组，直接使用new_coefs
+                # 这会在training_setup时被添加到优化器
+                if isinstance(new_coefs, nn.Parameter):
+                    self._coefs = new_coefs
+                else:
+                    self._coefs = nn.Parameter(new_coefs.requires_grad_(True))
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

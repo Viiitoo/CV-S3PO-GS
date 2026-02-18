@@ -190,8 +190,20 @@ class BackEnd(mp.Process):
         for cam_idx, viewpoint in self.viewpoints.items():  # Add viewpoints outside the current window to the random_viewpoint_stack
             if cam_idx in current_window_set:
                 continue
-            random_viewpoint_stack.append((cam_idx, viewpoint))       
-            
+            random_viewpoint_stack.append((cam_idx, viewpoint))
+
+        # ========== 解耦优化配置 ==========
+        decouple_cfg = self.config.get("Training", {}).get("decouple_pose_deform", None)
+        decouple_enabled = (decouple_cfg is not None and
+                           decouple_cfg.get("enabled", False) and
+                           hasattr(self.gaussians, '_coefs') and
+                           self.gaussians._coefs.numel() > 0 and
+                           not getattr(self.gaussians, 'freeze_coefs', False))
+        if decouple_enabled:
+            decouple_pose_steps = decouple_cfg.get("pose_steps", 3)
+            decouple_deform_steps = decouple_cfg.get("deform_steps", 1)
+            decouple_cycle = decouple_pose_steps + decouple_deform_steps
+
         for _ in range(iters):
             self.iteration_count += 1
             self.iteration_count_global += 1
@@ -450,17 +462,30 @@ class BackEnd(mp.Process):
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping += 10 * isotropic_loss.mean()
             
-            # time deformation regularization - 防止位移权重过大导致飘移
-            if hasattr(self.gaussians, '_w_pos') and self.gaussians._w_pos.numel() > 0:
-                # L2 正则化：鼓励小位移
-                w_pos_reg = self.gaussians._w_pos.pow(2).mean()
-                loss_mapping += 0.1 * w_pos_reg
-                
-                # 时间平滑正则化：相邻时间的位移应该相似（可选）
-                # sigma_reg = F.softplus(self.gaussians.t_sigma_raw).mean()
-                # loss_mapping += 0.01 * (1.0 / (sigma_reg + 1e-6))  # 鼓励较宽的基函数
+            # time deformation regularization - 对 _coefs 添加 L2 正则化
+            # 注：旧代码引用 _w_pos（已废弃字段，永远为空），现改为对 _coefs 正则化
+            coefs_reg_weight = self.config.get("Training", {}).get("coefs_reg_weight", 0.0)
+            if coefs_reg_weight > 0 and hasattr(self.gaussians, '_coefs') and self.gaussians._coefs.numel() > 0:
+                coefs_reg = self.gaussians._coefs.pow(2).mean()
+                loss_mapping += coefs_reg_weight * coefs_reg
             
             loss_mapping.backward()
+
+            # ========== 解耦优化：选择性清零梯度 ==========
+            if decouple_enabled:
+                phase_idx = (self.iteration_count - 1) % decouple_cycle
+                if phase_idx < decouple_pose_steps:
+                    # Phase P：清零 _coefs 梯度，只更新位姿+高斯几何
+                    if self.gaussians._coefs.grad is not None:
+                        self.gaussians._coefs.grad.zero_()
+                else:
+                    # Phase D：清零位姿梯度，只更新 _coefs+高斯几何
+                    if self.keyframe_optimizers is not None:
+                        for group in self.keyframe_optimizers.param_groups:
+                            for p in group["params"]:
+                                if p.grad is not None:
+                                    p.grad.zero_()
+
             gaussian_split = False
             
             # Deinsifying / Pruning Gaussians
@@ -521,7 +546,7 @@ class BackEnd(mp.Process):
                                 self.gaussians.prune_points(to_prune.cuda())
                                 # 在prune后更新deformation table，确保只有需要形变的点被标记
                                 # 这样可以优化性能并改善建模效果
-                                if hasattr(self.gaussians, 'update_deformation_table'):
+                                if hasattr(self.gaussians, 'update_deformation_table') and getattr(self.gaussians, 'use_deformation', True):
                                     self.gaussians.update_deformation_table()
                                 for idx in range((len(current_window))):
                                     current_idx = current_window[idx]
@@ -557,7 +582,7 @@ class BackEnd(mp.Process):
                     )
                     # 在densify_and_prune后更新deformation table
                     # 新点的deformation_table会在densify_and_prune中初始化，这里更新确保阈值正确
-                    if hasattr(self.gaussians, 'update_deformation_table'):
+                    if hasattr(self.gaussians, 'update_deformation_table') and getattr(self.gaussians, 'use_deformation', True):
                         self.gaussians.update_deformation_table()
                     gaussian_split = True
 
@@ -585,40 +610,16 @@ class BackEnd(mp.Process):
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
                 
                 # 监控时间变形状态（每200次迭代输出一次）
-                if self.iteration_count % 200 == 0 and hasattr(self.gaussians, '_w_pos'):
-                    if self.gaussians._w_pos.numel() > 0:
-                        w_pos = self.gaussians._w_pos
-                        w_rot = self.gaussians._w_rot if self.gaussians._w_rot.numel() > 0 else None
-                        w_scale = self.gaussians._w_scale if self.gaussians._w_scale.numel() > 0 else None
-                        
-                        # 位置形变统计
-                        w_pos_norm = w_pos.norm().item()
-                        w_pos_max = w_pos.abs().max().item()
-                        w_pos_mean = w_pos.abs().mean().item()
-                        
-                        # 旋转形变统计
-                        w_rot_info = ""
-                        if w_rot is not None:
-                            w_rot_norm = w_rot.norm().item()
-                            w_rot_max = w_rot.abs().max().item()
-                            w_rot_info = f", rot_norm={w_rot_norm:.6f}, rot_max={w_rot_max:.6f}"
-                        
-                        # 放缩形变统计
-                        w_scale_info = ""
-                        if w_scale is not None:
-                            w_scale_norm = w_scale.norm().item()
-                            w_scale_max = w_scale.abs().max().item()
-                            w_scale_info = f", scale_norm={w_scale_norm:.6f}, scale_max={w_scale_max:.6f}"
-                        
-                        # 时间基函数信息
-                        t_mu = self.gaussians.t_mu.detach().cpu().numpy()
-                        t_sigma = torch.nn.functional.softplus(self.gaussians.t_sigma_raw).detach().cpu().numpy()
-                        t_mu_range = f"[{t_mu.min():.3f}, {t_mu.max():.3f}]"
-                        t_sigma_mean = t_sigma.mean()
-                        
-                        # 移除详细的形变参数数值输出，这些对用户没有直观价值
-                        # 只保留关键信息，如动态点比例等（在update_deformation_table中输出）
-                        pass
+                if self.iteration_count % 200 == 0:
+                    if hasattr(self.gaussians, '_coefs') and self.gaussians._coefs.numel() > 0:
+                        coefs = self.gaussians._coefs
+                        Log(f"[Deform Stats] coefs_norm={coefs.norm().item():.6f}, "
+                            f"coefs_max={coefs.abs().max().item():.6f}, "
+                            f"coefs_mean={coefs.abs().mean().item():.6f}", tag="BACKEND")
+                    if hasattr(self.gaussians, '_deformation_table') and self.gaussians._deformation_table.numel() > 0:
+                        table = self.gaussians._deformation_table
+                        ratio = table.sum().item() / table.numel()
+                        Log(f"[Deform Stats] dynamic_ratio={ratio:.4f} ({table.sum().item()}/{table.numel()})", tag="BACKEND")
                 
                 pcd_save_interval = self.config["Results"].get("pcd_save_interval", 1000) 
             
@@ -835,11 +836,12 @@ class BackEnd(mp.Process):
                             Log(f"执行初始BA优化 | 点数: [green]{num_points:,}[/green] | 迭代: [cyan]{iter_per_kf}[/cyan]", tag="BA")
                         else:
                             iter_per_kf = self.mapping_itr_num
-                    for cam_idx in range(len(self.current_window)):     
+                    for cam_idx in range(len(self.current_window)):
                         if self.current_window[cam_idx] == 0:
                             continue
                         viewpoint = self.viewpoints[current_window[cam_idx]]
-                        if cam_idx < frames_to_optimize:        
+                        force_gt_pose = self.config.get("Training", {}).get("force_gt_pose", False)
+                        if cam_idx < frames_to_optimize and not force_gt_pose:
                             opt_params.append(
                                 {
                                     "params": [viewpoint.cam_rot_delta],
@@ -858,6 +860,11 @@ class BackEnd(mp.Process):
                                     "name": "trans_{}".format(viewpoint.uid),
                                 }
                             )
+                        # force_gt_pose 模式下强制重置位姿到GT
+                        if force_gt_pose and hasattr(viewpoint, 'R_gt') and hasattr(viewpoint, 'T_gt'):
+                            viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+                            viewpoint.cam_rot_delta.data.fill_(0)
+                            viewpoint.cam_trans_delta.data.fill_(0)
                         opt_params.append(
                             {
                                 "params": [viewpoint.exposure_a],
