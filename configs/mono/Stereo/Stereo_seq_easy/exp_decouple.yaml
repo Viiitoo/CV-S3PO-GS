@@ -22,10 +22,10 @@ Training:
   alpha: 0.98
   mapping_itr_nosingle: 30
   use_gt_pose: False
-  use_optical_flow: False
-  use_camera_flow: False
-  flow_visualization: False
-  flow_loss_weight: 0
+  use_optical_flow: True
+  use_camera_flow: True
+  flow_visualization: True
+  flow_loss_weight: 0.1
   decouple_pose_deform:
     enabled: true
     pose_steps: 3
@@ -45,4 +45,4 @@ rgb_edge_pnp:
   edge_match_ratio: 0.5
   edge_3d_weight: 2.0
   edge_border_margin: 30
-  center_crop_ratio: 0.5
+  center_crop_ratio: 1

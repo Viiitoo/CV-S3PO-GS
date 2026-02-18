@@ -146,12 +146,12 @@ def flow_loss(flow_pred, flow_gt, height, width):
     flow_pred = flow_pred.clone()
     flow_gt = flow_gt.clone()
 
-    flow_pred[0] /= height
-    flow_pred[1] /= width
+    flow_pred[0] /= width    # x方向（水平位移）除以宽度
+    flow_pred[1] /= height   # y方向（垂直位移）除以高度
     flow_pred = flow_pred.clamp(-1, 1)
 
-    flow_gt[0] /= height
-    flow_gt[1] /= width
+    flow_gt[0] /= width      # x方向（水平位移）除以宽度
+    flow_gt[1] /= height     # y方向（垂直位移）除以高度
     flow_gt = flow_gt.clamp(-1, 1)
 
     return l1_loss(flow_pred, flow_gt)

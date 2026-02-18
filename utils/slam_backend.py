@@ -412,7 +412,9 @@ class BackEnd(mp.Process):
                                     gs_flow_aligned = warping_gs_flow(depth_for_flow, gs_flow, viewpoint, viewpoint_next)
 
                                 H, W = image.shape[-2:]
-                                flow_loss_value = flow_loss(gs_flow_aligned, motion_flow, H, W)
+                                # gs_flow（含相机运动）与 optical_flow（总光流，同样含相机运动）对应
+                                # motion_flow 仅供日志/可视化，不参与 loss 计算
+                                flow_loss_value = flow_loss(gs_flow_aligned, optical_flow_gt.detach(), H, W)
 
                                 # 截断异常大的 flow loss，防止错误梯度主导优化
                                 flow_loss_clamped = torch.clamp(flow_loss_value, max=0.5)

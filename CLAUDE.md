@@ -12,7 +12,7 @@ S3PO-GS (CV-S3PO-GS) is a real-time monocular/stereo SLAM system built on 3D Gau
 - **Docker container**: `5d0fdd8cb92d`
 - Common run command:
   ```bash
-  CUDA_VISIBLE_DEVICES=X python3 slam.py --config configs/mono/Stereo/Stereo_seq_easy/stereo_full.yaml
+  CUDA_VISIBLE_DEVICES=X python3 slam.py --config configs/mono/Stereo/Stereo_seq_easy/exp_decouple.yaml
   ```
   其中 `X` 取决于哪个 GPU 空闲（通过 `nvidia-smi` 查看）。
 
@@ -34,7 +34,7 @@ pip install submodules/simple-knn
 python slam.py --config configs/mono/Stereo/Stereo_seq_easy/<scene>.yaml
 ```
 
-Key CLI overrides: `--begin/--end` (frame range), `--alpha` (loss weight), `--windowsize` (local BA window), `--iter` (tracking iterations), `--sh` (SH degree), `--patch_size`, `--color` (enable color refinement).
+Key CLI overrides: `--begin/--end` (frame range), `--alpha` (loss weight), `--windowsize` (local BA window), `--iter` (tracking iterations), `--sh` (SH degree), `--patch_size`, `--ns` (mapping iterations without single-frame), `--color` (enable color refinement).
 
 Config hierarchy: dataset-specific YAML inherits from `configs/mono/<dataset>/base_config.yaml`.
 
@@ -100,6 +100,7 @@ Key config sections in YAML files:
 - `opt_params.deformation_lr_init`: Learning rate for deformation parameters
 - `rgb_edge_pnp`: STAR-Edge guided PnP matching configuration
 - `Flow`: GMFlow model path and type
+- `single_thread: True`: Run frontend and backend in same process (used in Stereo configs to avoid CUDA context issues)
 
 ## Utility Scripts
 
@@ -109,6 +110,9 @@ python extract_rgb_video.py --viz_dir results/<run>/viz --output output.mp4 --fp
 
 # Visualize temporal deformation model
 python view_time_models.py <save_dir> --animate --start 0 --end 99 --step 5
+
+# Aggregate results across runs into CSV (reads stats_final.json and final_result.json per run)
+python cal_result.py
 ```
 
 ## Notes

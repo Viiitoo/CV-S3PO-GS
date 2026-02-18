@@ -106,7 +106,37 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     )
     ax.legend()
     plt.savefig(os.path.join(plot_dir, "evo_2dplot_{}.png".format(str(label))))
-    plt.close(fig) 
+    plt.close(fig)
+
+    # 三维轨迹图
+    fig3d = plt.figure(figsize=(8, 6))
+    ax3d = fig3d.add_subplot(111, projection='3d')
+    ax3d.set_title(f"ATE RMSE: {ape_stat:.4f} m")
+
+    ref_pos = traj_ref.positions_xyz
+    est_pos = traj_est_aligned.positions_xyz
+    errors = ape_metric.error
+
+    ax3d.plot(ref_pos[:, 0], ref_pos[:, 1], ref_pos[:, 2],
+              '--', color='gray', label='gt', linewidth=1.5)
+
+    norm = plt.Normalize(ape_stats["min"], ape_stats["max"])
+    cmap = plt.cm.jet
+    colors = cmap(norm(errors))
+    for i in range(len(est_pos) - 1):
+        ax3d.plot(est_pos[i:i+2, 0], est_pos[i:i+2, 1], est_pos[i:i+2, 2],
+                  color=colors[i], linewidth=1.5)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig3d.colorbar(sm, ax=ax3d, label='ATE [m]', shrink=0.6, pad=0.1)
+    ax3d.set_xlabel('x [m]')
+    ax3d.set_ylabel('y [m]')
+    ax3d.set_zlabel('z [m]')
+    ax3d.legend()
+    plt.savefig(os.path.join(plot_dir, "evo_3dplot_{}.png".format(str(label))),
+                dpi=150, bbox_inches='tight')
+    plt.close(fig3d)
 
     return ape_stat
 
