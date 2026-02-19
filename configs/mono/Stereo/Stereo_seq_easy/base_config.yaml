@@ -80,7 +80,7 @@ Training:
   single_thread: false
   size_threshold: 8
   spherical_harmonics: false
-  tracking_itr_num: 100
+  tracking_itr_num: 25
   window_size: 8
 
 # ================= MASt3R 点云轮廓提取（每帧）可视化保存 =================
