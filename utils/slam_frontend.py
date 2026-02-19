@@ -253,146 +253,12 @@ class FrontEnd(mp.Process):
         t_pose_end = time.time()
         self._timing_get_pose = (t_pose_end - t_pose_start) * 1000  # ms
         
-        # get mono_depth from MASt3R
-        mast_viz_cfg = self.config.get("mast3r_edge_viz", None)
-        if isinstance(mast_viz_cfg, dict):
-            _cfg = dict(mast_viz_cfg)
-            if _cfg.get("enabled", False):
-                viz_dir = os.path.join(self.save_dir, "viz_mast3r_pc_edge")
-                _cfg["dir"] = viz_dir
-                _cfg["frame_idx"] = int(cur_frame_idx)
-                _cfg["tag"] = "f{:06d}".format(int(cur_frame_idx))
-            mast_viz_cfg = _cfg
-        torch.cuda.synchronize()
-        t_depth_start = time.time()
-        depth = get_depth(img2, img2, self.model, return_conf=False, mast3r_edge_viz=mast_viz_cfg)
-        torch.cuda.synchronize()
-        t_depth_end = time.time()
-        self._timing_get_depth = (t_depth_end - t_depth_start) * 1000  # ms
-        viewpoint.mono_depth = depth
+        # [加速] 延迟 depth 计算到关键帧处理时（非关键帧不需要 mono_depth）
+        viewpoint.mono_depth = None
+        self._timing_get_depth = 0.0
         
-        # 计算光流（如果启用）
-        torch.cuda.synchronize()
-        t_flow_start = time.time()
-        self._timing_optical_flow = 0.0  # 默认0，如果未启用光流
-        if (self.use_optical_flow or self.use_camera_flow) and self.flownet is not None:
-            try:
-                from utils.flow_utils import compute_optical_flow
-                from utils.warp_utils import calculate_camera_flow
-                from utils.flow_viz import save_flow_visualization
-                
-                # 获取当前帧和下一帧图像
-                gt_image = viewpoint.original_image.cuda()  # (C, H, W), 范围 [0, 1]
-                
-                # 获取下一帧（如果存在）
-                next_frame_idx = cur_frame_idx + 1
-                flow_2d_gt = None  # 初始化为None，确保变量存在
-                camera_flow = None
-                motion_flow = None
-                
-                if next_frame_idx < len(self.dataset):
-                    # 从dataset加载下一帧图像
-                    next_gt_color, _, _, _ = self.dataset[next_frame_idx]
-                    next_gt_image = next_gt_color.cuda()  # (C, H, W), 范围 [0, 1]
-                    
-                    # 计算optical flow
-                    if self.use_optical_flow:
-                        if cur_frame_idx < len(self.flow_2d_gt_list):
-                            # 使用缓存的光流
-                            flow_2d_gt = self.flow_2d_gt_list[cur_frame_idx]
-                        else:
-                            # 计算新的光流
-                            flow_2d_gt = compute_optical_flow(gt_image, next_gt_image, self.flownet)
-                            self.flow_2d_gt_list.append(flow_2d_gt)
-                
-                # 计算camera flow（使用Mast3r预测的深度）
-                # 注意：camera flow也需要下一帧存在
-                if self.use_camera_flow and next_frame_idx < len(self.dataset):
-                    # 获取下一帧的相机对象（如果存在）
-                    if next_frame_idx in self.cameras:
-                        viewpoint_next = self.cameras[next_frame_idx]
-                    else:
-                        # 创建临时相机对象用于计算camera flow
-                        # 使用当前帧的位姿作为初始估计（实际应该使用下一帧的位姿）
-                        viewpoint_next = Camera.init_from_dataset(self.dataset, next_frame_idx, 
-                                                                  viewpoint.projection_matrix)
-                        # 如果使用真值位姿，使用真值
-                        if self.use_gt_pose:
-                            viewpoint_next.update_RT(viewpoint_next.R_gt, viewpoint_next.T_gt)
-                    
-                    # 准备深度数据：使用Mast3r预测的深度
-                    mono_depth_tensor = torch.from_numpy(viewpoint.mono_depth).float().cuda()
-                    # calculate_camera_flow期望输入为 (B) (1) H W 格式
-                    if len(mono_depth_tensor.shape) == 2:
-                        mono_depth_tensor = mono_depth_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-                    
-                    # 如果使用真值位姿，创建临时相机对象使用真值位姿
-                    if self.use_gt_pose:
-                        cam1_gt = Camera(
-                            viewpoint.uid, viewpoint.original_image, viewpoint.depth, 
-                            viewpoint.mono_depth, torch.eye(4, device=viewpoint.device),
-                            viewpoint.projection_matrix, viewpoint.fx, viewpoint.fy,
-                            viewpoint.cx, viewpoint.cy, viewpoint.FoVx, viewpoint.FoVy,
-                            viewpoint.image_height, viewpoint.image_width, device=viewpoint.device
-                        )
-                        cam1_gt.update_RT(viewpoint.R_gt, viewpoint.T_gt)
-                        
-                        cam2_gt = Camera(
-                            viewpoint_next.uid, viewpoint_next.original_image, viewpoint_next.depth,
-                            viewpoint_next.mono_depth, torch.eye(4, device=viewpoint_next.device),
-                            viewpoint_next.projection_matrix, viewpoint_next.fx, viewpoint_next.fy,
-                            viewpoint_next.cx, viewpoint_next.cy, viewpoint_next.FoVx, viewpoint_next.FoVy,
-                            viewpoint_next.image_height, viewpoint_next.image_width, device=viewpoint_next.device
-                        )
-                        cam2_gt.update_RT(viewpoint_next.R_gt, viewpoint_next.T_gt)
-                        
-                        camera_flow = calculate_camera_flow(mono_depth_tensor, cam1_gt, cam2_gt)
-                    else:
-                        camera_flow = calculate_camera_flow(mono_depth_tensor, viewpoint, viewpoint_next)
-                    
-                    # 计算motion flow（仅用于可视化，不存储到dict）
-                    # 后端会用当前优化后的位姿重新计算camera_flow，避免负反馈循环
-                    if self.use_optical_flow and flow_2d_gt is not None and camera_flow is not None:
-                        motion_flow = flow_2d_gt - camera_flow
-                    
-                    # 保存可视化（只有当下一帧存在时才保存）
-                    if self.flow_visualization and next_frame_idx < len(self.dataset):
-                        if self.use_optical_flow and flow_2d_gt is not None:
-                            save_flow_visualization(
-                                flow_2d_gt,
-                                os.path.join(self.flow_viz_dir, f"optical_flow_{cur_frame_idx:06d}.png"),
-                                f"Optical Flow Frame {cur_frame_idx}"
-                            )
-                        if self.use_camera_flow and camera_flow is not None:
-                            save_flow_visualization(
-                                camera_flow,
-                                os.path.join(self.flow_viz_dir, f"camera_flow_{cur_frame_idx:06d}.png"),
-                                f"Camera Flow Frame {cur_frame_idx}"
-                            )
-                        if self.use_optical_flow and self.use_camera_flow and motion_flow is not None:
-                            save_flow_visualization(
-                                motion_flow,
-                                os.path.join(self.flow_viz_dir, f"motion_flow_{cur_frame_idx:06d}.png"),
-                                f"Motion Flow Frame {cur_frame_idx}"
-                            )
-                else:
-                    # 最后一帧：没有下一帧，无法计算光流
-                    if self.flow_visualization:
-                        Log(f"帧 {cur_frame_idx} 是最后一帧，无法计算光流（需要下一帧）", tag="Flow")
-            except ImportError as e:
-                # 如果导入失败，说明光流相关模块不可用
-                Log(f"光流计算失败（模块导入错误）: {e}", tag="Flow")
-                pass
-            except Exception as e:
-                # 其他错误也记录但不中断程序
-                import traceback
-                Log(f"光流计算失败: {e}", tag="Flow")
-                Log(f"详细错误: {traceback.format_exc()}", tag="Flow")
-                pass
-        
-        torch.cuda.synchronize()
-        t_flow_end = time.time()
-        self._timing_optical_flow = (t_flow_end - t_flow_start) * 1000  # ms
+        # [加速] 光流仅在 request_keyframe() 的回溯机制中计算，非关键帧无需每帧计算
+        self._timing_optical_flow = 0.0
         
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)
@@ -813,7 +679,25 @@ class FrontEnd(mp.Process):
                     create_kf = check_time and create_kf
                 
                 t_kf_start = time.time()
-                if create_kf:     
+                if create_kf:
+                    # [加速] 延迟计算：仅为关键帧计算 MASt3R 深度
+                    if viewpoint.mono_depth is None:
+                        mast_viz_cfg = self.config.get("mast3r_edge_viz", None)
+                        if isinstance(mast_viz_cfg, dict):
+                            _cfg = dict(mast_viz_cfg)
+                            if _cfg.get("enabled", False):
+                                viz_dir = os.path.join(self.save_dir, "viz_mast3r_pc_edge")
+                                _cfg["dir"] = viz_dir
+                                _cfg["frame_idx"] = int(cur_frame_idx)
+                                _cfg["tag"] = "f{:06d}".format(int(cur_frame_idx))
+                            mast_viz_cfg = _cfg
+                        torch.cuda.synchronize()
+                        t_depth_start = time.time()
+                        viewpoint.mono_depth = get_depth(
+                            viewpoint.original_image, viewpoint.original_image,
+                            self.model, return_conf=False, mast3r_edge_viz=mast_viz_cfg)
+                        torch.cuda.synchronize()
+                        self._timing_get_depth = (time.time() - t_depth_start) * 1000
                     self.current_window, removed = self.add_to_window(cur_frame_idx, curr_visibility, self.occ_aware_visibility, self.current_window)       
                     depth_map = self.add_new_keyframe(cur_frame_idx, depth=render_pkg["depth"], opacity=render_pkg["opacity"], init=False)
                     self.request_keyframe(cur_frame_idx, viewpoint, self.current_window, depth_map)
