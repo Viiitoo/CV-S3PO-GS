@@ -1,0 +1,4 @@
+inherit_from: "configs/mono/Stereo/Stereo_seq_easy/exp_decouple.yaml"
+
+Training:
+  alpha: 0.93

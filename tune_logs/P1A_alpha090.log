@@ -1,0 +1,89 @@
+[Render] FlowRasterizer 导入成功 (flow_diff_gaussian_rasterization)
+Current backend: agg
+Warning, cannot find cuda-compiled version of RoPE2D, using a slow pytorch version instead
+[EdgeExtraction] LocalSH 模块加载成功
+S3PO-GS: saving results in results/stereo_seq_easy_stereo_seq_easy/2026-02-19-19-12-43
+git root error: Cmd('git') failed due to: exit code(128)
+  cmdline: git rev-parse --show-toplevel
+  stderr: 'fatal: detected dubious ownership in repository at '/workspace'
+To add an exception for this directory, call:
+
+	git config --global --add safe.directory /workspace'
+git root error: Cmd('git') failed due to: exit code(128)
+  cmdline: git rev-parse --show-toplevel
+  stderr: 'fatal: detected dubious ownership in repository at '/workspace'
+To add an exception for this directory, call:
+
+	git config --global --add safe.directory /workspace'
+... loading model from checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
+instantiating : AsymmetricMASt3R(enc_depth=24, dec_depth=12, enc_embed_dim=1024, dec_embed_dim=768, enc_num_heads=16, dec_num_heads=12, pos_embed='RoPE100',img_size=(512, 512), head_type='catmlp+dpt', output_mode='pts3d+desc24', depth_mode=('exp', -inf, inf), conf_mode=('exp', 1, inf), patch_embed_cls='PatchEmbedDust3R', two_confs=True, desc_conf_mode=('exp', 0, inf), landscape_only=False)
+<All keys matched successfully>
+Flow: 光流模型初始化成功
+[STAR-Edge CUDA] N=196608 desc_ms=57.75 total_ms=67.16
+Timing: [Frame 0] 初始化总计: 390.0ms | MASt3R深度: 389.4ms | 添加关键帧: 0.6ms
+[Render] FlowRasterizer 导入成功 (flow_diff_gaussian_rasterization)
+Current backend: agg
+Warning, cannot find cuda-compiled version of RoPE2D, using a slow pytorch version instead
+[EdgeExtraction] LocalSH 模块加载成功
+Init: 重置系统 | 帧: 0
+[初始化] 已保存初始化的PLY文件: results/stereo_seq_easy_stereo_seq_easy/2026-02-19-19-12-43/init_ply/initialized_point_cloud.ply (点数: 2400)
+Render: 使用标准 GaussianRasterizer（5输出）
+Render: Render: Rasterizer返回5个值（基础模式）
+WARNING: 形变系数未被优化器处理，已重新初始化（当前点数: 2,598）
+Init: 地图初始化完成 | 帧: 0 | 点数: 13,154
+/usr/local/lib/python3.11/dist-packages/numpy/linalg/linalg.py:2582: RuntimeWarning: overflow encountered in multiply
+  s = (x.conj() * x).real
+Render: 使用标准 GaussianRasterizer（5输出）
+Render: Render: Rasterizer返回5个值（基础模式）
+Timing: [Frame 1] 总计: 789.8ms | 相机初始化: 32.4ms | Tracking: 751.2ms (get_pose: 542.5ms, 
+get_depth: 0.0ms, 光流: 0.0ms, 位姿优化: 191.7ms/25itr) | KF处理: 0.1ms
+/usr/local/lib/python3.11/dist-packages/numpy/linalg/linalg.py:2583: RuntimeWarning: overflow encountered in reduce
+  return sqrt(add.reduce(s, axis=axis, keepdims=keepdims))
+Timing: [Frame 2] 总计: 726.6ms | 相机初始化: 16.9ms | Tracking: 703.2ms (get_pose: 518.0ms, 
+get_depth: 0.0ms, 光流: 0.0ms, 位姿优化: 183.2ms/25itr) | KF处理: 0.1ms
+Timing: [Frame 3] 总计: 754.9ms | 相机初始化: 19.7ms | Tracking: 728.6ms (get_pose: 517.1ms, 
+get_depth: 0.0ms, 光流: 0.0ms, 位姿优化: 199.2ms/25itr) | KF处理: 0.1ms
+Timing: [Frame 4] 总计: 753.6ms | 相机初始化: 18.8ms | Tracking: 725.4ms (get_pose: 531.5ms, 
+get_depth: 0.0ms, 光流: 0.0ms, 位姿优化: 191.6ms/25itr) | KF处理: 0.1ms
+/usr/local/lib/python3.11/dist-packages/torch/functional.py:504: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at ../aten/src/ATen/native/TensorShape.cpp:3526.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+[STAR-Edge CUDA] N=196608 desc_ms=52.64 total_ms=55.84
+Fallback: not enough accurate pixels, apply scale remedy using the previous keyframe
+Number of patches passed the first-stage filtering:  0
+Flow: 回溯存储 optical flow: 帧0 -> 帧5
+Timing: [Frame 5] [KF] 总计: 2479.2ms | 相机初始化: 21.8ms | Tracking: 710.9ms (get_pose: 503.7ms,
+get_depth: 260.9ms, 光流: 0.0ms, 位姿优化: 205.3ms/25itr) | KF处理: 1740.7ms (process_depth: 
+1395.4ms)
+Keyframe: 关键帧: 5 | 窗口: [5, 0] | 点数: 13,154 | 动态点: 100.0%
+Backend: [FlowRasterizer 配置] use_flow_rasterizer=True | available=True | fallback=True | 
+flow_loss_weight=0.1 | warm_up=1000 | interval=20
+Backend: [FlowRasterizer] 首次激活 | iter=1060 kf=0 | cfg=True available=True fallback=True | 
+flow_max_pairs=1
+Render: 使用 FlowRasterizer（光流模式，10输出）
+Render: Render: Rasterizer返回10个值（完整模式）
+Deform: 动态点: 81.3% (819/1,007) | 静态点: 18.7%
+Traceback (most recent call last):
+  File "/workspace/slam.py", line 313, in <module>
+    slam = SLAM(config, save_dir=save_dir,mast3r_model=mast3r_model)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/slam.py", line 119, in __init__
+    self.frontend.run()
+  File "/workspace/utils/slam_frontend.py", line 598, in run
+    time.sleep(0.01)
+KeyboardInterrupt
+Exception ignored in atexit callback: <function _exit_function at 0x7f71b7fe1d00>
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/util.py", line 357, in _exit_function
+    p.join()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 149, in join
+    res = self._popen.wait(timeout)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/popen_fork.py", line 43, in wait
+    return self.poll(os.WNOHANG if timeout == 0.0 else 0)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/popen_fork.py", line 27, in poll
+    pid, sts = os.waitpid(self.pid, flag)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt: 
+[Backend] 收到中断信号，正常退出
+[W CudaIPCTypes.cpp:15] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]

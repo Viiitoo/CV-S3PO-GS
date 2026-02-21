@@ -1,0 +1,7 @@
+inherit_from: "configs/mono/Stereo/Stereo_seq_easy/exp_decouple.yaml"
+
+Training:
+  decouple_pose_deform:
+    enabled: true
+    pose_steps: 5
+    deform_steps: 1
