@@ -42,13 +42,24 @@ def image_gradient_mask(image, eps=0.01):
 
 def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=False):
     image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
-    
+
     if config["Training"]["monocular"] and config["Dataset"]["depth_loss"]:
-        #return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
-        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
-    if config["Training"]["monocular"]:
-        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
-    return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
+        # mono_depth 在非关键帧时可能为 None（延迟计算优化），此时回退到 RGB
+        if viewpoint.mono_depth is not None:
+            loss = get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
+        else:
+            loss = get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
+    elif config["Training"]["monocular"]:
+        loss = get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
+    else:
+        loss = get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
+
+    # 位姿平滑正则化
+    smooth_weight = config.get("Training", {}).get("pose_smooth_weight", 0.0)
+    if smooth_weight > 0:
+        loss = loss + smooth_weight * pose_smoothness_loss(viewpoint, None)
+
+    return loss
 
 def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
     gt_image = viewpoint.original_image.cuda()
@@ -131,7 +142,7 @@ def get_median_depth(depth, opacity=None, mask=None, return_std=False):
 
 def flow_loss(flow_pred, flow_gt, height, width):
     """
-    计算光流损失，归一化到[-1, 1]范围
+    计算光流损失，归一化后使用Huber loss（对大运动更鲁棒）
 
     Args:
         flow_pred: 预测的光流，形状为 (2, H, W)
@@ -140,18 +151,31 @@ def flow_loss(flow_pred, flow_gt, height, width):
         width: 图像宽度
 
     Returns:
-        loss: L1损失
+        loss: Huber loss
     """
-    # 归一化到[-1, 1]范围
     flow_pred = flow_pred.clone()
     flow_gt = flow_gt.clone()
 
-    flow_pred[0] /= width    # x方向（水平位移）除以宽度
-    flow_pred[1] /= height   # y方向（垂直位移）除以高度
-    flow_pred = flow_pred.clamp(-1, 1)
+    flow_pred[0] /= width
+    flow_pred[1] /= height
 
-    flow_gt[0] /= width      # x方向（水平位移）除以宽度
-    flow_gt[1] /= height     # y方向（垂直位移）除以高度
-    flow_gt = flow_gt.clamp(-1, 1)
+    flow_gt[0] /= width
+    flow_gt[1] /= height
 
-    return l1_loss(flow_pred, flow_gt)
+    # 使用Huber loss替代L1+clamp，对大运动不截断而是线性增长
+    return F.smooth_l1_loss(flow_pred, flow_gt, beta=0.5)
+
+def pose_smoothness_loss(viewpoint, prev_viewpoint):
+    """
+    位姿平滑正则化：约束相邻帧位姿变化的一致性，减少帧间抖动
+
+    Args:
+        viewpoint: 当前帧的Camera对象
+        prev_viewpoint: 上一帧的Camera对象
+
+    Returns:
+        loss: 旋转和平移delta的L2正则
+    """
+    rot_delta = viewpoint.cam_rot_delta
+    trans_delta = viewpoint.cam_trans_delta
+    return rot_delta.pow(2).sum() + trans_delta.pow(2).sum()

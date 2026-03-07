@@ -303,7 +303,15 @@ class BackEnd(mp.Process):
                 flow_on_all_frames = self.config["Training"].get("flow_on_all_frames", False)
                 flow_max_pairs = self.config["Training"].get("flow_max_pairs", 1)
 
+                # 解耦模式Phase D时跳过光流损失（光流同时约束位姿和形变，
+                # Phase D清零位姿梯度会浪费光流计算，改为仅在Phase P计算光流）
+                in_decouple_phase_d = False
+                if decouple_enabled:
+                    phase_idx = (self.iteration_count - 1) % decouple_cycle
+                    in_decouple_phase_d = (phase_idx >= decouple_pose_steps)
+
                 if (flow_loss_weight > 0 and
+                    not in_decouple_phase_d and  # Phase D跳过光流
                     self.iteration_count >= flow_warm_up and
                     (self.iteration_count % flow_loss_interval) == 0 and
                     kf_idx in self.optical_flow_dict and
@@ -471,6 +479,20 @@ class BackEnd(mp.Process):
                 coefs_reg = self.gaussians._coefs.pow(2).mean()
                 loss_mapping += coefs_reg_weight * coefs_reg
             
+            # 位姿先验正则化：防止后端优化偏离PnP初始位姿过远
+            pose_prior_weight = self.config.get("Training", {}).get("pose_prior_weight", 0.0)
+            if pose_prior_weight > 0:
+                pose_prior_loss = 0.0
+                for cam_idx in range(min(frames_to_optimize, len(current_window))):
+                    viewpoint = viewpoint_stack[cam_idx]
+                    if viewpoint.uid == 0:
+                        continue
+                    # cam_rot_delta 和 cam_trans_delta 记录了优化期间位姿相对初始值的偏移
+                    # 正则化让偏移不要太大
+                    pose_prior_loss += viewpoint.cam_rot_delta.pow(2).sum()
+                    pose_prior_loss += viewpoint.cam_trans_delta.pow(2).sum()
+                loss_mapping += pose_prior_weight * pose_prior_loss
+
             loss_mapping.backward()
 
             # ========== 解耦优化：选择性清零梯度 ==========

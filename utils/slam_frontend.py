@@ -246,9 +246,18 @@ class FrontEnd(mp.Process):
         rgb_edge_pnp_cfg = self.config.get("rgb_edge_pnp", None)
         torch.cuda.synchronize()
         t_pose_start = time.time()
-        rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs, 
+        # 构建前几帧位姿用于常速运动模型回退
+        prev_poses = []
+        for offset in [2, 1]:  # 从更早到更近
+            prev_idx = cur_frame_idx - offset * self.use_every_n_frames
+            if prev_idx >= 0 and prev_idx in self.cameras:
+                prev_cam = self.cameras[prev_idx]
+                prev_w2c = getWorld2View2(prev_cam.R, prev_cam.T).cpu().numpy()
+                prev_poses.append(prev_w2c)
+
+        rel_pose, render_depth = get_pose(img1=img1, img2=img2, model=self.model, dist_coeffs=self.dataset.dist_coeffs,
                             viewpoint=last_kf, gaussians=self.gaussians, pipeline_params=self.pipeline_params, background=self.background,
-                            rgb_edge_pnp=rgb_edge_pnp_cfg)
+                            rgb_edge_pnp=rgb_edge_pnp_cfg, prev_poses=prev_poses if len(prev_poses) >= 2 else None)
         torch.cuda.synchronize()
         t_pose_end = time.time()
         self._timing_get_pose = (t_pose_end - t_pose_start) * 1000  # ms
@@ -263,10 +272,18 @@ class FrontEnd(mp.Process):
         # Compute current frame's pose estimation
         identity_matrix = torch.eye(4, device=self.device)
         rel_pose = torch.from_numpy(rel_pose).to(self.device).float()
-        # If the relative pose is identity (no motion), treat as a failure and use the previous pose
-        if torch.allclose(rel_pose, identity_matrix, atol=1e-6):  
-            pose_init = rel_pose @ pose_last_kf
-            viewpoint.update_RT(prev.R, prev.T)
+        # If the relative pose is identity (PnP failed), use constant velocity model
+        if torch.allclose(rel_pose, identity_matrix, atol=1e-6):
+            # 常速运动模型：用前两帧位姿外推当前帧
+            prev_idx2 = cur_frame_idx - 2 * self.use_every_n_frames
+            if prev_idx2 >= 0 and prev_idx2 in self.cameras:
+                prev2 = self.cameras[prev_idx2]
+                pose_prev2 = getWorld2View2(prev2.R, prev2.T)
+                velocity = pose_prev @ torch.linalg.inv(pose_prev2)
+                pose_init = velocity @ pose_prev
+                viewpoint.update_RT(pose_init[:3, :3], pose_init[:3, 3])
+            else:
+                viewpoint.update_RT(prev.R, prev.T)
         else:
             pose_init = rel_pose @ pose_last_kf
             viewpoint.update_RT(pose_init[:3, :3], pose_init[:3, 3])
@@ -379,6 +396,11 @@ class FrontEnd(mp.Process):
         dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])        # Get transformation matrix from current frame to previous keyframe; extract translation and compute distance
         dist_check = dist > kf_translation * self.median_depth
         dist_check2 = dist > kf_min_translation * self.median_depth
+
+        # 防御性检查：occ_aware_visibility 可能尚未包含 last_keyframe_idx
+        if last_keyframe_idx not in occ_aware_visibility:
+            Log(f"[is_keyframe] occ_aware_visibility 缺少 KF {last_keyframe_idx}，基于纯距离判断", tag="KF-Warn")
+            return dist_check or dist_check2
 
         union = torch.logical_or(
             cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
@@ -524,10 +546,18 @@ class FrontEnd(mp.Process):
         self.gaussians = data[1]
         self.occ_aware_visibility = data[2]
         keyframes = data[3]
-        # self.occ_aware_visibility = occ_aware_visibility
 
+        max_pose_update = self.config["Training"].get("max_pose_update", 0.05)
         for kf_id, kf_R, kf_T in keyframes:
-            self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
+            old_T = self.cameras[kf_id].T.clone()
+            delta = (kf_T - old_T).norm()
+            if delta > max_pose_update:
+                alpha = max_pose_update / (delta + 1e-8)
+                kf_T_clamped = old_T + alpha * (kf_T - old_T)
+                Log(f"[sync_backend] KF {kf_id} 位姿更新被限制: delta={delta:.4f} -> {max_pose_update:.4f}", tag="Pose-Clip")
+                self.cameras[kf_id].update_RT(kf_R.clone(), kf_T_clamped)
+            else:
+                self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
     # Clear current frame's camera data; clear CUDA cache every 10 frames
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
@@ -675,9 +705,15 @@ class FrontEnd(mp.Process):
                     point_ratio = intersection / union
                     create_kf = (check_time and point_ratio < self.config["Training"]["kf_overlap"])
                 
-                if self.single_thread:      
+                if self.single_thread:
                     create_kf = check_time and create_kf
-                
+
+                # 保底：超过最大关键帧间隔强制创建关键帧，防止长时间无KF导致后段漂移
+                max_kf_interval = self.config["Training"].get("max_kf_interval", 20)
+                if (cur_frame_idx - last_keyframe_idx) >= max_kf_interval and not create_kf:
+                    Log(f"[Frame {cur_frame_idx}] 强制创建关键帧：距上一KF({last_keyframe_idx})已过{cur_frame_idx - last_keyframe_idx}帧，超过max_kf_interval={max_kf_interval}", tag="KF-Force")
+                    create_kf = True
+
                 t_kf_start = time.time()
                 if create_kf:
                     # [加速] 延迟计算：仅为关键帧计算 MASt3R 深度

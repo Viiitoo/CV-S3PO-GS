@@ -2,6 +2,7 @@ inherit_from: "configs/mono/Stereo/Stereo_seq_easy/base_config.yaml"
 
 Dataset:
   begin: 0
+  depth_loss: True
   dataset_path: "datasets/StereoMIS/stereo_seq_easy/stereo_seq_easy/train"
   Calibration:
     fx: 516.95
@@ -26,6 +27,16 @@ Training:
   use_camera_flow: True
   flow_visualization: True
   flow_loss_weight: 0.1
+  tracking_itr_num: 60
+  pose_window: 6
+  flow_warm_up: 300
+  coefs_reg_weight: 0.05
+  pose_prior_weight: 0.01
+  pose_smooth_weight: 0.01
+  kf_translation: 0.04
+  kf_min_translation: 0.02
+  max_kf_interval: 20
+  max_pose_update: 0.05
   decouple_pose_deform:
     enabled: true
     pose_steps: 3

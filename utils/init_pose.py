@@ -117,7 +117,7 @@ def _weighted_ransac_pnp(objectPoints: np.ndarray,
     加权RANSAC-PnP（偏置采样 + 加权inlier评分）。
 
     OpenCV 的 solvePnPRansac 不支持 per-point 权重，这里用：
-    - 采样：按 weights 概率抽样最小集
+    - 采样：均匀随机采样最小集（保证空间多样性）
     - 评分：用 inliers 的 weight 之和作为 score（同时也能返回 inlier mask）
     """
     N = len(objectPoints)
@@ -126,7 +126,6 @@ def _weighted_ransac_pnp(objectPoints: np.ndarray,
 
     w = np.asarray(weights, dtype=np.float64).reshape(-1)
     w = np.clip(w, 1e-6, None)
-    p = w / w.sum()
 
     rng = np.random.default_rng(seed)
 
@@ -134,12 +133,9 @@ def _weighted_ransac_pnp(objectPoints: np.ndarray,
     best_rvec, best_tvec = None, None
     best_inliers = None
 
-    # 用 EPNP 做 minimal set 更稳（SQPNP 也可，但对极小样本偶尔不稳定）
+    # 采样阶段使用均匀采样（保证空间多样性），仅评分阶段使用权重
     for _ in range(iterationsCount):
-        try:
-            idx = rng.choice(N, size=min_sample, replace=False, p=p)
-        except ValueError:
-            idx = rng.choice(N, size=min_sample, replace=False)
+        idx = rng.choice(N, size=min_sample, replace=False)
 
         ok, rvec, tvec = cv2.solvePnP(
             objectPoints[idx], imagePoints[idx], K, dist_coeffs,
@@ -275,7 +271,7 @@ def depth_to_3d1(depth_map, K):
 
 # Estimate relative pose and return rendered depth
 def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_params, background,
-             rgb_edge_pnp=None):
+             rgb_edge_pnp=None, prev_poses=None):
     device = 'cuda'
     schedule = 'cosine'
     lr = 0.01
@@ -286,7 +282,11 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
     output = inference([tuple(images)], model, device, batch_size=1, verbose=False)
     view1, pred1 = output['view1'], output['pred1']
     view2, pred2 = output['view2'], output['pred2']
-    desc1, desc2 = pred1['desc'].squeeze(0).detach(), pred2['desc'].squeeze(0).detach()    
+
+    # MASt3R输出的3D点图（view1分辨率），用于边缘提取
+    mast3r_pts3d = pred1['pts3d'].squeeze(0).detach().cpu().numpy()  # (h_mast3r, w_mast3r, 3)
+
+    desc1, desc2 = pred1['desc'].squeeze(0).detach(), pred2['desc'].squeeze(0).detach()
     
     # find 2D-2D matches between the two images
     matches_im1, matches_im2 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=8,
@@ -360,11 +360,11 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
             edge_method_cfg = cfg.get("edge_extraction", {}) if isinstance(cfg, dict) else {}
             extractor3d = EdgeExtractor({"edge_extraction": edge_method_cfg})
 
-            # 全量点云：来自 depth_to_3d 的 (H,W,3)
-            H_img, W_img = pts3d.shape[:2]
-            pts3d_all = pts3d.reshape(-1, 3).astype(np.float32)
-            valid = np.isfinite(pts3d_all).all(axis=1) & (pts3d_all[:, 2] > 1e-6)
-            pts3d_all = pts3d_all[valid]
+            # 使用MASt3R输出的3D点云做边缘提取（比渲染深度更稳定）
+            H_img, W_img = pts3d.shape[:2]  # 仍用渲染深度的分辨率做参考
+            mast3r_pts_flat = mast3r_pts3d.reshape(-1, 3).astype(np.float32)
+            valid = np.isfinite(mast3r_pts_flat).all(axis=1) & (mast3r_pts_flat[:, 2] > 1e-6)
+            pts3d_all = mast3r_pts_flat[valid]
 
             if len(pts3d_all) >= 50:
                 # 下采样以加速（用EdgeExtractor自带体素下采样/点数上限）
@@ -469,9 +469,18 @@ def get_pose(img1, img2, model, dist_coeffs, viewpoint, gaussians, pipeline_para
         pose_w2c[:3, 3] = tvec[:, 0]
         return pose_w2c, render_depth.detach().cpu().numpy()  
     else:
-        print("PnP估计失败")
-        pose_w2c = np.eye(4)
-        return pose_w2c, render_depth.detach().cpu().numpy()  
+        print("PnP估计失败，使用常速运动模型回退")
+        # 常速运动模型：用最近两帧的速度外推
+        if prev_poses is not None and len(prev_poses) >= 2:
+            pose_t1 = prev_poses[-1]  # 上一帧 w2c
+            pose_t2 = prev_poses[-2]  # 上上帧 w2c
+            # velocity = T_{t-1} @ T_{t-2}^{-1}，即从t-2到t-1的运动
+            velocity = pose_t1 @ np.linalg.inv(pose_t2)
+            # 外推: T_t = velocity @ T_{t-1}
+            pose_w2c = velocity @ pose_t1
+        else:
+            pose_w2c = np.eye(4)
+        return pose_w2c, render_depth.detach().cpu().numpy()
 
 # Extract depth and confidence from MASt3R
 def get_depth(img1, img2, model, return_conf=False, mast3r_edge_viz=None): # <--- 改动：增加参数

@@ -63,6 +63,12 @@ class GaussianModel:
         else:
             self.deform_table_threshold = 0.0001  # 默认值：比原0.01小100倍
 
+        # ========== 形变缩放系数（可通过配置覆盖）==========
+        model_cfg = config.get("model_params", {}) if config else {}
+        self.deformation_xyz_scale = float(model_cfg.get("deformation_xyz_scale", 4.0))
+        self.deformation_rotation_scale = float(model_cfg.get("deformation_rotation_scale", 6.0))
+        self.deformation_opacity_scale = float(model_cfg.get("deformation_opacity_scale", 20.0))
+
         # ========== 是否启用形变网络 ==========
         if config is not None and "use_deformation" in config.get("model_params", {}):
             self.use_deformation = config["model_params"]["use_deformation"]
@@ -515,9 +521,9 @@ class GaussianModel:
         
         # 应用形变（参考EH-SurGS的apply_deformations）
         deformation_config = {
-            "xyz_scale": 4.0,
-            "rotation_scale": 6.0,
-            "opacity_scale": 20.0
+            "xyz_scale": self.deformation_xyz_scale,
+            "rotation_scale": self.deformation_rotation_scale,
+            "opacity_scale": self.deformation_opacity_scale,
         }
         
         # 位置形变（前3个通道）
