@@ -1,0 +1,10 @@
+inherit_from: "configs/mono/Stereo/Stereo_seq_easy/exp_decouple.yaml"
+
+Training:
+  pose_window: 5
+  flow_loss_weight: 0.1
+  flow_loss_interval: 15
+  decouple_pose_deform:
+    enabled: true
+    pose_steps: 5
+    deform_steps: 1

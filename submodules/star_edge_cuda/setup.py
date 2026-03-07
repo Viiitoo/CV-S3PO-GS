@@ -21,7 +21,8 @@ setup(
                     "--std=c++17",
                     "-O3",
                     "--use_fast_math",
-                    "-gencode=arch=compute_86,code=sm_86",
+                    "-gencode=arch=compute_86,code=sm_86",  # RTX 3090
+                    "-gencode=arch=compute_89,code=sm_89",  # RTX 4090
                 ],
                 "cxx": ["-O3", "-std=c++17"],
             },
